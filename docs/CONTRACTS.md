@@ -67,3 +67,19 @@
 Дедупликация уведомления: order_uuid + composition_version + переход + тип + адресат; смена трека добавляет версию отправления. Внешняя операция: provider + operation_id уникальна; входящее событие имеет проверенный ID либо детерминированный хеш существенных полей. Конкретные ограничения/миграции — TASK-012–013.
 
 Политики [ReservePolicy](../wp-content/plugins/suhoput-core/src/Domain/ReservePolicy.php), [Money](../wp-content/plugins/suhoput-core/src/Domain/Money.php), [Availability](../wp-content/plugins/suhoput-core/src/Domain/Availability.php) и [OperationResult](../wp-content/plugins/suhoput-core/src/Domain/OperationResult.php) проверяются на имитациях через tests/contracts.php. Это модель решений, не обработчик внешних операций и не доказательство гонок с другим каналом. Реальные переходы, журнал, блокировки, версии, UI и письма выполняются зависимыми задачами.
+
+## Нормализация МойСклад remap/1.2
+
+Документация прочитана 08.10.2026; ответы контрольных GET описаны в [ACCEPTANCE](ACCEPTANCE.md#exec-chk-008). Точные выбранные ID хранятся в локальной конфигурации, значения не вшиваются в код адаптера. Эта карта не является реализацией обмена.
+
+| Источник API | Назначение в контракте |
+| --- | --- |
+| product.id / variant.id; variant.product.meta.href | Устойчивые связи товара/варианта/родителя, без сопоставления по имени |
+| variant.characteristics[{id,name,value}] | Значения размера/цвета; сопоставление характеристик по выбранным ID, учитывая отдельный латинский размер |
+| salePrices[].priceType.id / value / currency.meta.href | Выбранный тип цены и проверенная валюта. В product.value сумма задаётся в копейках, 1300000 означает 13000 RUB при соответствующей валюте. Адаптер обязан избежать float-округления; missing/nonpositive не заменяется ценой другого контекста |
+| product/variant.images.meta.size | Наличие внешнего изображения; сама картинка и публикационный контроль требуют отдельного сценария. Ручные фото сайта сохраняются |
+| report/stock/bystore.rows[].meta.href | Связь количества с товаром/вариантом; родитель вариативного товара не является отдельной продаваемой единицей |
+| stockByStore[].meta.href / stock / reserve / inTransit | Фильтр store=<href выбранного склада>, stockMode=all; серверный ответ дополнительно проверяется по ID склада. Наличие = физический stock − reserve − ещё не отражённые локальные удержания, без inTransit. Неполные/неизвестные данные не становятся нулём |
+| meta.size / rows / offset / limit | Порционная пагинация, уникальность ID, продолжение и контроль полноты; стабильный size сам по себе не доказывает атомарность снимка |
+
+[Официальное описание товара](https://raw.githubusercontent.com/moysklad/api-remap-1.2-doc/master/md/dictionaries/_product.md) задаёт единицы цены. [Описание модификации](https://raw.githubusercontent.com/moysklad/api-remap-1.2-doc/master/md/dictionaries/_variant.md) указывает, что при отсутствии собственной цены в ответе выводится цена родителя. Это объяснение протокола; одинаковые значения родителя и варианта не доказывают происхождение конкретной цены без контрольного сценария. [Описание остатков](https://raw.githubusercontent.com/moysklad/api-remap-1.2-doc/master/md/reports/_report_stock.md) различает stock, freeStock и quantity: последнее включает ожидания и не используется как доступное количество магазина. Пагинация/нормализация/импорт и возобновление проверяются раздельно.
