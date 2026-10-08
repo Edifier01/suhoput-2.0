@@ -32,3 +32,4 @@ add_action('woocommerce_after_order_object_save', static function ($order): void
         \Suhoput\Core\Infrastructure\OrderOutbox::synchronize($order);
     }
 });
+add_action('init', [\Suhoput\Core\Infrastructure\QueueRuntime::class, 'boot'], 20);

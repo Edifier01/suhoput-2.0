@@ -1,5 +1,16 @@
 #!/bin/sh
 set -eu
+# The WordPress entrypoint extracts the shared core before writing configuration.
+# Container health alone does not prove that a fresh volume is ready for WP-CLI.
+attempt=0
+while [ ! -f /var/www/html/wp-config.php ] && [ "$attempt" -lt 30 ]; do
+  sleep 1
+  attempt=$((attempt + 1))
+done
+if [ ! -f /var/www/html/wp-config.php ]; then
+  echo 'Local WordPress configuration did not become ready.' >&2
+  exit 1
+fi
 if ! wp core is-installed >/dev/null 2>&1; then
   wp core install --url=http://localhost:18880 --title='Suhoput local' --admin_user=local-admin --admin_password="$LOCAL_ADMIN_PASSWORD" --admin_email=local-admin@example.invalid --skip-email
 fi

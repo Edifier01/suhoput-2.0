@@ -44,6 +44,8 @@
 ./tools/fetch-vendor.ps1
 docker compose --env-file infra/.env.local -f infra/compose.yaml up -d --wait
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /bootstrap.sh
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp suhoput queue tick
+docker compose --env-file infra/.env.local -f infra/compose.yaml --profile queue up -d scheduler
 ```
 
 Проверены первая установка и повтор bootstrap. Docker образы закреплены digest, WooCommerce ZIP проверяется SHA-256. WordPress доступен на http://localhost:18880, перехватчик почты — http://localhost:18881. Учётка стенда `local-admin`, пароль только в игнорируемом `infra/.env.local`, здесь не выводится. Сеть приложения/базы закрыта; localhost публикует отдельный прокси. HTTP API заблокирован локальным MU-обработчиком, почта направлена в Mailpit, задания от посещений и автообновления отключены. MU-обработчик относится только к инфраструктуре локального стенда и не включается в production. Интеграционные ключи из [ACCESS](docs/ACCESS.md) в этот закрытый стенд автоматически не передаются.
@@ -58,6 +60,9 @@ docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/journal.php
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/workers.php
 node tests/worker-crashes.cjs
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/scheduler.php
+node tests/queue-concurrency.cjs
+node tests/queue-minute.cjs
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /tests/lint.sh
 node tests/concurrency.cjs
 ./tools/check-secrets.ps1
@@ -79,6 +84,12 @@ node tests/browser-smoke.cjs
 ```powershell
 docker compose --env-file infra/.env.local -f infra/compose.yaml down
 ```
+
+Минутный сервис `scheduler` работает через системный `sleep`/WP-CLI без посещений сайта. Первый `queue tick` на чистом стенде завершает штатную миграцию Action Scheduler 4.1.0; новый процесс выбирает DBStore. При `SUHOPUT_SYSTEM_QUEUE_ENABLED=true` отключён асинхронный запуск AS из HTTP. Сервис ограничивает процесс 55 секундами, очередь блокирует наложения и начинает следующий запуск по границе минуты. При проверках очереди остановить `scheduler`, чтобы тестовые адаптеры не обрабатывались другим процессом; затем запустить снова.
+
+`docker compose --env-file infra/.env.local -f infra/compose.yaml logs --timestamps --tail 20 scheduler` показывает системные запуски. В базе сохраняются время начала/окончания и счётчик (`suhoput_queue_*`), для операций — ошибки и следующие попытки, для периодических заданий — последнее успешное выполнение. Менеджерский интерфейс/реальная доставка тревог добавляются TASK-038/039/046. Перезапуск сервиса сохраняет очередь в базе.
+
+Для будущего Linux-окружения подготовлены `infra/systemd/suhoput-queue.service` и `.timer` (раз в минуту, предел 55 секунд). Это шаблоны: перед установкой обследовать сервер и задать фактические пути/пользователя/WP-CLI, `DISABLE_WP_CRON=true` и `SUHOPUT_SYSTEM_QUEUE_ENABLED=true`. Сервис обслуживает также штатные группы WooCommerce; системный вызов остальных необходимых cron-событий WordPress определяется TASK-046. На production шаблоны не устанавливались. Восстановленная копия остаётся с запрещёнными внешними действиями до сверки TASK-048.
 
 VPS Timeweb, S3 Selectel, домен и почтовый домен reg.ru указаны владельцем в ТЗ; доступы, адреса и состояние не обследованы. Порядок размещения и эксплуатации задаёт [SPEC](docs/SPEC.md#почта-и-эксплуатация). Секреты задаются в соответствующем окружении, а не в документах.
 

@@ -102,6 +102,7 @@ final class Worker
             $this->attempt('notifications', 'notification_key', $key);
             $this->update('notifications', 'notification_key', $key, ['state'=>'unknown']);
             try { $result = ($row['state'] === 'queued' ? $this->mail[0] : $this->mail[1])($row); }
+            catch (RetryLater $error) { throw $error; }
             catch (\Throwable $error) { return false; }
             if (!$result instanceof OperationResult) { throw new \LogicException('Delivery result must be explicit.'); }
             $this->update('notifications', 'notification_key', $key, ['state'=>$result->status, 'result_body'=>Journal::canonical($result->evidence), 'lease_until'=>null]);

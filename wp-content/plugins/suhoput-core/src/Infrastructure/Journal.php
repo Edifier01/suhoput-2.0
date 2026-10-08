@@ -18,6 +18,7 @@ final class Journal
             'composition_version'=>$command['composition_version'], 'provider'=>$command['provider'],
             'action'=>$command['action'], 'idempotency_key'=>$key, 'request_body'=>$body,
             'request_hash'=>hash('sha256',$body), 'created_at'=>gmdate('Y-m-d H:i:s'), 'updated_at'=>gmdate('Y-m-d H:i:s'),
+            'available_at'=>isset($command['not_before']) ? gmdate('Y-m-d H:i:s',$command['not_before']) : null,
         ];
         $old = $wpdb->suppress_errors(true);
         try { $inserted = $wpdb->insert($this->table('operations'), $row); }
@@ -30,7 +31,7 @@ final class Journal
             }
             throw new \RuntimeException('Could not persist operation intention.');
         }
-        foreach (['order_id','composition_version','provider','action','idempotency_key','request_hash'] as $field) {
+        foreach (['order_id','composition_version','provider','action','idempotency_key','request_hash','available_at'] as $field) {
             if (($existing[$field] === null ? null : (string)$existing[$field]) !== ($row[$field] === null ? null : (string)$row[$field])) {
                 throw new \LogicException('An operation intention is immutable.');
             }
@@ -50,6 +51,7 @@ final class Journal
         $key = $command['idempotency_key'] ?? null;
         if ($key !== null && (!is_string($key) || $key === '' || strlen($key) > 64)) { throw new \InvalidArgumentException('Invalid operation key.'); }
         if (!is_array($command['request'] ?? null)) { throw new \InvalidArgumentException('Command request must be an array.'); }
+        if (isset($command['not_before']) && (!is_int($command['not_before']) || $command['not_before'] < 0)) { throw new \InvalidArgumentException('Invalid command deadline.'); }
         self::canonical($command['request']);
     }
 
@@ -77,6 +79,8 @@ final class Journal
             try {
                 $result = $effect($this->get($id));
                 if (!$result instanceof OperationResult) { throw new \LogicException('Provider result must be explicit.'); }
+            } catch (RetryLater $error) {
+                throw $error;
             } catch (\Throwable $error) {
                 // Do not log request, exception content, headers or secrets.
                 return OperationResult::unknown();

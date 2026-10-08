@@ -32,6 +32,7 @@ services:
         define('DISALLOW_FILE_MODS', true);
         define('SUHOPUT_EXTERNAL_WRITES_ENABLED', false);
         define('SUHOPUT_LOCAL_SAFETY', true);
+        define('SUHOPUT_SYSTEM_QUEUE_ENABLED', true);
     volumes: &wp-volumes
       - wordpress:/var/www/html
       - ../wp-content/plugins/suhoput-core:/var/www/html/wp-content/plugins/suhoput-core
@@ -56,6 +57,18 @@ services:
       - ../tests:/tests:ro
       - ./bootstrap.sh:/bootstrap.sh:ro
     networks: [local]
+  scheduler:
+    extends:
+      service: cli
+    profiles: [queue]
+    restart: unless-stopped
+    init: true
+    entrypoint: [sh, /queue-loop.sh]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./queue-loop.sh:/queue-loop.sh:ro
   mailpit:
     image: axllent/mailpit:v1.29.2@sha256:030f06031ce5c60913ac9363da1ab0d4be6fd2a78147dd0e1ca0fcac665d6b34
     networks: [local]

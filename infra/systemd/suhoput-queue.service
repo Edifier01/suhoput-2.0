@@ -1,0 +1,13 @@
+[Unit]
+Description=Suhoput Action Scheduler queue
+After=network.target
+
+[Service]
+Type=oneshot
+User=www-data
+WorkingDirectory=/srv/suhoput/current
+ExecStart=/usr/local/bin/wp suhoput queue tick --path=/srv/suhoput/current
+TimeoutStartSec=55
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true

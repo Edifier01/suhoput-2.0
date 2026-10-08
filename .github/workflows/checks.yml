@@ -45,6 +45,8 @@ jobs:
         run: |
           docker compose --env-file infra/.env.local -f infra/compose.yaml up -d --wait
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /bootstrap.sh
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp suhoput queue tick
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/queue-startup.php
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/local-safety.php
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli php /tests/contracts.php
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema.php
@@ -53,7 +55,11 @@ jobs:
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/workers.php
           node tests/worker-crashes.cjs
           node tests/concurrency.cjs
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/scheduler.php
+          node tests/queue-concurrency.cjs
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /tests/lint.sh
+      - name: System minute queue without HTTP
+        run: node tests/queue-minute.cjs
       - name: Browser smoke
         run: pnpm test:browser
       - name: Stop this CI project
