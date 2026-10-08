@@ -66,5 +66,5 @@ jobs:
         if: always()
         run: |
           if [ -f infra/.env.local ]; then
-            docker compose --env-file infra/.env.local -f infra/compose.yaml down
+            docker compose --env-file infra/.env.local -f infra/compose.yaml --profile queue down
           fi

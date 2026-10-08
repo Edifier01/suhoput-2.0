@@ -82,7 +82,7 @@ node tests/browser-smoke.cjs
 Остановка только этого проекта без удаления данных:
 
 ```powershell
-docker compose --env-file infra/.env.local -f infra/compose.yaml down
+docker compose --env-file infra/.env.local -f infra/compose.yaml --profile queue down
 ```
 
 Минутный сервис `scheduler` работает через системный `sleep`/WP-CLI без посещений сайта. Первый `queue tick` на чистом стенде завершает штатную миграцию Action Scheduler 4.1.0; новый процесс выбирает DBStore. При `SUHOPUT_SYSTEM_QUEUE_ENABLED=true` отключён асинхронный запуск AS из HTTP. Сервис ограничивает процесс 55 секундами, очередь блокирует наложения и начинает следующий запуск по границе минуты. При проверках очереди остановить `scheduler`, чтобы тестовые адаптеры не обрабатывались другим процессом; затем запустить снова.
