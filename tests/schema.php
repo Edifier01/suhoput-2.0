@@ -6,7 +6,7 @@ Schema::migrate();
 global $wpdb;
 $prefix = $wpdb->prefix . 'suhoput_';
 $assert = static function (bool $ok, string $name): void { if (!$ok) { throw new RuntimeException('FAIL: '.$name); } };
-$expected = ['links', 'accounts', 'operations', 'inbox', 'notifications', 'holds'];
+$expected = ['links', 'accounts', 'operations', 'inbox', 'notifications', 'holds', 'order_access'];
 foreach ($expected as $name) {
     $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($prefix . $name)));
     $assert($found === $prefix . $name, 'Table '.$name);
@@ -38,4 +38,4 @@ $order->update_meta_data('_suhoput_schema_fixture', $tag);
 $order->save();
 $assert(wc_get_order($order->get_id())->get_meta('_suhoput_schema_fixture') === $tag, 'CRUD with HPOS');
 $order->delete(true);
-echo "PASS: 6 tables, repeated migration, database uniqueness, capabilities and HPOS CRUD\n";
+echo "PASS: 7 tables, repeated migration, database uniqueness, capabilities and HPOS CRUD\n";

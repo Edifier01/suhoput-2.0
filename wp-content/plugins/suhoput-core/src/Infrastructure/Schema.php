@@ -4,7 +4,7 @@ namespace Suhoput\Core\Infrastructure;
 
 final class Schema
 {
-    public const VERSION = 5;
+    public const VERSION = 6;
 
     public static function migrate(): void
     {
@@ -26,6 +26,17 @@ final class Schema
                 }
             }
             $definitions = [
+                'order_access' => "order_id bigint unsigned NOT NULL,
+token_hash varbinary(64) NOT NULL,
+browser_hash varbinary(64) NOT NULL,
+email_hash varbinary(64) NOT NULL,
+purpose varchar(16) NOT NULL,
+user_id bigint unsigned NOT NULL DEFAULT 0,
+state varchar(16) NOT NULL DEFAULT 'issued',
+requested_at bigint unsigned NOT NULL,
+expires_at bigint unsigned NOT NULL,
+grant_expires_at bigint unsigned NOT NULL DEFAULT 0,
+PRIMARY KEY  (order_id)",
                 'links' => "id bigint unsigned NOT NULL AUTO_INCREMENT,
 local_type varchar(32) NOT NULL,
 local_id bigint unsigned NOT NULL,

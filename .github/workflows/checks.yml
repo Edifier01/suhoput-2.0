@@ -71,6 +71,8 @@ jobs:
         run: pnpm test:browser
       - name: Local accounts, concurrent attempts, database failures and captured mail
         run: node tests/accounts-suite.cjs
+      - name: Customer order ownership, one-use proof, direct links, APIs and local mail
+        run: node tests/order-access-suite.cjs
       - name: Stop this CI project
         if: always()
         run: |

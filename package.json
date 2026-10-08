@@ -6,7 +6,8 @@
   "scripts": {
     "test:docs": "node tools/validate-docs.cjs",
     "test:browser": "node tests/browser-smoke.cjs",
-    "test:accounts": "node tests/accounts-suite.cjs"
+    "test:accounts": "node tests/accounts-suite.cjs",
+    "test:order-access": "node tests/order-access-suite.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1"
