@@ -10,17 +10,9 @@ final class Journal
     public function intend(array $command): void
     {
         global $wpdb;
-        foreach (['operation_id','provider','action'] as $key) {
-            if (!is_string($command[$key] ?? null) || $command[$key] === '' || strlen($command[$key]) > ($key === 'operation_id' ? 36 : 64)) {
-                throw new \InvalidArgumentException('Invalid command identifier.');
-            }
-        }
-        foreach (['order_id','composition_version'] as $key) {
-            if (!is_int($command[$key] ?? null) || $command[$key] < 1) { throw new \InvalidArgumentException('Invalid command version/order.'); }
-        }
+        self::validateCommand($command);
         $key = $command['idempotency_key'] ?? null;
-        if ($key !== null && (!is_string($key) || $key === '' || strlen($key) > 64)) { throw new \InvalidArgumentException('Invalid operation key.'); }
-        $body = self::canonical($command['request'] ?? null);
+        $body = self::canonical($command['request']);
         $row = [
             'operation_id'=>$command['operation_id'], 'order_id'=>$command['order_id'],
             'composition_version'=>$command['composition_version'], 'provider'=>$command['provider'],
@@ -43,6 +35,22 @@ final class Journal
                 throw new \LogicException('An operation intention is immutable.');
             }
         }
+    }
+
+    public static function validateCommand(array $command): void
+    {
+        foreach (['operation_id','provider','action'] as $key) {
+            if (!is_string($command[$key] ?? null) || $command[$key] === '' || strlen($command[$key]) > ($key === 'operation_id' ? 36 : 64)) {
+                throw new \InvalidArgumentException('Invalid command identifier.');
+            }
+        }
+        foreach (['order_id','composition_version'] as $key) {
+            if (!is_int($command[$key] ?? null) || $command[$key] < 1) { throw new \InvalidArgumentException('Invalid command version/order.'); }
+        }
+        $key = $command['idempotency_key'] ?? null;
+        if ($key !== null && (!is_string($key) || $key === '' || strlen($key) > 64)) { throw new \InvalidArgumentException('Invalid operation key.'); }
+        if (!is_array($command['request'] ?? null)) { throw new \InvalidArgumentException('Command request must be an array.'); }
+        self::canonical($command['request']);
     }
 
     public function get(string $id, bool $required = true): ?array
@@ -91,10 +99,15 @@ final class Journal
         if ($ok === false) { throw new \RuntimeException('Could not persist operation result.'); }
     }
 
-    public function receive(string $provider, string $eventId, array $body): void
+    public function receive(string $provider, string $eventId, array $body, ?int $orderId = null): int
     {
+        global $wpdb;
+        if ($provider === '' || strlen($provider) > 64 || $eventId === '' || ($orderId !== null && $orderId < 1)) { throw new \InvalidArgumentException('Invalid inbox identity.'); }
         $this->uniquePayload('inbox', ['provider'=>$provider,'event_key'=>hash('sha256',$eventId)],
-            ['body'=>self::canonical($body),'body_hash'=>hash('sha256',self::canonical($body)),'received_at'=>gmdate('Y-m-d H:i:s')], 'body');
+            ['order_id'=>$orderId,'body'=>self::canonical($body),'body_hash'=>hash('sha256',self::canonical($body)),'received_at'=>gmdate('Y-m-d H:i:s')], 'body');
+        $row = $wpdb->get_row($wpdb->prepare('SELECT id,order_id FROM '.$this->table('inbox').' WHERE provider=%s AND event_key=%s', $provider,hash('sha256',$eventId)),ARRAY_A);
+        if (($row['order_id'] === null ? null : (int)$row['order_id']) !== $orderId) { throw new \LogicException('Conflicting event order.'); }
+        return (int)$row['id'];
     }
 
     public function notify(array $identity, array $payload): void

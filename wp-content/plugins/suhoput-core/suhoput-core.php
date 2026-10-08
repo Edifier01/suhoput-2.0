@@ -27,3 +27,8 @@ add_action('plugins_loaded', static function (): void {
         \Suhoput\Core\Infrastructure\Schema::migrate();
     }
 });
+add_action('woocommerce_after_order_object_save', static function ($order): void {
+    if ($order instanceof WC_Order) {
+        \Suhoput\Core\Infrastructure\OrderOutbox::synchronize($order);
+    }
+});

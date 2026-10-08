@@ -4,7 +4,7 @@ namespace Suhoput\Core\Infrastructure;
 
 final class Schema
 {
-    public const VERSION = 3;
+    public const VERSION = 4;
 
     public static function migrate(): void
     {
@@ -56,6 +56,7 @@ request_body longtext NOT NULL,
 request_hash char(64) NOT NULL,
 state varchar(16) NOT NULL DEFAULT 'queued',
 result_body longtext DEFAULT NULL,
+applied_at datetime DEFAULT NULL,
 attempts int unsigned NOT NULL DEFAULT 0,
 next_attempt_at datetime DEFAULT NULL,
 lease_until datetime DEFAULT NULL,
@@ -68,9 +69,14 @@ KEY runnable (state,next_attempt_at)",
                 'inbox' => "id bigint unsigned NOT NULL AUTO_INCREMENT,
 provider varchar(64) NOT NULL,
 event_key char(64) NOT NULL,
+order_id bigint unsigned DEFAULT NULL,
 body longtext NOT NULL,
 body_hash char(64) NOT NULL,
 state varchar(16) NOT NULL DEFAULT 'queued',
+attempts int unsigned NOT NULL DEFAULT 0,
+next_attempt_at datetime DEFAULT NULL,
+lease_until datetime DEFAULT NULL,
+processed_at datetime DEFAULT NULL,
 received_at datetime NOT NULL,
 PRIMARY KEY  (id),
 UNIQUE KEY provider_event (provider,event_key),
@@ -82,6 +88,8 @@ payload longtext NOT NULL,
 state varchar(16) NOT NULL DEFAULT 'queued',
 attempts int unsigned NOT NULL DEFAULT 0,
 next_attempt_at datetime DEFAULT NULL,
+lease_until datetime DEFAULT NULL,
+result_body longtext DEFAULT NULL,
 created_at datetime NOT NULL,
 PRIMARY KEY  (id),
 UNIQUE KEY notification_key (notification_key),
