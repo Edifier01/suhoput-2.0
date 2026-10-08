@@ -4,6 +4,10 @@ if ! wp core is-installed >/dev/null 2>&1; then
   wp core install --url=http://localhost:18880 --title='Suhoput local' --admin_user=local-admin --admin_password="$LOCAL_ADMIN_PASSWORD" --admin_email=local-admin@example.invalid --skip-email
 fi
 if ! wp plugin is-installed woocommerce >/dev/null 2>&1; then
+  if [ ! -r /packages/woocommerce.11.2.0.zip ]; then
+    echo 'Verified WooCommerce archive is missing or unreadable; bootstrap stopped.' >&2
+    exit 1
+  fi
   wp plugin install /packages/woocommerce.11.2.0.zip
 fi
 if [ "$(wp plugin get woocommerce --field=version)" != '11.2.0' ]; then

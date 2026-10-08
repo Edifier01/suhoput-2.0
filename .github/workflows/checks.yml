@@ -32,6 +32,7 @@ jobs:
           for key in LOCAL_DB_PASSWORD LOCAL_DB_ROOT_PASSWORD LOCAL_ADMIN_PASSWORD; do
             printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
           done > infra/.env.local
+          umask 022
           mkdir -p .cache/packages
           curl --fail --silent --show-error --location https://downloads.wordpress.org/plugin/woocommerce.11.2.0.zip -o .cache/packages/woocommerce.11.2.0.zip
           printf '%s  %s\n' 66e91b45b057b64c73d4521111cea5bdc78c4c89de8fa2ca4b18b9422706d722 .cache/packages/woocommerce.11.2.0.zip | sha256sum --check
