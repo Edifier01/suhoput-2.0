@@ -496,6 +496,15 @@
 
 ## Доказательства исполнения
 
+<a id="exec-chk-020"></a>
+### EXEC-CHK-020 — Серверный CI инструментов раннего чтения
+
+08.10.2026, итог проверен 11:11 UTC (14:11 Europe/Moscow). Код **9fbdd42bdb15d44374b6a0cbc73de0882848dcfa**, [PR run 37767842201](https://github.com/Edifier01/suhoput-2.0/actions/runs/37767842201), job 113279738519; [push run 37767837276](https://github.com/Edifier01/suhoput-2.0/actions/runs/37767837276), job 113279723080. Оба foundation — success. GitHub-hosted Ubuntu 24.04, workflow с Node 24.19.0, системным pwsh и закреплёнными образами/архивом WordPress/WooCommerce; закрытая сеть стенда, без секретов МойСклад/ЮKassa.
+
+По фактическим steps оба запуска: Documents and whitespace, Independent MoySklad probe scenarios (no credentials), redacted Gitleaks, проверка WC ZIP, установка browser tools, Bootstrap and PHP checks, system minute queue, browser smoke и cleanup — success. Это стандартная серверная регрессия и проверка 27 синтетических сценариев инструмента; внешние GET EXEC-CHK-018 выполнялись отдельно на Windows. Наследование/резерв/маркировка реально не доказаны, никаких внешних изменяющих испытаний CI не выполняет. TASK-013/014 не перерабатывались.
+
+PR #1 остаётся draft/open, head=feat/local-foundation; коммит появился в нём после push. Текст доказательств добавлен в существующее описание через авторизованный интерфейс GitHub, сохранённое состояние проверено визуально. Коннектор update_pull_request получил 403; запасной способ API с чтением Git credential helper отклонён автоматической проверкой до выполнения. Безопасный UI завершил обновление без чтения токена/изменения разрешений. Слияние/Release не выполнялись. Данная запись и итог STATUS — последующая документальная поправка; результаты серверных испытаний относятся именно к указанной кодовой точке, а не к ещё не созданному SHA документационной передачи.
+
 <a id="exec-chk-018"></a>
 ### EXEC-CHK-018 — Возобновляемое GET-чтение каталога и документов
 
