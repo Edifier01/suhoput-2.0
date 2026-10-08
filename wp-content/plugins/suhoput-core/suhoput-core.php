@@ -33,3 +33,5 @@ add_action('woocommerce_after_order_object_save', static function ($order): void
     }
 });
 add_action('init', [\Suhoput\Core\Infrastructure\QueueRuntime::class, 'boot'], 20);
+\Suhoput\Core\Infrastructure\Accounts::boot();
+add_action('plugins_loaded', [\Suhoput\Core\Accounts\Forms::class, 'boot'], 30);

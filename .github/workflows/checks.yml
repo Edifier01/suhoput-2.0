@@ -69,6 +69,8 @@ jobs:
         run: node tests/queue-minute.cjs
       - name: Browser smoke
         run: pnpm test:browser
+      - name: Local accounts, concurrent attempts, database failures and captured mail
+        run: node tests/accounts-suite.cjs
       - name: Stop this CI project
         if: always()
         run: |
