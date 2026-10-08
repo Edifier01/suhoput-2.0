@@ -22,7 +22,11 @@ jobs:
           git diff --check
       - name: Independent MoySklad probe scenarios (no credentials)
         shell: pwsh
-        run: ./tests/moysklad-probe.ps1
+        run: |
+          ./tests/moysklad-probe.ps1
+          ./tests/moysklad-control.ps1
+          ./tests/moysklad-document-control.ps1
+          ./tests/moysklad-examples.ps1
       - name: Secrets (redacted)
         run: >-
           docker run --rm --network none -v "$PWD:/repo:ro"
