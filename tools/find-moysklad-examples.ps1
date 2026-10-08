@@ -128,5 +128,9 @@ try {
     $taskState.checked_utc=[DateTime]::UtcNow.ToString('o'); Save-Examples
     $taskCatalogRows=@($taskState.products.Values)+@($taskState.variants.Values)
     @{result='examples_search_complete';utc=$taskState.checked_utc;requests=$taskRequests;mutations=0;products=$taskState.product.size;variants=$taskState.variant.size;images_unknown=@($taskCatalogRows | Where-Object { $null -eq $_.images }).Count;photo_candidates=$taskState.photo_candidates.Count;documents=$taskState.demand.offset;document_pages=$taskState.demand.pages;positions=$taskState.positions;linked_orders=$taskState.linked_orders;code_candidate_documents=$taskState.code_candidates.Count;full_code_proven=$false} | ConvertTo-Json -Compress
-} catch { throw ('Read-only examples search stopped; status='+$taskLastStatus+'; raw response/PII/codes/credentials withheld. No mutations.') }
+} catch {
+    $taskSafeReason='withheld'
+    if ($_.Exception.Message -cin @('Collection size changed; restart read.','Collection count exceeded size.','Missing or invalid collection size.','Response offset differs from requested checkpoint.','Missing or duplicate ID.','Empty intermediate page.','Catalog size changed; no complete result.','Document size changed; no complete result.','Image collection incomplete.','Document outside selected warehouse/organization.')) { $taskSafeReason=$_.Exception.Message }
+    throw ('Read-only examples search stopped; source='+[IO.Path]::GetFileName($_.InvocationInfo.ScriptName)+'; line='+$_.InvocationInfo.ScriptLineNumber+'; exception_type='+$_.Exception.GetType().Name+'; status='+$taskLastStatus+'; reason='+$taskSafeReason+'; raw response/PII/codes/credentials withheld. No mutations.')
+}
 finally { $taskClient.Dispose(); $taskHandler.Dispose(); $taskConfig.Clear() }
