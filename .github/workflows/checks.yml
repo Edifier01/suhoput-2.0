@@ -20,6 +20,9 @@ jobs:
         run: |
           node tools/validate-docs.cjs
           git diff --check
+      - name: Independent MoySklad probe scenarios (no credentials)
+        shell: pwsh
+        run: ./tests/moysklad-probe.ps1
       - name: Secrets (redacted)
         run: >-
           docker run --rm --network none -v "$PWD:/repo:ro"
