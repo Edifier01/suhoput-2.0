@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$WarehouseName, [switch]$ProbeCatalog)
+param([Parameter(Mandatory)][string]$WarehouseName, [string]$OrganizationName, [switch]$ProbeCatalog, [switch]$FullCatalog)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 $taskFile = Join-Path $taskRoot 'infra/.env.integrations.local'
@@ -64,14 +64,21 @@ try {
         }
     }
     $taskOrgs = Get-TaskMs '/entity/organization?limit=1000'
+    if ($OrganizationName -and -not $taskOrgs.ok) { throw ('Organization read failed, status=' + $taskOrgs.status + '; configuration not saved.') }
     $taskActiveOrgs = @()
     if ($taskOrgs.ok) {
         $taskActiveOrgs = @($taskOrgs.data.rows | Where-Object { -not $_.archived })
-        if ($taskActiveOrgs.Count -eq 1) { Set-TaskSetting 'MOYSKLAD_ORGANIZATION_ID' $taskActiveOrgs[0].id }
+        if ($OrganizationName) {
+            $taskMatchingOrg = @($taskActiveOrgs | Where-Object { $_.name -ceq $OrganizationName })
+            if ($taskMatchingOrg.Count -ne 1) { throw 'Organization name is not unique or was not found; confirm locally. Values were not printed.' }
+            Set-TaskSetting 'MOYSKLAD_ORGANIZATION_ID' $taskMatchingOrg[0].id
+            Set-TaskSetting 'MOYSKLAD_ORGANIZATION_NAME' $taskMatchingOrg[0].name
+        } elseif ($taskActiveOrgs.Count -eq 1) { Set-TaskSetting 'MOYSKLAD_ORGANIZATION_ID' $taskActiveOrgs[0].id }
     }
     $taskShops = Get-TaskMs '/entity/retailstore?limit=1000'
     $taskLinkedShops = @()
     if ($taskShops.ok) {
+        Set-TaskSetting 'MOYSKLAD_RETAIL_STORE_ID' ''
         $taskLinkedShops = @($taskShops.data.rows | Where-Object { -not $_.archived -and $_.store.meta.href -eq ($taskBase + '/entity/store/' + $taskWarehouse.id) })
         if ($taskLinkedShops.Count -eq 1) {
             Set-TaskSetting 'MOYSKLAD_SHOP_NAME' $taskLinkedShops[0].name
@@ -111,5 +118,32 @@ try {
         }
         [IO.File]::WriteAllText((Join-Path $taskRoot '.cache/moysklad/probe.local.json'), ($taskSummary | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
         Write-Output ($taskSummary | ConvertTo-Json -Compress -Depth 8)
+    }
+    if ($FullCatalog) {
+        $taskTotals = @{}
+        foreach ($taskEntity in @('product','variant')) {
+            $taskOffset=0; $taskIds=[Collections.Generic.HashSet[string]]::new(); $taskPages=0; $taskStableSize=$null; $taskImages=0; $taskMissingRetail=0; $taskControl13000=0
+            do {
+                $taskPage = Get-TaskMs ('/entity/'+$taskEntity+'?limit=1000&offset='+$taskOffset)
+                if (-not $taskPage.ok) { throw ('Catalog page read failed, entity='+$taskEntity+', offset='+$taskOffset+', status='+$taskPage.status) }
+                $taskSize=[int]$taskPage.data.meta.size
+                if ($null -eq $taskStableSize) { $taskStableSize=$taskSize }
+                if ($taskSize -ne $taskStableSize) { throw 'Catalog changed during pagination; no complete snapshot claimed.' }
+                foreach ($taskItem in $taskPage.data.rows) {
+                    if (-not $taskIds.Add($taskItem.id)) { throw 'Duplicate item during pagination; no complete snapshot claimed.' }
+                    if ($taskItem.images.meta.size -gt 0) { ++$taskImages }
+                    $taskRetail=@($taskItem.salePrices | Where-Object { $_.priceType.id -eq $taskConfig['MOYSKLAD_RETAIL_PRICE_TYPE_ID'] })
+                    if ($taskRetail.Count -ne 1 -or $taskRetail[0].value -le 0) { ++$taskMissingRetail }
+                    if ($taskRetail.Count -eq 1 -and $taskRetail[0].value -eq 1300000) { ++$taskControl13000 }
+                }
+                ++$taskPages
+                $taskOffset+=@($taskPage.data.rows).Count
+                if ($taskOffset -lt $taskSize -and @($taskPage.data.rows).Count -eq 0) { throw 'Empty intermediate page; no complete snapshot claimed.' }
+            } while ($taskOffset -lt $taskSize)
+            $taskTotals[$taskEntity]=@{expected=$taskSize; unique=$taskIds.Count; pages=$taskPages; with_images=$taskImages; nonpositive_or_missing_retail_price=$taskMissingRetail; price_13000_examples=$taskControl13000}
+        }
+        $taskPagination=@{checked_utc=[DateTime]::UtcNow.ToString('o');method='GET';mutations=0;result='stable_metadata_pagination';totals=$taskTotals;resume_after_process_stop='not_tested';variant_price_inheritance='not_proven'}
+        [IO.File]::WriteAllText((Join-Path $taskRoot '.cache/moysklad/pagination.local.json'), ($taskPagination | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+        Write-Output ($taskPagination | ConvertTo-Json -Compress -Depth 6)
     }
 } finally { $taskClient.Dispose(); $taskHandler.Dispose(); $taskConfig.Clear(); $taskText=$null }

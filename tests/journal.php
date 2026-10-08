@@ -42,6 +42,19 @@ try {
     $journal->notify($notice,['subject'=>'Synthetic']);
     $journal->notify($notice,['subject'=>'Synthetic']);
     $assert((int)$wpdb->get_var($wpdb->prepare('SELECT COUNT(*) FROM '.$wpdb->prefix.'suhoput_notifications WHERE order_id=%d',$order->get_id()))===1,'Notification has independent deduplication');
+    $distinct = $command;
+    foreach (['Review-Key-A', 'review-key-a', 'Review-Key-A '] as $opaqueKey) {
+        $distinct['operation_id'] = wp_generate_uuid4();
+        $distinct['idempotency_key'] = $opaqueKey;
+        $journal->intend($distinct);
+        $assert($journal->get($distinct['operation_id'])['idempotency_key'] === $opaqueKey, 'Opaque keys retain exact bytes');
+    }
+    $distinct['idempotency_key'] = null;
+    foreach (['OPAQUE-ID', 'opaque-id', 'opaque-id '] as $opaqueId) {
+        $distinct['operation_id'] = $opaqueId;
+        $journal->intend($distinct);
+        $assert($journal->get($opaqueId)['operation_id'] === $opaqueId, 'Opaque operation IDs retain exact bytes');
+    }
 } finally {
     foreach(['operations','notifications','holds'] as $table){$wpdb->delete($wpdb->prefix.'suhoput_'.$table,['order_id'=>$order->get_id()]);}
     $wpdb->delete($wpdb->prefix.'suhoput_inbox',['provider'=>$provider]);

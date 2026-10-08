@@ -46,6 +46,7 @@ jobs:
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/local-safety.php
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli php /tests/contracts.php
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema-upgrade.php
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/journal.php
           node tests/concurrency.cjs
           docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /tests/lint.sh

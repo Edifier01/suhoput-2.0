@@ -4,7 +4,7 @@ namespace Suhoput\Core\Infrastructure;
 
 final class Schema
 {
-    public const VERSION = 2;
+    public const VERSION = 3;
 
     public static function migrate(): void
     {
@@ -21,7 +21,9 @@ final class Schema
             $holdsTable = $p . 'holds';
             if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($holdsTable))) === $holdsTable) {
                 $index = $wpdb->get_results("SHOW INDEX FROM {$holdsTable} WHERE Key_name = 'operation_id'");
-                if ($index) { $wpdb->query("ALTER TABLE {$holdsTable} DROP INDEX operation_id"); }
+                if ($index && $wpdb->query("ALTER TABLE {$holdsTable} DROP INDEX operation_id") === false) {
+                    throw new \RuntimeException('Could not remove obsolete hold index.');
+                }
             }
             $definitions = [
                 'links' => "id bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -44,12 +46,12 @@ UNIQUE KEY email_key (email_key),
 UNIQUE KEY user_id (user_id),
 UNIQUE KEY counterparty_id (counterparty_id)",
                 'operations' => "id bigint unsigned NOT NULL AUTO_INCREMENT,
-operation_id char(36) NOT NULL,
+operation_id varbinary(36) NOT NULL,
 order_id bigint unsigned NOT NULL,
 composition_version bigint unsigned NOT NULL,
 provider varchar(64) NOT NULL,
 action varchar(64) NOT NULL,
-idempotency_key varchar(64) DEFAULT NULL,
+idempotency_key varbinary(64) DEFAULT NULL,
 request_body longtext NOT NULL,
 request_hash char(64) NOT NULL,
 state varchar(16) NOT NULL DEFAULT 'queued',
@@ -85,14 +87,14 @@ PRIMARY KEY  (id),
 UNIQUE KEY notification_key (notification_key),
 KEY runnable (state,next_attempt_at)",
                 'holds' => "id bigint unsigned NOT NULL AUTO_INCREMENT,
-hold_id char(36) NOT NULL,
+hold_id varbinary(36) NOT NULL,
 order_id bigint unsigned NOT NULL,
 composition_version bigint unsigned NOT NULL,
 variant_id bigint unsigned NOT NULL,
 warehouse_id varchar(191) COLLATE utf8mb4_bin NOT NULL,
 quantity bigint unsigned NOT NULL,
 state varchar(16) NOT NULL DEFAULT 'pending',
-operation_id char(36) NOT NULL,
+operation_id varbinary(36) NOT NULL,
 expires_at datetime NOT NULL,
 PRIMARY KEY  (id),
 UNIQUE KEY hold_id (hold_id),
@@ -102,16 +104,64 @@ KEY variant_state (variant_id,state)",
             ];
             foreach ($definitions as $name => $columns) {
                 dbDelta("CREATE TABLE {$p}{$name} (\n{$columns}\n) ENGINE=InnoDB {$collate};");
-                if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($p . $name))) !== $p . $name) {
-                    throw new \RuntimeException('Own table migration failed.');
-                }
+                self::assertStructure($p . $name, $columns);
             }
             foreach (['administrator', 'shop_manager'] as $roleName) {
                 get_role($roleName)?->add_cap('manage_suhoput');
             }
-            update_option('suhoput_schema_version', self::VERSION, false);
+            $previousVersion = (int) get_option('suhoput_schema_version', 0);
+            if (!update_option('suhoput_schema_version', self::VERSION, false) && $previousVersion !== self::VERSION) {
+                throw new \RuntimeException('Could not persist schema version.');
+            }
         } finally {
             $wpdb->get_var($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock));
+        }
+    }
+
+    /** dbDelta can return normally after SQL errors. Verify its actual postconditions. */
+    private static function assertStructure(string $table, string $definition): void
+    {
+        global $wpdb;
+        $status = $wpdb->get_row($wpdb->prepare('SHOW TABLE STATUS LIKE %s', $wpdb->esc_like($table)), ARRAY_A);
+        if (!$status || strcasecmp($status['Engine'], 'InnoDB') !== 0) {
+            throw new \RuntimeException('Own table migration failed.');
+        }
+        $columns = [];
+        foreach ($wpdb->get_results("SHOW FULL COLUMNS FROM {$table}", ARRAY_A) as $column) { $columns[$column['Field']] = $column; }
+        $indexes = [];
+        foreach ($wpdb->get_results("SHOW INDEX FROM {$table}", ARRAY_A) as $index) {
+            $indexes[$index['Key_name']]['unique'] = (int) $index['Non_unique'] === 0;
+            $indexes[$index['Key_name']]['columns'][(int) $index['Seq_in_index']] = $index['Column_name'];
+            if ($index['Sub_part'] !== null) { throw new \RuntimeException('Truncated own index is not supported.'); }
+        }
+        $normalizeType = static fn(string $type): string => strtolower(preg_replace('/(tinyint|smallint|mediumint|int|bigint)\(\d+\)/i', '$1', $type));
+        foreach (explode("\n", $definition) as $line) {
+            $line = rtrim(trim($line), ',');
+            if (preg_match('/^(PRIMARY KEY|UNIQUE KEY|KEY)\s+(?:(\w+)\s*)?\(([^)]+)\)$/', $line, $key)) {
+                $name = $key[1] === 'PRIMARY KEY' ? 'PRIMARY' : $key[2];
+                $expected = array_map('trim', explode(',', $key[3]));
+                $actual = $indexes[$name] ?? null;
+                if ($actual) { ksort($actual['columns']); }
+                if (!$actual || array_values($actual['columns']) !== $expected || $actual['unique'] !== ($key[1] !== 'KEY')) {
+                    throw new \RuntimeException('Required own index is missing or incompatible.');
+                }
+                continue;
+            }
+            if (!preg_match('/^(\w+)\s+(\w+(?:\(\d+\))?(?: unsigned)?)/', $line, $expected)) {
+                throw new \LogicException('Invalid own schema definition.');
+            }
+            $column = $columns[$expected[1]] ?? null;
+            $nullable = !str_contains($line, 'NOT NULL');
+            $autoIncrement = str_contains($line, 'AUTO_INCREMENT');
+            if (!$column || $normalizeType($column['Type']) !== $normalizeType($expected[2]) || ($column['Null'] === 'YES') !== $nullable || str_contains($column['Extra'], 'auto_increment') !== $autoIncrement) {
+                throw new \RuntimeException('Required own column is missing or incompatible.');
+            }
+            if (preg_match('/COLLATE (\w+)/', $line, $collation) && $column['Collation'] !== $collation[1]) {
+                throw new \RuntimeException('Required own identifier collation is missing.');
+            }
+            if (preg_match("/DEFAULT '([^']*)'/", $line, $default) && $column['Default'] !== $default[1]) {
+                throw new \RuntimeException('Required own column default is missing.');
+            }
         }
     }
 }

@@ -54,6 +54,7 @@ docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/local-safety.php
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli php /tests/contracts.php
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema.php
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema-upgrade.php
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/journal.php
 docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /tests/lint.sh
 node tests/concurrency.cjs
