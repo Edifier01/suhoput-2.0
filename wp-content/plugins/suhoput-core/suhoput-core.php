@@ -1,0 +1,29 @@
+<?php
+/**
+ * Plugin Name: Suhoput Core
+ * Description: Правила магазина Suhoput.
+ * Version: 0.1.0
+ * Requires PHP: 8.3
+ * Requires Plugins: woocommerce
+ * License: GPL-2.0-or-later
+ */
+defined('ABSPATH') || exit;
+spl_autoload_register(static function (string $class): void {
+    $prefix = 'Suhoput\\Core\\';
+    if (!str_starts_with($class, $prefix)) { return; }
+    $relative = substr($class, strlen($prefix));
+    if (!preg_match('/\A[A-Za-z0-9_\\\\]+\z/', $relative)) { return; }
+    $file = __DIR__ . '/src/' . str_replace('\\', '/', $relative) . '.php';
+    if (is_file($file)) { require_once $file; }
+});
+add_action('before_woocommerce_init', static function (): void {
+    if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+    }
+});
+register_activation_hook(__FILE__, [\Suhoput\Core\Infrastructure\Schema::class, 'migrate']);
+add_action('plugins_loaded', static function (): void {
+    if ((int) get_option('suhoput_schema_version', 0) < \Suhoput\Core\Infrastructure\Schema::VERSION) {
+        \Suhoput\Core\Infrastructure\Schema::migrate();
+    }
+});

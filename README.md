@@ -15,6 +15,10 @@
 | [STATUS](docs/STATUS.md) | Текущая передача работы и препятствия |
 | [ACCEPTANCE](docs/ACCEPTANCE.md) | Покрытие ТЗ, способы проверок и доказательства |
 | [DECISIONS](docs/DECISIONS.md) | Основания решений и изменения требований |
+| [ACCESS](docs/ACCESS.md) | Получение прав, тестовые контуры и заполнение локальной конфигурации |
+| [COMPATIBILITY](docs/COMPATIBILITY.md) | Зафиксированные версии, лицензии и предварительный аудит ЮKassa |
+| [CONTRACTS](docs/CONTRACTS.md) | Интерфейсы v1 и модель состояний/событий |
+| [DESIGN](docs/DESIGN.md) | Карта исходной вёрстки и отсутствующих состояний |
 
 ## Окружение и запуск
 
@@ -28,10 +32,50 @@
 | Docker и SSH | Docker Engine 29.8.0 и Compose 5.5.1 отвечают; SSH-соединения не проверялись |
 | Python | Найден WindowsApps alias; работоспособность интерпретатора не подтверждена |
 | PHP, Composer, WP-CLI, npm, gh, MariaDB/MySQL CLI | Не найдены в текущем PATH; отсутствие установки вне PATH не утверждается |
-| WordPress/WooCommerce, PHP-среда и база | Не подготовлены в проекте; версии и совместимость ещё не выбраны |
-| Дизайн и ресурсы | В проекте отсутствуют |
+| WordPress/WooCommerce, PHP и база | Локально 7.1.3 / 11.2.0 / 8.3.35 / MariaDB 10.11.19, HPOS включён |
+| Дизайн | Предоставлена папка владельца, сопоставление — DESIGN; текущая тема — минимальный каркас |
 
-**Команд запуска магазина, установки зависимостей, сборки, миграций, функциональных тестов и CI пока нет.** Не использовать вымышленные `npm run`, `wp` или контейнерные команды. После подготовки окружения агент добавит сюда фактически выполненные команды и конфигурацию безопасного стенда.
+## Локальный стенд
+
+Из корня проекта, PowerShell 7 / Docker с Linux-контейнерами:
+
+```powershell
+./infra/init-local.ps1
+./tools/fetch-vendor.ps1
+docker compose --env-file infra/.env.local -f infra/compose.yaml up -d --wait
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /bootstrap.sh
+```
+
+Проверены первая установка и повтор bootstrap. Docker образы закреплены digest, WooCommerce ZIP проверяется SHA-256. WordPress доступен на http://localhost:18880, перехватчик почты — http://localhost:18881. Учётка стенда `local-admin`, пароль только в игнорируемом `infra/.env.local`, здесь не выводится. Сеть приложения/базы закрыта; localhost публикует отдельный прокси. HTTP API заблокирован локальным MU-обработчиком, почта направлена в Mailpit, задания от посещений и автообновления отключены. MU-обработчик относится только к инфраструктуре локального стенда и не включается в production. Интеграционные ключи из [ACCESS](docs/ACCESS.md) в этот закрытый стенд автоматически не передаются.
+
+Два собственных плагина и классическая тема активны. Функции магазина проходят отдельные задачи PLAN; минимальная тема ещё не воспроизводит дизайн. ЮKassa на стенде не установлена.
+
+```powershell
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/local-safety.php
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli php /tests/contracts.php
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema.php
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/journal.php
+docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /tests/lint.sh
+node tests/concurrency.cjs
+./tools/check-secrets.ps1
+```
+
+Браузерные зависимости: pnpm 11.25.0, lockfile фиксирует Playwright 1.62.1. На текущем компьютере pnpm доступен по пути bundled runtime:
+
+```powershell
+& 'C:/Users/komba/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/fallback/pnpm.cmd' install --frozen-lockfile
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) '.cache/ms-playwright'
+& 'C:/Users/komba/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/fallback/pnpm.cmd' exec playwright install chromium --only-shell
+node tests/browser-smoke.cjs
+```
+
+Для другой среды использовать установленный pnpm той же версии; абсолютный bundled путь относится к этому компьютеру. В CI Linux используется собственная установка браузера. Smoke проверяет запуск каркаса desktop/mobile, а не покупательскую приёмку TASK-040. PHP-имитации не доказывают внешний резерв/платёж. Команды Docker, HTTP localhost и браузер требуют разрешения песочницы в этой сессии.
+
+Остановка только этого проекта без удаления данных:
+
+```powershell
+docker compose --env-file infra/.env.local -f infra/compose.yaml down
+```
 
 VPS Timeweb, S3 Selectel, домен и почтовый домен reg.ru указаны владельцем в ТЗ; доступы, адреса и состояние не обследованы. Порядок размещения и эксплуатации задаёт [SPEC](docs/SPEC.md#почта-и-эксплуатация). Секреты задаются в соответствующем окружении, а не в документах.
 
