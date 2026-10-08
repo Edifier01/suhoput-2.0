@@ -73,6 +73,8 @@ jobs:
         run: node tests/accounts-suite.cjs
       - name: Customer order ownership, one-use proof, direct links, APIs and local mail
         run: node tests/order-access-suite.cjs
+      - name: Server cart context, guest quotas, concurrent requests and local mail
+        run: node tests/commerce-suite.cjs
       - name: Stop this CI project
         if: always()
         run: |

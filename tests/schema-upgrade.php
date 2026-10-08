@@ -7,7 +7,7 @@ $originalOptions = $wpdb->options;
 $fixturePrefix = 'fixture_' . bin2hex(random_bytes(6)) . '_';
 $fixtureOptions = $fixturePrefix . 'options';
 $tables = array_map(static fn(string $name): string => $fixturePrefix . 'suhoput_' . $name,
-    ['links', 'accounts', 'operations', 'inbox', 'notifications', 'holds', 'order_access']);
+    ['links', 'accounts', 'operations', 'inbox', 'notifications', 'holds', 'order_access', 'guest_rates', 'guest_slots']);
 $resetCache = static function (): void {
     foreach (['suhoput_schema_version', 'alloptions', 'notoptions', 'wp_user_roles'] as $key) {
         wp_cache_delete($key, 'options');

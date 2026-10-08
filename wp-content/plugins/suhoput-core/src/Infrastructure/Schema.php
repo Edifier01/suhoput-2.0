@@ -4,7 +4,7 @@ namespace Suhoput\Core\Infrastructure;
 
 final class Schema
 {
-    public const VERSION = 6;
+    public const VERSION = 7;
 
     public static function migrate(): void
     {
@@ -26,6 +26,18 @@ final class Schema
                 }
             }
             $definitions = [
+                'guest_rates' => "bucket_key varbinary(64) NOT NULL,
+window_start bigint unsigned NOT NULL,
+attempts int unsigned NOT NULL DEFAULT 0,
+PRIMARY KEY  (bucket_key)",
+                'guest_slots' => "intent_id varbinary(36) NOT NULL,
+actor_hash varbinary(64) NOT NULL,
+ip_hash varbinary(64) NOT NULL,
+state varchar(16) NOT NULL DEFAULT 'active',
+created_at bigint unsigned NOT NULL,
+PRIMARY KEY  (intent_id),
+KEY actor_state (actor_hash,state),
+KEY ip_state (ip_hash,state)",
                 'order_access' => "order_id bigint unsigned NOT NULL,
 token_hash varbinary(64) NOT NULL,
 browser_hash varbinary(64) NOT NULL,

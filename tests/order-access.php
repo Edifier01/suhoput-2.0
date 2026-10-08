@@ -113,11 +113,17 @@ try {
     wp_set_current_user(0);
     $r=rest_do_request(new WP_REST_Request('GET','/suhoput/v1/orders'));
     $assert($r->get_status() === 404,'Guest cannot enumerate history');
+    // TASK-019 keeps the earlier revoked-history scenario read-only. Re-enable
+    // this fixture's wholesale right before testing a new trusted checkout.
+    $wpdb->update($wpdb->prefix.'suhoput_accounts',['access_enabled'=>1],['user_id'=>$one]);
     $checkoutOrder=new WC_Order(); $checkoutOrder->set_customer_id($two); wp_set_current_user($one);
     do_action('woocommerce_checkout_create_order',$checkoutOrder,[]);
     $checkoutOrder->save(); $orders[]=$checkoutOrder->get_id();
     $assert(Access::isSite($checkoutOrder) && $checkoutOrder->get_customer_id() === $one,'Checkout uses server session owner and site origin');
     wp_set_current_user(0); $checkoutOrder=new WC_Order(); $checkoutOrder->set_billing_email($tag.'@example.invalid');
+    $guestRandom=bin2hex(random_bytes(32));
+    $_COOKIE[\Suhoput\Core\Commerce\GuestLimits::COOKIE]=$guestRandom.'.'.hash_hmac('sha256',$guestRandom,wp_salt('auth'));
+    $_SERVER['REMOTE_ADDR']='192.0.2.18';
     do_action('woocommerce_checkout_create_order',$checkoutOrder,[]); $checkoutOrder->save(); $orders[]=$checkoutOrder->get_id();
     do_action('woocommerce_checkout_order_created',$checkoutOrder);
     $assert(Access::canView($checkoutOrder,0),'Originating checkout browser can access its new guest order');
@@ -130,7 +136,7 @@ try {
     echo 'PASS: '.$checks.' order ownership and proof checks; fixture='.$tag."\n";
 } finally {
     wp_set_current_user(0);
-    foreach ($orders as $id) { if (class_exists(Access::class)) { $wpdb->delete($wpdb->prefix.'suhoput_order_access',['order_id'=>$id]); } wc_get_order($id)?->delete(true); }
+    foreach ($orders as $id) { if (class_exists(Access::class)) { $wpdb->delete($wpdb->prefix.'suhoput_order_access',['order_id'=>$id]); } $o=wc_get_order($id); if ($o) { $wpdb->delete($wpdb->prefix.'suhoput_guest_slots',['intent_id'=>(string)$o->get_meta('_suhoput_guest_intent')]); $o->delete(true); } }
     require_once ABSPATH.'wp-admin/includes/user.php';
     foreach ($users as $id) { $wpdb->delete($wpdb->prefix.'suhoput_accounts',['user_id'=>$id]); wp_delete_user($id); }
 }

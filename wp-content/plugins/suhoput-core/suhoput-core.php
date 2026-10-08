@@ -8,6 +8,8 @@
  * License: GPL-2.0-or-later
  */
 defined('ABSPATH') || exit;
+// Foundation deliberately bypasses page caches. Enabling one requires TASK-023/046 proof.
+if (!defined('DONOTCACHEPAGE')) { define('DONOTCACHEPAGE', true); }
 spl_autoload_register(static function (string $class): void {
     $prefix = 'Suhoput\\Core\\';
     if (!str_starts_with($class, $prefix)) { return; }
@@ -37,3 +39,5 @@ add_action('init', [\Suhoput\Core\Infrastructure\QueueRuntime::class, 'boot'], 2
 add_action('plugins_loaded', [\Suhoput\Core\Accounts\Forms::class, 'boot'], 30);
 add_action('plugins_loaded', [\Suhoput\Core\Orders\Access::class, 'boot'], 30);
 add_action('plugins_loaded', [\Suhoput\Core\Orders\Forms::class, 'boot'], 30);
+add_action('plugins_loaded', [\Suhoput\Core\Commerce\Context::class, 'boot'], 30);
+add_action('plugins_loaded', [\Suhoput\Core\Commerce\Settings::class, 'boot'], 30);

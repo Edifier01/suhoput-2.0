@@ -7,7 +7,8 @@
     "test:docs": "node tools/validate-docs.cjs",
     "test:browser": "node tests/browser-smoke.cjs",
     "test:accounts": "node tests/accounts-suite.cjs",
-    "test:order-access": "node tests/order-access-suite.cjs"
+    "test:order-access": "node tests/order-access-suite.cjs",
+    "test:commerce": "node tests/commerce-suite.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1"
