@@ -1,0 +1,83 @@
+name: Required checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  foundation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - name: Documents and whitespace
+        run: |
+          node tools/validate-docs.cjs
+          git diff --check
+      - name: Independent MoySklad probe scenarios (no credentials)
+        shell: pwsh
+        run: |
+          ./tests/moysklad-probe.ps1
+          ./tests/moysklad-control.ps1
+          ./tests/moysklad-document-control.ps1
+          ./tests/moysklad-examples.ps1
+      - name: Secrets (redacted)
+        run: >-
+          docker run --rm --network none -v "$PWD:/repo:ro"
+          zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git /repo --redact --no-banner
+      - name: Local-only configuration and verified WooCommerce
+        shell: bash
+        run: |
+          umask 077
+          for key in LOCAL_DB_PASSWORD LOCAL_DB_ROOT_PASSWORD LOCAL_ADMIN_PASSWORD; do
+            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
+          done > infra/.env.local
+          umask 022
+          mkdir -p .cache/packages
+          curl --fail --silent --show-error --location https://downloads.wordpress.org/plugin/woocommerce.11.2.0.zip -o .cache/packages/woocommerce.11.2.0.zip
+          printf '%s  %s\n' 66e91b45b057b64c73d4521111cea5bdc78c4c89de8fa2ca4b18b9422706d722 .cache/packages/woocommerce.11.2.0.zip | sha256sum --check
+      - name: Install browser tools
+        run: |
+          npm install --global pnpm@11.25.0
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium --only-shell
+      - name: Bootstrap and PHP checks
+        run: |
+          docker compose --env-file infra/.env.local -f infra/compose.yaml up -d --wait
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /bootstrap.sh
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp suhoput queue tick
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/queue-startup.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/local-safety.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli php /tests/contracts.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema-upgrade.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/journal.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/workers.php
+          node tests/worker-crashes.cjs
+          node tests/concurrency.cjs
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/scheduler.php
+          node tests/queue-concurrency.cjs
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /tests/lint.sh
+      - name: System minute queue without HTTP
+        run: node tests/queue-minute.cjs
+      - name: Browser smoke
+        run: pnpm test:browser
+      - name: Local accounts, concurrent attempts, database failures and captured mail
+        run: node tests/accounts-suite.cjs
+      - name: Customer order ownership, one-use proof, direct links, APIs and local mail
+        run: node tests/order-access-suite.cjs
+      - name: Server cart context, guest quotas, concurrent requests and local mail
+        run: node tests/commerce-suite.cjs
+      - name: Stop this CI project
+        if: always()
+        run: |
+          if [ -f infra/.env.local ]; then
+            docker compose --env-file infra/.env.local -f infra/compose.yaml --profile queue down
+          fi
