@@ -1,0 +1,13 @@
+.cache/
+.env
+.env.*
+!.env.example
+infra/.env
+infra/.env.*
+!infra/.env.example
+!infra/.env.integrations.example
+node_modules/
+vendor/
+test-results/
+playwright-report/
+.worktrees/
