@@ -1,0 +1,10 @@
+{
+  "bridge": "none",
+  "ip-forward": false,
+  "ip-forward-no-drop": true,
+  "userland-proxy": true,
+  "default-address-pools": [{"base": "10.234.0.0/16", "size": 24}],
+  "default-network-opts": {"bridge": {"com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"}},
+  "log-driver": "local",
+  "log-opts": {"max-size": "10m", "max-file": "3"}
+}

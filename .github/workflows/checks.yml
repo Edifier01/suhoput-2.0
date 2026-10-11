@@ -75,6 +75,14 @@ jobs:
         run: node tests/order-access-suite.cjs
       - name: Server cart context, guest quotas, concurrent requests and local mail
         run: node tests/commerce-suite.cjs
+      - name: Separate synthetic staging with mail capture and disabled queues
+        shell: bash
+        run: |
+          umask 077
+          for key in STAGE_DB_PASSWORD STAGE_DB_ROOT_PASSWORD STAGE_ADMIN_PASSWORD; do
+            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
+          done > .cache/staging-ci.env
+          node tests/staging-suite.cjs .cache/staging-ci.env suhoput-stage-ci
       - name: Stop this CI project
         if: always()
         run: |

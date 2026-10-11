@@ -7,6 +7,7 @@ infra/.env.*
 !infra/.env.example
 !infra/.env.integrations.example
 !infra/.env.infrastructure.example
+!infra/.env.staging.example
 node_modules/
 vendor/
 test-results/
