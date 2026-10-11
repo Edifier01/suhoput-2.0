@@ -4,6 +4,8 @@
 
 ## Карта и чтение
 
+Для TASK-044 подготовлены [входы инфраструктуры](docs/ACCESS.md#infrastructure-inputs) и [протокол обследования](docs/INFRASTRUCTURE.md#read-only-survey). Шаблон `infra/.env.infrastructure.example` копируется в игнорируемый `infra/.env.infrastructure.local` только при отсутствии существующей копии; значения вводятся локально, файл не исполняется. Протокол сначала читает подтверждённые ресурсы. Создание стенда требует конкретного согласования после обследования; локальный Compose сам по себе не является конфигурацией VPS. Фактическая проверка и её незапущенные части — [ACCEPTANCE](docs/ACCEPTANCE.md#exec-chk-034).
+
 Новый агент начинает с [AGENTS](AGENTS.md) и [STATUS](docs/STATUS.md), проверяет Git, затем выбирает задачу из [PLAN](docs/PLAN.md) и читает относящиеся к ней требования, [ARCHITECTURE](docs/ARCHITECTURE.md), [DECISIONS](docs/DECISIONS.md) и [ACCEPTANCE](docs/ACCEPTANCE.md). Для первого подробного планирования SPEC читается полностью.
 
 | Документ | Содержимое |
