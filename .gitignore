@@ -13,3 +13,5 @@ vendor/
 test-results/
 playwright-report/
 .worktrees/
+__pycache__/
+*.pyc

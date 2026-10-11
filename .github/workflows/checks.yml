@@ -20,6 +20,8 @@ jobs:
         run: |
           node tools/validate-docs.cjs
           git diff --check
+      - name: Offline backup safety scenarios (synthetic; no S3 or DB restore)
+        run: python3 tests/backup_model_test.py
       - name: Independent MoySklad probe scenarios (no credentials)
         shell: pwsh
         run: |
