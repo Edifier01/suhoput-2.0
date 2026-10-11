@@ -51,6 +51,8 @@ async function main() {
     assert.ok(result.includes('PASS: 12 staging isolation checks'), 'Staging PHP controls passed');
     const blocked = compose(['run', '--rm', 'cli', 'wp', 'suhoput', 'queue', 'tick'], 1);
     assert.ok(blocked.includes('Staging queue execution is disabled.'), 'Manual system tick blocked');
+    const cliCron = compose(['run', '--rm', 'cli', 'wp', 'cron', 'event', 'run', '--due-now'], 1);
+    assert.ok(cliCron.includes('Staging safety configuration required.'), 'CLI cron fails before invocation');
     const cron = await fetch('http://127.0.0.1:18890/wp-cron.php');
     assert.equal(cron.status, 403, 'Direct cron endpoint blocked');
     const site = await fetch('http://127.0.0.1:18890/');

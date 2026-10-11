@@ -8,6 +8,10 @@ if (wp_get_environment_type() !== 'staging'
     || !defined('SUHOPUT_SYSTEM_QUEUE_ENABLED') || SUHOPUT_SYSTEM_QUEUE_ENABLED !== false
     || (defined('DOING_CRON') && DOING_CRON)) {
     http_response_code(503);
+    if (defined('WP_CLI') && WP_CLI) {
+        fwrite(STDERR, "Staging safety configuration required.\n");
+        exit(1);
+    }
     exit('Staging safety configuration required.');
 }
 add_filter('pre_http_request', static function () {
