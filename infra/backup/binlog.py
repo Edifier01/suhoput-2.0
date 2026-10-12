@@ -218,8 +218,15 @@ def _parse(raw, filename, schema, prefix):
             transaction = True; maps.clear()
         elif kind == GTID_LIST:
             _need(not transaction and len(body) >= 4, 'Invalid GTID list')
-            count = struct.unpack_from('<I', body)[0]
-            _need(count < 65536 and len(body) == 4 + 16 * count, 'GTID list count/body differs')
+            count_flags = struct.unpack_from('<I', body)[0]
+            _need(count_flags & 0xf0000000 == 0, 'Unsupported GTID list flags')
+            count = count_flags & 0x0fffffff
+            # MariaDB10.11 get_data_size()/to_packet() uses two ZERO padding
+            # bytes for count0, allowing conversion to older slaves' dummy event.
+            # log_event.h:3644-3650, log_event_server.cc:3827-3831.
+            expected = 6 if count == 0 else 4 + 16 * count
+            _need(count < 65536 and len(body) == expected and
+                  (count != 0 or body[4:] == b'\0\0'), 'GTID list count/body differs')
         elif kind == CHECKPOINT:
             _need(not transaction and len(body) >= 4, 'Invalid binlog checkpoint')
             length = struct.unpack_from('<I', body)[0]

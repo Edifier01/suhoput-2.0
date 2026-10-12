@@ -4,6 +4,8 @@
 
 ## Текущее состояние
 
+12.10.2026: runtimee9bcc6b установлен; pre-update9337files/manual watermark6.592492sec/read-only audit13snapshots/7logs PASS. Owner C encrypted/full/app/config/media preparation PASS, SQL не запускался: raw guard не учитывал documented empty GTID-list0000padding. Fix21tests+реальные cached234events/40ROW/end000007/450 PASS; explicit prepared-only resume сохраняет отказ/volume, before new DB требует SHA/tree/label/absence checks. Другой physical PC/medium и human owner-run, month budget/native S3 deletion/30д остаются неподтверждёнными.
+
 12.10.2026: checkpoint8fd8bcd сохранён,125Python checks/native local exact-ID forget/independent review PASS; восемь public helpers установлены14:08UTC без SQL/restart/timer enable/S3 deletion. Owner-full B прошёл S3/full tree/app/config/binlog readback, остановлен до DB на PHP key-order media comparison; оба отказа и volumes сохраняются, normalization проверяется на canonical JSON. UTC+3 CSV подтверждён владельцем;1.32RUB/39часов остаётся project-period, не месячный бюджет.
 
 12.10.2026: предоставленный Selectel CSV прочитан:194строки/39часов,1.32RUB за S3 всего проекта; bucket/pool/timezone/native cadence не подтверждены, monthly budget gate закрыт. Для archive-tip используется новый локальный owner-control, без новых VPS объектов; прежняя point DB сохраняется. Первая owner-full попытка сохранена и остановлена до DB create/import на auth manifest; исправление несовместимого порядка Path/flat проверяется отдельно. Live retention apply/tombstone retained-prefix integration и реальные30д не подтверждены; timersdisabled.

@@ -113,7 +113,7 @@ class ByteGuardTests(unittest.TestCase):
     def test_known_benign_mariadb_events_do_not_execute_annotated_sql(self):
         checkpoint=struct.pack('<I',len(FILE))+FILE.encode()
         gtid=struct.pack('<QI',1,0)+b'\x04'+b'\0'*6
-        raw,_=build([(163,struct.pack('<I',0)),(161,checkpoint),(162,gtid),(160,b'INSERT INTO suhoput2_stage.wp_posts VALUES (42)'),(19,table_map()),(30,rows(kind=30)),(16,struct.pack('<Q',1)),(3,b'')])
+        raw,_=build([(163,struct.pack('<I',0)+b'\0\0'),(161,checkpoint),(162,gtid),(160,b'INSERT INTO suhoput2_stage.wp_posts VALUES (42)'),(19,table_map()),(30,rows(kind=30)),(16,struct.pack('<Q',1)),(3,b'')])
         self.assertEqual(self.call(raw)['selected_row_events'],1)
     def test_gtid_ddl_xa_and_standalone_flags_block(self):
         for flag in (1,32,64,128):
@@ -137,5 +137,21 @@ class ByteGuardTests(unittest.TestCase):
             status=fixed+b'\x05'+bytes([len(timezone)])+timezone
             raw,_=build([(2,query(status=status)),(2,query(b'COMMIT'))])
             self.assertEqual(self.call(raw)['result'],'PASS')
+
+    def test_native_empty_gtid_list_has_exact_two_zero_padding_bytes(self):
+        raw,_=build([(163,struct.pack('<I',0)+b'\0\0')])
+        result=self.call(raw)
+        self.assertEqual(result['result'],'PASS'); self.assertEqual(result['selected_row_events'],0)
+    def test_empty_gtid_padding_count_flags_and_payload_length_are_strict(self):
+        for body in (struct.pack('<I',0),struct.pack('<I',0)+b'\0',struct.pack('<I',0)+b'\x01\0',struct.pack('<I',0)+b'\0\x01',struct.pack('<I',0)+b'\0'*3,struct.pack('<I',1)+b'\0\0',struct.pack('<I',1<<28)+b'\0\0',struct.pack('<I',1<<29)+b'\0\0',struct.pack('<I',1<<31)+b'\0\0'):
+            raw,_=build([(163,body)])
+            with self.subTest(body=body),self.assertRaises(guards.GuardError): self.call(raw)
+    def test_populated_native_gtid_list_has_exact_sixteen_byte_records(self):
+        body=struct.pack('<I',1)+struct.pack('<IIQ',0,2047,1)
+        raw,_=build([(163,body)])
+        self.assertEqual(self.call(raw)['result'],'PASS')
+        for wrong in (body[:-1],body+b'\0',struct.pack('<I',2)+body[4:]):
+            raw,_=build([(163,wrong)])
+            with self.assertRaises(guards.GuardError): self.call(raw)
 
 if __name__=='__main__': unittest.main()
