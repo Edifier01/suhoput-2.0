@@ -16,6 +16,17 @@ def fixture():
     manifests={base['id']:{'source':source,'coordinates':{'file':'suhoput2-binlog.000001','position':4},'stage_app_sha':'f'*40,'application_sha256':'3'*64,'configuration_sha256':'4'*64},log['id']:{'source':source,'previous_count':0,'first_log':1,'last_log':2,'logs':[{'file':'suhoput2-binlog.000001','size':400,'sha256':'5'*64},{'file':'suhoput2-binlog.000002','size':500,'sha256':'6'*64}]}}
     return {'generation':GEN,'repositories':{'base':'7'*64,'binlog':'8'*64},'snapshots':[base,log],'manifests':manifests}
 class InventoryBoundTests(unittest.TestCase):
+    def test_many_base_coordinates_validate_the_chain_once_without_multiplicative_rescans(self):
+        m=subject();inventory=fixture();manifest=inventory['manifests']['2'*64]
+        manifest.update(first_log=1,last_log=100,previous_count=0,logs=[{'file':'suhoput2-binlog.%06d'%i,'size':500,'sha256':'5'*64} for i in range(1,101)])
+        for i in range(24):
+            sid=format(i+4096,'064x');inventory['snapshots'].append({**inventory['snapshots'][0],'id':sid,'token':sid[:32]})
+            inventory['manifests'][sid]=copy.deepcopy(inventory['manifests']['1'*64]);inventory['manifests'][sid]['coordinates']['file']='suhoput2-binlog.%06d'%(i+1)
+        checked=[0];original=guards.checked_logs
+        def count(items):checked[0]+=len(items);return original(items)
+        with mock.patch.object(guards,'checked_logs',count):plan=m.inventory_plan(inventory,NOW)
+        self.assertEqual(plan['chain_last_file'],'suhoput2-binlog.000100')
+        self.assertLessEqual(checked[0],300,'Each base rescans the entire already validated chain')
     def test_order_independent_digest_binds_repository_manifest_and_entire_inventory(self):
         m=subject();a=fixture();b=copy.deepcopy(a);b['snapshots'].reverse();self.assertEqual(m.inventory_digest(a),m.inventory_digest(b))
         for field in ('repository','manifest','extra'):

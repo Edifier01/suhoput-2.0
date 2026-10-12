@@ -9,6 +9,7 @@ receipt. An existing intent always disables a subsequent apply, even after succe
 No network, credential loading, CLI, scheduling, prune, repair or unlock lives here.
 """
 import copy
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -117,6 +118,27 @@ def protected_dependencies(inventory, candidate_ids, at):
                            'Preserved hourly/full source or application differs')
             guards.require(full_id not in candidates,
                            'Frozen candidate is required by a preserved hourly arrival')
+        # Fulls retained solely for hourly application files are not recovery
+        # bases. Every other preserved base, including a new arrival, protects
+        # the complete chain starting at its real dump coordinates.
+        binlog_candidates=[cid for cid in candidates if cid in indexed and indexed[cid]['lane']=='binlog']
+        if not any(row['lane']=='binlog' for row in indexed.values()):
+            guards.require(not binlog_candidates,'Candidate binlog chain absent');return True
+        plan=retention.inventory_plan(inventory,at)
+        descriptors={item['file']:item for item in plan['logs']}
+        last_deleted=max((inventory['manifests'][cid]['last_log'] for cid in binlog_candidates),default=0)
+        cutoff=at-dt.timedelta(days=30)
+        application_only={inventory['manifests'][sid]['full_id'] for sid,row in indexed.items()
+                          if row['kind']=='hourly' and sid not in candidates}
+        for sid,row in indexed.items():
+            if row['lane']!='base' or sid in candidates:continue
+            if sid in application_only and row['kind'] in ('full','pre-update') and guards.utc(row['time'])<cutoff and sid!=plan['anchor_id']:continue
+            start=inventory['manifests'][sid]['coordinates']
+            descriptor=descriptors.get(start['file'])
+            guards.require(descriptor is not None and 4<=start['position']<=descriptor['size'],'Preserved recovery base has no available coordinate')
+            first=guards.log_number(start['file'])
+            guards.require(last_deleted<first,
+                           'Frozen binlog candidate is required by a preserved recovery base')
         return True
     except (KeyError, TypeError, ValueError) as error:
         raise guards.GuardError('Incomplete preserved hourly dependency') from error
@@ -126,6 +148,10 @@ def _plan(inventory, plan, at):
     _time(at)
     indexed, source = _index(inventory, at)
     planned = guards.utc(plan['planned_at'])
+    if 'cohort' in inventory:
+        cohort=inventory['cohort'];guards.hex_id(cohort['sha256'],64);guards.hex_id(cohort['code_sha'],40)
+        guards.require(plan.get('cohort')==cohort and guards.utc(cohort['planned_at'])==planned,
+                       'Plan frozen cohort differs')
     guards.require(0 <= (at - planned).total_seconds() <= MAX_PLAN_AGE_SECONDS,
                    'Plan stale or clock rollback')
     calculated = retention.bounded_plan(inventory, retention.inventory_plan(inventory, planned), MAX_CANDIDATES)
@@ -175,6 +201,9 @@ def validate_apply(inventory, plan, evidence, at):
                                ('repositories', inventory['repositories']), ('source', source),
                                ('inventory_sha256', plan['inventory_sha256'])]:
                 guards.require(document[key] == value, 'Evidence inventory/source binding differs')
+            if 'cohort' in inventory:
+                guards.require(document.get('cohort')==inventory['cohort'] and document.get('code_sha')==inventory['cohort']['code_sha'],
+                               'Evidence frozen cohort/version differs')
             started = guards.utc(document['started_at']); completed = guards.utc(document['completed_at'])
             guards.require(started <= completed <= at and completed >= at - dt.timedelta(seconds=MAX_PLAN_AGE_SECONDS),
                            'Evidence clock window differs')
@@ -226,7 +255,8 @@ def validate_apply(inventory, plan, evidence, at):
         guards.require(type(cost) in (int, float) and 0 <= cost <= 500 and
                        type(size) is int and 0 <= size <= 10 * 1024 ** 3,
                        'Account budget projection exceeds agreed limits or unknown')
-        return {'generation': inventory['generation'], 'repositories': copy.deepcopy(inventory['repositories']),
+        return {**({'cohort':copy.deepcopy(inventory['cohort'])} if 'cohort' in inventory else {}),
+                'generation': inventory['generation'], 'repositories': copy.deepcopy(inventory['repositories']),
                 'inventory_sha256': plan['inventory_sha256'], 'candidate_ids': list(plan['candidates']),
                 'keep_ids': list(plan['keep']), 'anchor_id': plan['anchor_id'],
                 'proof_sha256': copy.deepcopy(plan['proof_sha256']), 'source': copy.deepcopy(source)}
@@ -253,13 +283,14 @@ class Executor:
     Callers must not clear an intent to retry. Reconcile writes observed exact
     absence/presence; a partial receipt never authorizes retry or tombstones.
     """
-    def __init__(self, inventory_reader, runner, intent_store, receipt_writer, repository_paths, clock=None):
+    def __init__(self, inventory_reader, runner, intent_store, receipt_writer, repository_paths, clock=None, *, effect_section=None, pre_effect=None):
         self.read_inventory = inventory_reader
         self.runner = runner
         self.store = intent_store
         self.write_receipt = receipt_writer
         self.repositories = dict(repository_paths)
         self.clock = clock
+        self.effect_section=effect_section;self.pre_effect=pre_effect
         guards.require(set(self.repositories) == {'base', 'binlog'} and
                        all(isinstance(v, str) and v and not v.startswith('-') for v in self.repositories.values()),
                        'Explicit repository paths required')
@@ -283,6 +314,7 @@ class Executor:
             after = self.read_inventory()
             comparison = compatible_inventory(intent['before_inventory'], after, at, intent['candidate_ids'])
             protected_dependencies(after, intent['candidate_ids'], at)
+            retention.inventory_plan(after,at)
             absent = sorted(set(intent['candidate_ids']) - {row['id'] for row in after['snapshots']})
             return {'forgotten_ids': absent,
                     'present_candidate_ids': sorted(set(intent['candidate_ids']) - set(absent)),
@@ -300,6 +332,7 @@ class Executor:
         receipt.update({'operation': 'native-retention-forget', 'result': status,
                         'remote_delete_calls': calls, 'prune_run': False,
                         'error_type': error, 'completed_at': at.isoformat(), **observed})
+        if 'cohort' in intent:receipt['cohort']=copy.deepcopy(intent['cohort'])
         self.write_receipt(copy.deepcopy(receipt))
         return receipt
 
@@ -318,6 +351,7 @@ class Executor:
                            'inventory_sha256': plan['inventory_sha256'], 'candidate_ids': [],
                            'keep_ids': list(plan['keep']), 'anchor_id': plan['anchor_id'],
                            'proof_sha256': {}, 'source': copy.deepcopy(source)}
+                if 'cohort' in inventory:binding['cohort']=copy.deepcopy(inventory['cohort'])
         except (KeyError, TypeError, ValueError) as failure:
             raise guards.GuardError('Incomplete retention plan') from failure
         before = self.read_inventory()
@@ -326,10 +360,25 @@ class Executor:
             validate_apply(inventory, plan, evidence, at)
         else:
             _plan(inventory, plan, at)
+        # All complete proof validation is outside native upload lane locks.
+        if self.effect_section is not None and plan['candidates']:
+            validate_apply(inventory,plan,evidence,at)
+            at=self._now(at)
+        with self.effect_section() if self.effect_section is not None else contextlib.nullcontext():
+            if self.effect_section is not None:
+                before=self.read_inventory();at=self._now(at)
+            if self.pre_effect is not None:self.pre_effect(before)
+            return self._effect(inventory,plan,evidence,binding,before,at)
+
+    def _effect(self,inventory,plan,evidence,binding,before,at):
         comparison = compatible_inventory(inventory, before, at)
         protected_dependencies(before, binding['candidate_ids'], at)
+        at=self._now(at)
+        if plan['candidates']:current_freshness(plan,evidence,at)
+        else:_plan(inventory,plan,at)
         body = {**binding, 'operation': 'native-retention-forget', 'token': uuid.uuid4().hex,
                 'prepared_at': at.isoformat(), 'before_inventory': compact_authenticated_inventory(before, at),
+                'before_inventory_sha256':retention.inventory_digest(before),
                 'protected_arrival_ids': comparison['arrival_ids'],
                 'repository_paths': self.repositories}
         intent = {**body, 'intent_sha256': document_digest(body)}
@@ -354,7 +403,7 @@ class Executor:
                 # A slow read (or dependency check) must never turn a fresh
                 # pre-read proof into permission for a later expired effect.
                 at = self._now(at)
-                validate_apply(inventory, plan, evidence, at)
+                if self.effect_section is None:validate_apply(inventory, plan, evidence, at)
                 at = self._now(at)
                 current_freshness(plan,evidence,at)
                 calls += 1
@@ -403,6 +452,7 @@ def retention_tombstones(intent, receipt):
         for key in ('token', 'generation', 'repositories', 'inventory_sha256', 'candidate_ids',
                     'keep_ids', 'anchor_id', 'proof_sha256', 'source', 'intent_sha256'):
             guards.require(receipt[key] == intent[key], 'Absence receipt binding differs')
+        if 'cohort' in intent:guards.require(receipt.get('cohort')==intent['cohort'],'Absence cohort binding differs')
         absent = receipt['forgotten_ids']; present = receipt['present_candidate_ids']
         guards.require(isinstance(absent, list) and absent == sorted(set(absent)) and
                        set(absent) <= set(intent['candidate_ids']) and

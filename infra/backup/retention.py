@@ -1,5 +1,5 @@
 """Read-only native inventory/anchor audit. No remote deletion or scheduling."""
-import argparse,contextlib,datetime as dt,hashlib,io,json,os,pathlib,sys,uuid
+import argparse,contextlib,datetime as dt,hashlib,io,json,os,pathlib,sys,uuid,time
 import guards,runtime,restic_adapter,backup_catalog
 from worker import Worker,DB_IMAGE,sha,private_path,now
 from restore import Recovery,replay_range
@@ -24,16 +24,24 @@ def decode(data):
     except (ValueError,UnicodeError,RecursionError) as error:
         raise guards.GuardError('Invalid authenticated JSON') from error
 
-def native_inventory(worker,at,repository_ids,clock=None):
+def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=None):
     w=worker;entries=[];manifests={};tokens=set();observed=at
-    catalog=backup_catalog.ArchiveCatalog(w);records=catalog.entries();backfilled=False;live={}
+    catalog=backup_catalog.ArchiveCatalog(w)
+    if reader is not None:records=reader._records
+    else:records=catalog.entries()
+    backfilled=False;live={}
     for lane in ('base','binlog'):
         repo=w.c['repositories'][lane];scope=str(w.root/'spool'/(lane+'-payload'))
-        run=lambda args:w.restic(lane,['--repo',repo,*args])
+        def run(args):
+            if deadline is None:return w.restic(lane,['--repo',repo,*args])
+            remaining=deadline-time.monotonic();guards.require(remaining>0,'Native critical inventory deadline exceeded')
+            result=w.restic(lane,['--repo',repo,*args],timeout=remaining)
+            guards.require(time.monotonic()<deadline,'Native critical inventory deadline exceeded');return result
         config=decode(run(['cat','config']))
         guards.require(config['version']==2 and config['id']==guards.hex_id(repository_ids[lane],64),'Repository identity changed')
         listed=decode(run(['snapshots','--json']));guards.require(isinstance(listed,list),'Complete snapshot inventory required')
         for row in listed:
+            if deadline is not None:guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')
             sid=guards.hex_id(row['id'],64);guards.require(sid not in manifests,'Duplicate snapshot across inventory')
             # Native snapshots --json already decrypts/authenticates each
             # snapshot. Reopening the same metadata in N new native processes
@@ -56,6 +64,7 @@ def native_inventory(worker,at,repository_ids,clock=None):
                                'Native metadata differs from verified catalog')
                 manifest=record['projection']
             else:
+                guards.require(reader is None,'Uncatalogued current arrival; native admission required before capture/effect')
                 # Cold backfill reuses native unfiltered metadata, then performs
                 # actual all-file restore verification. No tags/flags import.
                 body=run(['dump',sid,scope+'/manifest.json']);guards.require(isinstance(body,bytes) and hashlib.sha256(body).hexdigest()==digest,'Authenticated manifest digest differs')
@@ -114,7 +123,7 @@ def inventory_plan(inventory,at):
         first=guards.log_number(batch[0]['file']) if batch else None
         guards.require(batch and type(manifest['previous_count']) is int and manifest['previous_count']==first-1 and manifest['first_log']==first and manifest['last_log']==guards.log_number(batch[-1]['file']) and (not logs or first==guards.log_number(logs[-1]['file'])+1),'Binlog manifest range/previous count mismatch')
         logs.extend(batch);records.append({**row,'first_log':manifest['first_log'],'last_log':manifest['last_log']})
-    guards.retained_logs(logs)
+    guards.retained_logs(logs);log_index={item['file']:item for item in logs}
     indexed={x['id']:x for x in entries};guards.require(len(indexed)==len(entries),'Duplicate inventory identity')
     for row in entries:
         if row['kind']=='binlog':continue
@@ -137,8 +146,11 @@ def inventory_plan(inventory,at):
         start=manifests[row['id']]['coordinates']
         if guards.log_number(start['file'])<first:
             guards.require((row['id'] in dependencies or row['id'] in plan['candidates']) and row['kind'] in ('full','pre-update') and guards.utc(row['time'])<cutoff and row['id']!=plan['anchor_id'],'Unavailable recovery base below retained suffix')
-        else:replay_range(start,start,logs)
-    return {**plan,'logs':logs,'inventory_sha256':inventory_digest(inventory),'chain_last_file':logs[-1]['file'],'chain_last_position':logs[-1]['size']}
+        else:
+            descriptor=log_index.get(start['file'])
+            guards.require(descriptor is not None and start['position']<=descriptor['size'],'Missing or truncated recovery base coordinate')
+    return {**plan,**({'cohort':inventory['cohort']} if 'cohort' in inventory else {}),
+            'logs':logs,'inventory_sha256':inventory_digest(inventory),'chain_last_file':logs[-1]['file'],'chain_last_position':logs[-1]['size']}
 
 def bounded_plan(inventory,plan,limit=256):
     """One deterministic safe batch, retaining every deferred expired ID.
@@ -186,34 +198,59 @@ def bind_recovery(inventory,plan,proof):
     except (KeyError,TypeError,StopIteration) as error:
         raise guards.GuardError('Incomplete native recovery binding') from error
 
+def cached_log_audit(reader,inventory,target):
+    """Stream sealed catalog bytes, checking every original ROW/CRC file.
+
+    Full payload verification was required at admission. Native read-data and
+    current unfiltered tree equality remain separate compulsory controls.
+    """
+    import binlog
+    target=pathlib.Path(target);plan=inventory_plan(inventory,guards.utc(inventory['cohort']['planned_at']))
+    owners={item['file']:(row['id'],item) for row in inventory['snapshots'] if row['lane']=='binlog'
+            for item in inventory['manifests'][row['id']]['logs']}
+    coordinates={}
+    for row in inventory['snapshots']:
+        if row['lane']=='base':
+            start=inventory['manifests'][row['id']]['coordinates'];coordinates.setdefault(start['file'],[]).append(start)
+    events=rows=0
+    for item in plan['logs']:
+        sid,descriptor=owners[item['file']];guards.require(descriptor==item,'Catalog log descriptor differs')
+        raw=reader.binlog_bytes(sid,item['file']);stop={'file':item['file'],'position':len(raw)}
+        report=binlog.validate_chain({item['file']:raw},[item],{'file':item['file'],'position':4},stop)
+        for start in coordinates.get(item['file'],[]):binlog.validate_chain({item['file']:raw},[item],start,stop)
+        path=target/item['file']
+        if path.exists() or path.is_symlink():
+            guards.require(path.is_file() and not path.is_symlink() and path.stat().st_nlink==1 and sha(path)==item['sha256'],
+                           'Existing audited log changed')
+        else:
+            with open(path,'xb') as output:output.write(raw);output.flush();os.fsync(output.fileno())
+            os.chmod(path,0o600)
+        events+=report['event_count'];rows+=report['selected_row_events']
+    return {'files':len(plan['logs']),'events':events,'row_events':rows,'guard':'strict-mariadb-10.11-row'}
+
 class Inspector:
     def __init__(self,config):
         self.config=config;self.w=Worker(config);self.root=self.w.root/'spool'/('retention-audit-'+uuid.uuid4().hex)
     def run(self):
-        w=self.w;w.gate();started=now()
+        import retention_cohort,time
+        w=self.w;w.gate();started=now();scan_started=time.monotonic()
         with runtime.lane_lock(w.root/'receipts/retention-audit.lock'):
             self.root.mkdir(mode=0o700);(self.root/'logs').mkdir(mode=0o700)
             runtime.atomic_json(self.root/'intent.json',{'generation':w.c['generation'],'code_sha':w.c['code_sha'],'started_at':now(),'remote_delete':False})
-            repository_ids={lane:runtime.load_json(private_path(w.root/'receipts'/('init-'+lane+'.json')))['repository_id'] for lane in ('base','binlog')}
-            before=native_inventory(w,dt.datetime.now(dt.timezone.utc),repository_ids,lambda:dt.datetime.now(dt.timezone.utc))
+            before,capture_timing=retention_cohort.CohortStore(w).capture();repository_ids=before['repositories']
             journals={}
             for lane in ('base','binlog'):
                 guards.require(not (w.root/'receipts'/lane/'pending.json').exists(),'Unknown pending upload; retention audit stopped')
                 journals[lane]=runtime.UploadJournal(w.root/'receipts'/lane,w.c['generation']).state()
             from retention_native import verified_tombstones
-            confirmed_inventory(before,journals,verified_tombstones(w));plan=inventory_plan(before,dt.datetime.now(dt.timezone.utc))
+            confirmed_inventory(before,journals,verified_tombstones(w));plan=inventory_plan(before,guards.utc(before['cohort']['planned_at']))
             for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
-            for row in before['snapshots']:
-                lane=row['lane'];sid=row['id'];scope=str(w.root/'spool'/(lane+'-payload'))
-                adapter=restic_adapter.ResticAdapter(w.c['repositories'][lane],w.c['generation'],scope,runner=lambda args,lane=lane:w.restic(lane,args),verify_archive=lambda sid,manifest,lane=lane,**proof:w.verify_archive(lane,sid,manifest,**proof))
-                adapter.hints[row['token']]=sid;matches=adapter.find(row['token'])
-                guards.require(len(matches)==1 and matches[0]['id']==sid and matches[0]['manifest_sha256']==row['manifest_sha256'],'Incomplete authenticated archive readback')
-                if lane=='binlog':
-                    for item in before['manifests'][sid]['logs']:
-                        target=self.root/'logs'/item['file'];guards.require(not target.exists(),'Duplicate archived binlog path')
-                        w.restic(lane,['--repo',w.c['repositories'][lane],'dump',sid,scope+'/logs/'+item['file']],target=target)
-                        guards.require(target.stat().st_size==item['size'] and sha(target)==item['sha256'] and target.read_bytes()[:4]==b'\xfebin','Captured S3 binlog differs')
-            args=['docker','run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--memory','384m','--cpus','0.5','--pids-limit','128','--mount','type=bind,source='+str(self.root/'logs')+',target=/logs,readonly','--entrypoint','mariadb-binlog',DB_IMAGE,'--no-defaults','--verify-binlog-checksum',*['/logs/'+x['file'] for x in plan['logs']]]
+            with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
+                sealed=retention_cohort.CohortStore(w).load(reader);same_inventory(before,sealed)
+                row_guard=cached_log_audit(reader,before,self.root/'logs')
+            # find batches argv below the native ARG_MAX; SQL output is discarded
+            # because this is a checksum audit, never an import/replay stream.
+            args=['docker','run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--memory','384m','--cpus','0.5','--pids-limit','128','--mount','type=bind,source='+str(self.root/'logs')+',target=/logs,readonly','--entrypoint','sh',DB_IMAGE,'-c',"find /logs -maxdepth 1 -type f -name 'suhoput2-binlog.[0-9][0-9][0-9][0-9][0-9][0-9]' -exec mariadb-binlog --no-defaults --verify-binlog-checksum {} + > /dev/null"]
             w.native.run(args,target=self.root/'checksum-decoded.sql')
             for item in plan['logs']:guards.require(sha(self.root/'logs'/item['file'])==item['sha256'],'Decoded archive changed')
             recovery=Recovery(self.config,w.root/'config/restore-plan.json')
@@ -223,7 +260,8 @@ class Inspector:
             for item in proof['verified_binlogs']:
                 path=recovery.root/'logs'/item['file']
                 guards.require(path.resolve()==path and not path.is_symlink() and path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Recovery file differs from audited S3 binlog')
-            after=native_inventory(w,dt.datetime.now(dt.timezone.utc),repository_ids,lambda:dt.datetime.now(dt.timezone.utc));same_inventory(before,after)
+            with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
+                after=retention_cohort.CohortStore(w).load(reader);same_inventory(before,after)
             blockers=['native_delete_executor_disabled','measured_monthly_budget/account_billing_unverified','independent_owner_full_restore_not_run']
             if not plan['pre_window_anchor_present']:blockers.append('real_30_day_history_not_present')
             if proof['stop']!={'file':plan['chain_last_file'],'position':plan['chain_last_position']}:blockers.append('verified_restore_stop_precedes_archived_chain_tip')
@@ -231,7 +269,9 @@ class Inspector:
             receipt.update(evidence_type='audit',source=w.source,started_at=started,
                            checked_repositories=repository_ids,check_mode='read-data',binlog_check_mode='native-checksum',
                            readback_snapshots={r['id']:r['manifest_sha256'] for r in before['snapshots']},
-                           verified_binlog_count=len(plan['logs']),verified_binlogs=plan['logs'])
+                           verified_binlog_count=len(plan['logs']),verified_binlogs=plan['logs'],row_event_guard=row_guard,
+                           cohort=before['cohort'],phase_seconds={'scan_seconds':time.monotonic()-scan_started,
+                                                                'critical_seconds':capture_timing['critical_seconds']})
             runtime.atomic_json(self.root/'receipt.json',receipt)
             from retention_native import publish_evidence
             publish_evidence(w,'audit',receipt,before,started)

@@ -52,6 +52,40 @@ def load_json(path):
     except (ValueError,UnicodeError) as error:
         raise guards.GuardError('Invalid journal JSON') from error
 
+def publish_history(worker):
+    """Derive actual cadence from protected confirmations, never fixture flags."""
+    import backup_catalog,retention_cohort,retention_native
+    started=retention_cohort.clock();w=worker
+    # Empty/sparse native journals cannot become observation proof even when
+    # archives were bulk backfilled with old capture dates.
+    journals={lane:UploadJournal(w.root/'receipts'/lane,w.c['generation']).state() for lane in ('base','binlog')}
+    guards.require(all(journal['confirmed'] for journal in journals.values()),'Native cadence journal absent')
+    with backup_catalog.ArchiveCatalog(w).open_reader() as reader:inventory=retention_cohort.CohortStore(w).load(reader)
+    planned=guards.utc(inventory['cohort']['planned_at']);cutoff=planned-dt.timedelta(days=30)
+    indexed={row['id']:row for row in inventory['snapshots']};groups={'binlog':[],'hourly':[],'full':[]}
+    for lane,journal in journals.items():
+        for proof in journal['confirmed']:
+            row=indexed.get(proof['id'])
+            if row is None:continue
+            guards.require(proof['token']==row['token'] and proof['manifest_sha256']==row['manifest_sha256'] and
+                           proof['captured_at']==row['time'],'History confirmation identity differs')
+            captured=guards.utc(proof['captured_at']);prepared=guards.utc(proof['prepared_at']);confirmed=guards.utc(proof['confirmed_at'])
+            interval=60 if lane=='binlog' else 3600
+            guards.require(captured<=prepared<=confirmed<=captured+dt.timedelta(seconds=interval),'Late/backfilled confirmation cannot prove cadence')
+            kind=row['kind'];group='binlog' if lane=='binlog' else ('hourly' if kind=='hourly' else 'full')
+            groups[group].append(captured)
+    cadence={'binlog':60,'hourly':3600,'full':86400};first=[]
+    for kind,limit in cadence.items():
+        times=sorted(set(groups[kind]));guards.require(times and times[0]<=cutoff and times[-1]<=planned and
+                              (planned-times[-1]).total_seconds()<=limit,'Actual 30-day frequency coverage absent')
+        window=[max(t for t in times if t<=cutoff)]+[t for t in times if t>cutoff]
+        guards.require(all(0<(b-a).total_seconds()<=limit for a,b in zip(window,window[1:])),'Actual native cadence gap')
+        first.append(window[0])
+    document={'result':'PASS','observed_from':max(first).isoformat(),'observed_until':planned.isoformat(),
+              'observation_source':'native-confirmed-upload-journal','cadence_seconds':cadence,
+              'journal_sha256':retention_native.retention_apply.document_digest(journals),'completed_at':retention_cohort.clock().isoformat()}
+    return retention_native.publish_evidence(w,'history',document,inventory,started.isoformat())
+
 @contextmanager
 def lane_lock(path):
     fd=os.open(path,os.O_CREAT|os.O_RDWR|getattr(os,'O_NOFOLLOW',0),0o600)

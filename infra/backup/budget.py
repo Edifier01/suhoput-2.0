@@ -225,6 +225,75 @@ and absent operations remain unknown. File name is never a period authority.
             'reconciliation_status': 'incomplete', 'missing': missing}
 
 
+def import_selected_billing(object_data,metric_data,context,*,now):
+    """Parse the actual 12/8-column Console pair with its admitted selection.
+
+    Scope comes explicitly from the hash-bound authenticated UI selection and
+    matching object export. No project/bucket columns are fabricated in the
+    metric CSV; an ordinary unscoped metric export remains unsupported alone.
+    """
+    object_header=('Аккаунт','Идентификатор объекта','Наименование объекта','Идентификатор родительского объекта','Тип объекта','Наименование типа объекта',
+                   'Период','Идентификатор проекта','Наименование проекта','Продукт','Регион','Стоимость')
+    metric_header=('Аккаунт','Идентификатор ресурса','Наименование ресурса','Количество ресурса','Единица измерения ресурса','Период','Продукт','Стоимость')
+    def parse(raw,header):
+        if not isinstance(raw,bytes) or not 0<len(raw)<=16*1024*1024:raise BudgetError('Bounded actual CSV bytes required')
+        try:rows=list(csv.reader(io.StringIO(raw.decode('utf-8-sig'),newline=''),delimiter=';',strict=True))
+        except (UnicodeError,csv.Error):raise BudgetError('Invalid actual provider CSV') from None
+        if not rows or rows[0]!=list(header) or len(rows)<2 or any(len(r)!=len(header) for r in rows[1:]):raise BudgetError('Actual provider CSV schema differs')
+        return rows[1:]
+    if hashlib.sha256(object_data).hexdigest()!=context['objects_sha256'] or hashlib.sha256(metric_data).hexdigest()!=context['billing_sha256']:
+        raise BudgetError('Selected raw export hashes differ')
+    zone=fixed_timezone(context['timezone'])
+    if zone is None:raise BudgetError('Actual export timezone required')
+    def stamp(value):
+        try:result=dt.datetime.strptime(value,'%Y-%m-%d %H:%M:%S').replace(tzinfo=zone).astimezone(dt.timezone.utc)
+        except ValueError:raise BudgetError('Invalid actual billing hour') from None
+        first=dt.datetime.fromisoformat(context['selected_from'].replace('Z','+00:00'));last=dt.datetime.fromisoformat(context['selected_until'].replace('Z','+00:00'))
+        if result.minute or result.second or not first<=result<last or result+dt.timedelta(hours=1)>now:raise BudgetError('Billing hour outside actual selection or incomplete')
+        return result
+    objects=parse(object_data,object_header);metrics=parse(metric_data,metric_header);hour_cost={};account=None
+    for row in objects:
+        if row[1]!=context['object_id'] or row[3] not in ('',context.get('parent_object_id',context['project_id'])) or row[7]!=context['project_id'] or row[9]!='storage' or row[10] not in ('',context['pool']):
+            raise BudgetError('Object export lineage differs from selected bucket')
+        if account is None:account=row[0]
+        if row[0]!=account or hashlib.sha256(account.encode()).hexdigest()!=context['account_scope_sha256']:raise BudgetError('Actual selected account differs')
+        at=stamp(row[6])
+        if at in hour_cost:raise BudgetError('Duplicate selected object hour')
+        hour_cost[at]=local_decimal(row[11],money=True)
+    scope=scope_fingerprint(account,context['project_id'],context['bucket'],context['pool']);grouped={};seen=set();metric_cost={};unknown=0
+    for row in metrics:
+        if row[0]!=account or row[6]!='storage':raise BudgetError('Metric export account/product differs')
+        at=stamp(row[5]);resource=row[1];identity=(at,resource)
+        if identity in seen or at not in hour_cost:raise BudgetError('Duplicate metric or missing selected object hour')
+        seen.add(identity);quantity=local_decimal(row[3]);cost=local_decimal(row[7],money=True);spec=metric_spec(resource)
+        if cost.as_tuple().exponent<-2:raise BudgetError('Actual kopeck-rounded cost required')
+        metric_cost[at]=metric_cost.get(at,Decimal(0))+cost
+        if spec is None:unknown+=1;continue
+        metric,storage_class=spec
+        if row[4]!=NATIVE_UNITS[metric] or storage_class!='standard':raise BudgetError('Selected standard metric unit/class differs')
+        group=grouped.setdefault(metric,{'quantity':Decimal(0),'cost':Decimal(0),'intervals':[]});group['quantity']+=quantity;group['cost']+=cost
+        if quantity:group['intervals'].append((max(Decimal(0),cost-Decimal('.005'))*FACTORS[metric]/quantity,(cost+Decimal('.005'))*FACTORS[metric]/quantity))
+    if metric_cost!=hour_cost:raise BudgetError('Object and selected metric hourly costs differ')
+    reports=[];inconsistent=False
+    for metric,group in grouped.items():
+        bounds=group['intervals'];lower=max((x[0] for x in bounds),default=None);upper=min((x[1] for x in bounds),default=None)
+        if lower is not None and lower>=upper:inconsistent=True;interval=None
+        else:interval={'lower':number_text(lower),'upper':number_text(upper)} if lower is not None else None
+        reports.append({'metric':metric,'storage_class':'standard','scope_sha256':scope,'native_unit':NATIVE_UNITS[metric],
+                        'quantity':number_text(group['quantity']),'cost_rub':number_text(group['cost']),'rate_unit':RATE_UNITS[metric],'rate_interval':interval})
+    periods=sorted(hour_cost);missing=['native_monthly_pattern_missing']
+    if unknown:missing.append('unknown_metric_rows')
+    if inconsistent:missing.append('inconsistent_observed_tariff')
+    return {'parsed':True,'provider_budget_verified':False,'provider_billing_verified':False,'bucket_scopes':[scope],
+            'source_context':{'scope_source':'hash-bound-authenticated-ui-selection-and-object-export','object_id':context['object_id'],'project_id':context['project_id'],
+                              'region_source':'authenticated selection; object CSV region absent' if all(not row[10] for row in objects) else 'object CSV and authenticated selection'},
+            'provenance':{'file_sha256':context['billing_sha256'],'object_file_sha256':context['objects_sha256'],'metric_schema':list(metric_header),'object_schema':list(object_header),
+                          'source_authenticity_verified':False,'timezone':context['timezone'],'rate_interval_assumption':'nearest kopeck rounding; quantities exact; not confirmed by CSV','tax_basis':'unknown'},
+            'period':{'first_utc':periods[0].isoformat().replace('+00:00','Z'),'last_utc':periods[-1].isoformat().replace('+00:00','Z'),
+                      'observed_hours':len(periods),'span_hours':int((periods[-1]-periods[0]).total_seconds()/3600)+1,'monthly_pattern_verified':False},
+            'metrics':reports,'cost_rub':number_text(sum(hour_cost.values(),Decimal(0))),'cost_scope':'selected bucket actual exported hours only',
+            'missing':missing,'observed_operations':sorted(grouped.keys()&{'put','get','delete'})}
+
 def reconcile_billing(report, rates, source_scope):
     """Verify scope, dimensions and tariff compatibility, never rate authenticity."""
     missing = []
@@ -236,7 +305,9 @@ def reconcile_billing(report, rates, source_scope):
     for metric, key in RATE_KEYS.items():
         observed = [group for group in report['metrics'] if group['metric'] == metric
                     and group['storage_class'] == 'standard' and group['scope_sha256'] == source_scope]
-        if not observed: missing.append('account_rate_unobserved:' + metric)
+        if not observed:
+            if metric=='delete' and report.get('source_context',{}).get('tariff_basis')=='owner-approved-public-standard-ru1' and local_decimal(rates[key])==0:continue
+            missing.append('account_rate_unobserved:' + metric)
         for group in observed:
             interval = group['rate_interval']
             if interval is None: missing.append('account_rate_unknown:' + metric)
@@ -247,8 +318,8 @@ def reconcile_billing(report, rates, source_scope):
 
 
 def monthly_projection(samples, cadence, inventory, rates, *, account_report=None,
-                       budget_rub='500', max_gib='10'):
-    """30-day scenario forecast with 730-hour provider storage month pricing.
+                       budget_rub='500', max_gib='10', projection_days=30):
+    """Explicit 30/31-day scenario with 730-hour provider storage month pricing.
 
 Every scenario requires a native receipt and provider HTTP meter. Retained
 bytes and object deltas are conservative upper bounds with no assumed dedup
@@ -256,6 +327,7 @@ or prune savings. No manual test count is used as a scheduled monthly cadence.
 """
     if not all(isinstance(value, dict) for value in (samples, cadence, inventory, rates)):
         raise BudgetError('Measurement dictionaries required')
+    if type(projection_days) is not int or projection_days not in (30,31):raise BudgetError('Thirty-day or worst calendar month required')
     budget, capacity = local_decimal(budget_rub), local_decimal(max_gib)
     if not budget or not capacity: raise BudgetError('Positive budget and capacity required')
     missing, counts, measured_rates = [], {}, {}
@@ -270,7 +342,7 @@ or prune savings. No manual test count is used as a scheduled monthly cadence.
         if inventory.get(key) is None: missing.append('inventory_missing:' + key)
         else: nonnegative_integer(inventory[key])
     for job in JOBS:
-        count = FIXED_CADENCE.get(job, cadence.get(job))
+        count = FIXED_CADENCE[job]//30*projection_days if job in FIXED_CADENCE else cadence.get(job)
         if count is None: missing.append('cadence_missing:' + job)
         else: counts[job] = nonnegative_integer(count)
         if job in FIXED_CADENCE and job in cadence and cadence[job] != count:
@@ -294,7 +366,7 @@ or prune savings. No manual test count is used as a scheduled monthly cadence.
             else: nonnegative_integer(sample[key])
     result = {'budget_gate': False, 'provider_billing_verified': False,
               'projected_rub': None, 'over_limit': None, 'monthly_jobs': counts,
-              'projection_days': 30, 'billing_month_hours': 730, 'missing': missing}
+              'projection_days': projection_days, 'billing_month_hours': 730, 'missing': missing}
     if missing: return result
     objects = inventory['objects'] + sum(samples[job]['new_objects'] * counts[job] for job in JOBS)
     stored = inventory['storage_bytes'] + sum(samples[job]['retained_delta_bytes'] * counts[job] for job in JOBS)
@@ -327,6 +399,98 @@ or prune savings. No manual test count is used as a scheduled monthly cadence.
                               'inventory_receipt': inventory['receipt_sha256']})
     return result
 
+
+def publish_budget(worker):
+    """Derive a cohort projection from fixed protected raw provider evidence.
+
+    Public ordinary standard/ru-1 tariffs are the accepted rate policy. Actual
+    export/selection provenance and all seven native job measurements remain
+    compulsory; no authenticity flag or precomputed PASS report is imported.
+    """
+    import backup_catalog,guards,meter,runtime,retention_cohort,retention_native
+    from worker import private_path,protected_directory,sha
+    w=worker;root=protected_directory(w.root/'receipts/budget-inputs');started=retention_cohort.clock()
+    provenance=runtime.load_json(private_path(root/'provenance.json'));selection=runtime.load_json(private_path(root/'provider-selection.json'))
+    rates=runtime.load_json(private_path(root/'rates.json'));measurements=runtime.load_json(private_path(root/'measurements.json'))
+    guards.require(provenance['operation']=='native-provider-export-admission' and provenance['export_source']=='authenticated-selectel-console' and
+                   provenance['bucket']==selection['bucket']==w.c['bucket'] and selection['source']=='authenticated-selectel-console-selection' and
+                   selection['storage_class']=='standard' and selection['region']==w.c['region']=='ru-1',
+                   'Actual provider selection/source absent or foreign')
+    for filename,key in (('billing.csv','billing_sha256'),('access.jsonl','access_sha256'),('rates.json','rates_sha256'),('provider-selection.json','selection_sha256')):
+        guards.require(sha(private_path(root/filename))==guards.hex_id(provenance[key],64),'Provider admitted input bytes differ')
+    for key in ('selected_from','selected_until','covered_from','covered_until','account_scope_sha256','provider_access_account_scope_sha256','scope_mapping_source','timezone'):
+        guards.require(provenance[key]==selection[key],'Provider source selection differs')
+    start=guards.utc(provenance['selected_from']);end=guards.utc(provenance['selected_until']);download=guards.utc(provenance['downloaded_at'])
+    guards.require(start<end and start<=download<=started,'Provider export selection/download clock differs')
+    covered_from=guards.utc(provenance['covered_from']);covered_until=guards.utc(provenance['covered_until'])
+    guards.require(start<=covered_from<covered_until<=min(end,download) and isinstance(provenance['scope_mapping_source'],str) and provenance['scope_mapping_source'].strip(),
+                   'Actual covered export bounds or authenticated scope mapping absent')
+    guards.require(rates['tariff_basis']=='owner-approved-public-standard-ru1' and rates['tax_basis'] in ('inclusive','exclusive'),
+                   'Accepted ordinary public tariff basis absent')
+    with backup_catalog.ArchiveCatalog(w).open_reader() as reader:inventory=retention_cohort.CohortStore(w).load(reader)
+    native_jobs=measurements['native_jobs'];guards.require(set(native_jobs)==set(JOBS),'All seven actual native job samples required')
+    def receipt(item):
+        name=item['receipt_file'];guards.require(isinstance(name,str) and pathlib.PurePath(name).name==name and name.endswith('.json'),'Fixed native receipt basename required')
+        path=private_path(w.root/'receipts'/name);guards.require(sha(path)==item['receipt_sha256'],'Native sample receipt bytes differ')
+        doc=runtime.load_json(path)
+        guards.require(doc['result']=='PASS' and doc['generation']==inventory['generation'] and doc['source']==w.source and
+                       doc['code_sha']==w.c['code_sha'] and doc['cohort']==inventory['cohort'],'Native sample cohort/source/version differs')
+        return doc
+    windows={job:{key:receipt(item)[key] for key in ('started_at','completed_at')} for job,item in native_jobs.items()}
+    counter=meter.access_log(private_path(root/'access.jsonl').read_bytes(),bucket=w.c['bucket'],windows=windows)
+    guards.require(counter['account_scope_sha256']==provenance['provider_access_account_scope_sha256'] and counter['isolated_job_measurement'] is True and
+                   start<=guards.utc(counter['first_utc'])<=guards.utc(counter['last_utc'])<=min(end,download),'Actual complete isolated provider counters absent')
+    scope=guards.hex_id(provenance['billing_scope_sha256'],64);samples={}
+    for job,item in native_jobs.items():
+        observed=counter['jobs'][job]
+        samples[job]={'measurement':'native','source_scope':scope,'receipt_sha256':item['receipt_sha256'],
+                      'provider_http':{name.lower():observed['charge_groups'][name] for name in ('PUT','GET','DELETE')},
+                      'egress_bytes':observed['server_to_client_bytes'],'retained_delta_bytes':nonnegative_integer(item['retained_delta_bytes']),
+                      'new_objects':nonnegative_integer(item['new_objects'])}
+    actual_inventory=measurements['inventory'];receipt(actual_inventory)
+    measured_inventory={key:actual_inventory[key] for key in ('objects','buckets','storage_bytes','receipt_sha256')};measured_inventory['source_scope']=scope
+    if (root/'objects.csv').exists():
+        guards.require(sha(private_path(root/'objects.csv'))==provenance['objects_sha256'],'Selected object export bytes differ')
+        for key in ('object_id','project_id'):guards.require(provenance[key]==selection[key],'Selected object/project lineage differs')
+        context={**provenance,'pool':selection['region']}
+        account=import_selected_billing(private_path(root/'objects.csv').read_bytes(),private_path(root/'billing.csv').read_bytes(),context,now=started)
+        account['source_context']['tariff_basis']=rates['tariff_basis']
+    else:account=import_billing_csv(private_path(root/'billing.csv').read_bytes(),timezone=provenance['timezone'],now=started)
+    guards.require(account['bucket_scopes']==[scope],'Account billing lacks selected bucket attribution')
+    actual_period=account['period']
+    guards.require(guards.utc(actual_period['first_utc'])==covered_from and guards.utc(actual_period['last_utc'])+dt.timedelta(hours=1)==covered_until,
+                   'Admitted covered bounds differ from actual exported sparse hours')
+    # Trust is derived from the fixed authenticated UI export/selection receipt,
+    # not a passed JSON report boolean. Numeric CSV rate intervals still undergo
+    # the existing reconciliation against the accepted ordinary public policy.
+    account['provenance'].update(source_authenticity_verified=True,tax_basis=rates['tax_basis'])
+    cadence=measurements['cadence']
+    minimum_batches=(44640+744+31+255)//256
+    guards.require(type(cadence['retention']) is int and cadence['retention']>=minimum_batches,
+                   'Retention projection undercounts bounded minute-archive cleanup')
+    effective_rates=dict(rates)
+    if rates['tax_basis']=='exclusive':
+        guards.require(rates.get('tax_multiplier') is not None,'Tax-exclusive forecast requires admitted final-charge multiplier')
+        factor=local_decimal(rates['tax_multiplier']);guards.require(factor>=1,'Invalid admitted tax multiplier')
+        for key in RATE_KEYS.values():effective_rates[key]=local_decimal(rates[key])*factor
+    projection=monthly_projection(samples,cadence,measured_inventory,effective_rates,account_report=account,projection_days=31)
+    # The owner accepted ordinary public rates. Exact invoice rounding is not
+    # a prerequisite for this conservative upper forecast. Keep the generic
+    # CSV compatibility/rounding limitations visible; never relabel them PASS.
+    cost=local_decimal(projection['projected_rub']) if projection['projected_rub'] is not None else None
+    public_upper_gate=cost is not None and cost<=Decimal(500) and projection['storage_upper_bound_bytes']<=10*GIB
+    document={'result':'PASS' if public_upper_gate else 'BLOCK','cohort':inventory['cohort'],'projection':projection,
+              'forecast_basis':'owner-approved ordinary public standard ru-1 rates; conservative native-job upper bounds',
+              'invoice_compatibility':{'numeric':projection.get('account_tariff_compatible'),'limitations':projection['missing']},
+              'bounded_retention_minimum_monthly_batches':minimum_batches,
+              'billing_month_basis':'worst calendar month: 31 days; storage price uses provider 730-hour month',
+              'bounded_retention_recommended_monthly_batches':186,
+              'provider_usage_sha256':provenance['access_sha256'],'account_billing_sha256':provenance['billing_sha256'],'tariff_sha256':provenance['rates_sha256'],
+              'measurement_from':counter['first_utc'],'measurement_until':counter['last_utc'],'measured_requests':counter['charge_groups'],
+              'measured_egress_bytes':counter['server_to_client_bytes'],'projected_monthly_rub':float(projection['projected_rub']) if projection['projected_rub'] is not None else None,
+              'projected_storage_bytes':projection.get('storage_upper_bound_bytes'),'completed_at':retention_cohort.clock().isoformat()}
+    if document['result']=='PASS':return retention_native.publish_evidence(w,'budget',document,inventory,started.isoformat())
+    return document
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

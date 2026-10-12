@@ -49,6 +49,22 @@ class CatalogTests(unittest.TestCase):
         self.w.c['code_sha']='9'*40
         self.assertEqual(c.entries()[SID]['verified']['code_sha'],'b'*40)
         self.admit(c);self.assertEqual(len(c.entries()),1)
+    def test_reader_refresh_authenticates_only_append_tail_and_rejects_pending_or_rollback(self):
+        c=self.catalog();self.admit(c)
+        with c.open_reader() as reader:
+            self.assertTrue(callable(getattr(reader,'refresh',None)),'Sealed append refresh missing')
+            meta={**self.meta,'id':'4'*64,'tags':[x.replace(TOKEN,'5'*32) for x in self.meta['tags']]}
+            c.admit('base','4'*64,meta,self.raw,self.restored)
+            with mock.patch.object(c,'_scan',side_effect=AssertionError('Repeated historic scan')):
+                fresh=reader.refresh()
+                self.assertEqual(set(reader.entries()),{SID})
+                self.assertEqual(set(fresh.entries()),{SID,'4'*64})
+                self.assertEqual(fresh.refresh().head,fresh.head)
+            runtime.atomic_json(c.pending,{'partial':True})
+            with self.assertRaises(guards.GuardError):reader.refresh()
+            c.pending.unlink()
+            head=runtime.load_json(c.head);runtime.atomic_json(c.head,{**head,'sequence':1})
+            with self.assertRaises(guards.GuardError):reader.refresh()
     def test_all_file_bytes_raw_manifest_and_metadata_drift_fail_admission(self):
         for change in ('bytes','raw','tree','source','generation','app','time','path','extra','duplicate_file'):
             with self.subTest(change=change):
@@ -288,6 +304,18 @@ class WorkerAdmissionTests(unittest.TestCase):
         self.assertFalse(any(cmd[0]=='restore' for cmd in commands))
 
 class CatalogLifecycleTests(unittest.TestCase):
+    def test_checkpoint_initial_native_audit_releases_upload_lanes(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        original=self.c._retirement_evidence;calls=[]
+        def audit(records,**kwargs):
+            if not calls:
+                try:
+                    with runtime.lane_lock(self.c.receipts/'base/lane.lock'),runtime.lane_lock(self.c.receipts/'binlog/lane.lock'):calls.append('unlocked-audit')
+                except guards.GuardError:self.fail('Initial long checkpoint audit holds upload lanes')
+            else:calls.append('final-check')
+            return original(records,**kwargs)
+        with mock.patch.object(self.c,'_retirement_evidence',audit):self.c.checkpoint()
+        self.assertEqual(calls,['unlocked-audit','final-check'])
     setUp=CatalogTests.setUp
     refresh=CatalogTests.refresh
     def prepare(self):
@@ -300,7 +328,7 @@ class CatalogLifecycleTests(unittest.TestCase):
             mock.patch.object(retention_native,'private_path',side_effect=lambda p:subject().safe(p)).start()
             mock.patch.object(retention_native,'protected_directory',side_effect=lambda p:subject().safe(p,directory=True)).start()
         for lane in ('base','binlog'):(self.root/'receipts'/lane).mkdir(mode=0o700)
-        def native(lane,args):
+        def native(lane,args,**kwargs):
             if args[2:]==['cat','config']:return json.dumps({'version':2,'id':('7' if lane=='base' else '8')*64}).encode()
             if args[2:]==['snapshots','--json']:return json.dumps([self.records[sid]['native'] for sid in sorted(self.live) if self.records[sid]['lane']==lane]).encode()
             raise AssertionError('Checkpoint attempted non-read-only/native operation')

@@ -96,6 +96,13 @@ class Recovery:
         guards.require(chain['generation']==self.w.c['generation'],'Chain generation mismatch')
         from retention_native import retained_chain,verified_tombstones
         chain=retained_chain(chain,verified_tombstones(self.w))
+        if (self.w.root/'receipts/retention-cohort.json').exists():
+            import backup_catalog,retention_cohort,retention
+            with backup_catalog.ArchiveCatalog(self.w).open_reader() as reader:
+                inventory=retention_cohort.CohortStore(self.w).load(reader)
+            frozen=retention.inventory_plan(inventory,guards.utc(inventory['cohort']['planned_at']))
+            guards.require(all(item in chain['logs'] for item in frozen['logs']),'Current chain lacks frozen cohort logs')
+            chain={**chain,'logs':frozen['logs']}
         if self.profile=='tip':validate_tip_end(self.plan['stop'],chain['logs'])
         return replay_range(base['coordinates'],self.plan['stop'],chain['logs'])
     def snapshot(self,lane,sid,*,existing=False):
@@ -218,10 +225,10 @@ class Recovery:
         receipt={'before_replay_control_records_absent':True,'before_replay_proof':self.before_proof,'before_replay_proof_kind':self.before_proof_kind,'result':'PASS','started_from':'private encrypted S3-B base+binlogs; original source reads=0','source':w.source,'code_sha':w.c['code_sha'],'stage_app_sha':base['stage_app_sha'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'full_id':self.plan['full_id'],'full_manifest_sha256':fmd,'coordinates':base['coordinates'],'stop':self.plan['stop'],'replayed_logs':len(selected),'verified_binlogs':selected,'synthetic_order_after_base':True,'synthetic_operation_after_base':True,'later_order_operation_excluded':self.profile=='point','additional_order_operation_present':self.profile=='tip','profile':self.profile,'media':restored,'negatives':negatives,'control_objects':[self.control,self.volume],'owner_independent_machine':'not_run','timers':'disabled;usage/account tariff prerequisite','completed_at':now()}
         runtime.atomic_json(w.root/'receipts'/self.receipt_name,receipt)
         if self.before_proof_kind=='native-journals':
-            from retention import native_inventory
+            import backup_catalog,retention_cohort
             from retention_native import publish_evidence
-            ids={lane:runtime.load_json(private_path(w.root/'receipts'/('init-'+lane+'.json')))['repository_id'] for lane in ('base','binlog')}
-            inventory=native_inventory(w,dt.datetime.now(dt.timezone.utc),ids,lambda:dt.datetime.now(dt.timezone.utc))
+            with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
+                inventory=retention_cohort.CohortStore(w).load(reader)
             intent=runtime.load_json(private_path(self.intent));started=intent['started_at']
             receipt=publish_evidence(w,'tip' if self.profile=='tip' else 'anchor',receipt,inventory,started)
         print(json.dumps(receipt));return receipt

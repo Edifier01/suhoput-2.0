@@ -41,6 +41,28 @@ def inputs():
 
 
 class BillingImportTests(unittest.TestCase):
+    def test_selected_object_and_metric_exports_preserve_actual_schema_timezone_and_scope(self):
+        m=subject();self.assertTrue(callable(getattr(m,'import_selected_billing',None)),'Actual selected Console CSV pair unsupported')
+        import hashlib
+        objects=['account','object','StageB','project','storage','Storage','2026-10-12 11:00:00','project','Project','storage','ru-1','0.71']
+        object_header='Аккаунт;Идентификатор объекта;Наименование объекта;Идентификатор родительского объекта;Тип объекта;Наименование типа объекта;Период;Идентификатор проекта;Наименование проекта;Продукт;Регион;Стоимость'
+        metric_header='Аккаунт;Идентификатор ресурса;Наименование ресурса;Количество ресурса;Единица измерения ресурса;Период;Продукт;Стоимость'
+        raw_objects=csv_bytes([objects],object_header);raw_metrics=csv_bytes([['account','traffic-req-put','PUT','1000','item','2026-10-12 11:00:00','storage','0.71']],metric_header)
+        context={'object_id':'object','project_id':'project','bucket':'stage-b','pool':'ru-1','timezone':'+03:00','account_scope_sha256':hashlib.sha256(b'account').hexdigest(),
+                 'selected_from':'2026-10-12T08:00:00Z','selected_until':'2026-10-12T09:00:00Z',
+                 'billing_sha256':hashlib.sha256(raw_metrics).hexdigest(),'objects_sha256':hashlib.sha256(raw_objects).hexdigest()}
+        report=m.import_selected_billing(raw_objects,raw_metrics,context,now=NOW)
+        self.assertEqual(report['period']['first_utc'],'2026-10-12T08:00:00Z')
+        self.assertEqual(report['cost_rub'],'0.71');self.assertEqual(report['bucket_scopes'],[m.scope_fingerprint('account','project','stage-b','ru-1')])
+        self.assertEqual(report['provenance']['metric_schema'],metric_header.split(';'))
+        empty_fields=list(objects);empty_fields[3]=empty_fields[10]='';actual_objects=csv_bytes([empty_fields],object_header)
+        actual_context={**context,'objects_sha256':hashlib.sha256(actual_objects).hexdigest()}
+        try:actual=m.import_selected_billing(actual_objects,raw_metrics,actual_context,now=NOW)
+        except m.BudgetError as error:self.fail('Actual empty parent/region fields must use explicit authenticated selection: '+str(error))
+        self.assertEqual(actual['source_context']['region_source'],'authenticated selection; object CSV region absent')
+        for key,value in [('project_id','other'),('object_id','other'),('billing_sha256','0'*64),('account_scope_sha256','0'*64)]:
+            bad=copy.deepcopy(context);bad[key]=value
+            with self.subTest(key=key),self.assertRaises(m.BudgetError):m.import_selected_billing(raw_objects,raw_metrics,bad,now=NOW)
     def test_duplicate_hour_scope_metric_cannot_double_charge_report(self):
         m = subject()
         with self.assertRaises(m.BudgetError):
@@ -146,6 +168,18 @@ class BillingImportTests(unittest.TestCase):
 
 
 class MonthlyProjectionTests(unittest.TestCase):
+    def test_calendar_month_bound_rejects_cost_that_only_fits_thirty_days(self):
+        m=subject();samples,cadence,inventory,rates=inputs();rates['put_rub_1000']='11'
+        thirty=m.monthly_projection(samples,cadence,inventory,rates)
+        try:calendar=m.monthly_projection(samples,cadence,inventory,rates,projection_days=31)
+        except TypeError:self.fail('Native calendar month projection still has only thirty-day counts')
+        self.assertLessEqual(Decimal(thirty['projected_rub']),Decimal(500))
+        self.assertGreater(Decimal(calendar['projected_rub']),Decimal(500))
+        self.assertTrue(calendar['over_limit'])
+        self.assertEqual(calendar['monthly_jobs']['binlog'],44640)
+        self.assertEqual(calendar['monthly_jobs']['hourly'],744)
+        self.assertEqual(calendar['monthly_jobs']['full'],31)
+
     def test_arithmetic_compatible_csv_without_source_confirmation_never_opens_gate(self):
         m = subject()
         samples, cadence, inventory, rates = inputs()

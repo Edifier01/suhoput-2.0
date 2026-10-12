@@ -279,10 +279,12 @@ class ApplyTests(unittest.TestCase):
         result=ex.apply(before,self.plan,self.evidence,NOW)
         self.assertEqual(result['result'],'APPLIED'); self.assertEqual(result['protected_arrival_ids'],['9'*64])
     def test_clock_rollback_before_lane_command_has_no_effect(self):
-        # The second clock read is now after the initial inventory, before
-        # intent. Advance to the lane phase before injecting its rollback.
-        before=copy.deepcopy(self.inventory); clocks=iter([NOW,NOW,NOW-dt.timedelta(seconds=1)])
-        ex=self.executor(); ex.clock=lambda:next(clocks,NOW-dt.timedelta(seconds=1))
+        # Inject at the observable durability boundary, not a clock-call count;
+        # final dependency work now has its own pre-intent freshness check.
+        before=copy.deepcopy(self.inventory);current=[NOW]
+        class RollbackIntent(MemoryIntent):
+            def prepare(self,value):super().prepare(value);current[0]=NOW-dt.timedelta(seconds=1)
+        ex=self.executor(store=RollbackIntent());ex.clock=lambda:current[0]
         result=ex.apply(before,self.plan,self.evidence,NOW)
         self.assertEqual(self.calls,[]); self.assertEqual(result['result'],'RECONCILE_REQUIRED')
 
