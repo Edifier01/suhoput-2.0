@@ -22,6 +22,17 @@ jobs:
           git diff --check
       - name: Offline backup safety scenarios (synthetic; no S3 or DB restore)
         run: python3 tests/backup_model_test.py
+      - name: Backup journal and manifest fault scenarios (synthetic; no S3 or DB)
+        run: python3 tests/backup_runtime_test.py
+      - name: WordPress media record guards (synthetic; no DB or network)
+        run: >-
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges
+          --tmpfs /control:rw,nosuid,nodev,size=16777216
+          --mount "type=bind,source=$PWD/tests,target=/tests,readonly"
+          --mount "type=bind,source=$PWD/infra/backup,target=/input,readonly"
+          --entrypoint php
+          wordpress:7.1.3-php8.3-apache@sha256:8ecd8d8e374167ea22235acf30f80d1165b82f07ffa5bcef90c1cad8f7be251f
+          /tests/backup-media.php
       - name: Local MariaDB PITR rehearsal (synthetic; no S3 or VPS)
         shell: bash
         run: |

@@ -1,6 +1,6 @@
 # Копии и восстановление владельцем — TASK-047
 
-**Подготовленный протокол, не действующая система копий.** Готовность — [STATUS](STATUS.md), согласованные объекты/операции — [INFRASTRUCTURE](INFRASTRUCTURE.md#task-047-change-proposal), требования — [TASK-047](PLAN.md#task-047) и [SPEC](SPEC.md#почта-и-эксплуатация). Самостоятельное назначение документа — порядок восстановления и критерии проверки владельцем. Целевые uploads/retention/DB restore/PITR ещё не запускались: новый PutObject403. Отдельный локальный архивный control описан ниже. Команды будущего восстановления нельзя применять к SITE-A.
+**Подготовленный протокол, не действующая система копий.** Готовность — [STATUS](STATUS.md), согласованные объекты/операции — [INFRASTRUCTURE](INFRASTRUCTURE.md#task-047-change-proposal), требования — [TASK-047](PLAN.md#task-047) и [SPEC](SPEC.md#почта-и-эксплуатация). Самостоятельное назначение документа — порядок восстановления и критерии проверки владельцем. Новый S3-B Put/Get/SHA/Delete и encrypted S3 archive control прошли12.10.2026, включая отдельный synthetic MariaDB replay после чтения из S3; EXEC-CHK-055. Целевой stage runtime/retention/owner restore ещё не приняты. Отдельные локальные контроли описаны ниже. Команды будущего восстановления нельзя применять к SITE-A.
 
 ## Независимый комплект владельца
 
@@ -8,13 +8,22 @@
 
 DPAPI credential привязан к текущему Windows-профилю. Переносимый защищённый экспорт и восстановление на другом компьютере ещё не подготовлены/не испытаны. Секреты не передавать в чат, Git, PR, receipt или argv. Серверные credential/password files — root0600 в root0700 каталоге. Проверять происхождение/права, читать env как данные, не исполнять его как shell-код.
 
-Кандидат — [restic0.19.1](https://restic.net/blog/2026-07-05/restic-0.19.1-released/), repository format2, проверка TLS/hostname и path-style S3. Документация [repository/S3](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html) изучена11.10.2026. Официальный binary скачан локально, SHA-256 совпал с Release SHA256SUMS. 12.10.2026 подпись SHA256SUMS проверена GPGV2.4.9 с fingerprint из [официальной инструкции](https://restic.readthedocs.io/en/stable/020_installation.html#stable-releases); изменённый manifest отвергнут. Локальные архивирование и MariaDB replay испытаны, EXEC-CHK-054. На VPS binary не установлен, совместимость S3-B и независимый owner-комплект не испытаны.
+Кандидат — [restic0.19.1](https://restic.net/blog/2026-07-05/restic-0.19.1-released/), repository format2, проверка TLS/hostname и path-style S3. Документация [repository/S3](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html) изучена11.10.2026. Официальный binary скачан локально, SHA-256 совпал с Release SHA256SUMS. 12.10.2026 подпись SHA256SUMS проверена GPGV2.4.9 с fingerprint из [официальной инструкции](https://restic.readthedocs.io/en/stable/020_installation.html#stable-releases); изменённый manifest отвергнут. Локальные архивирование и MariaDB replay испытаны, EXEC-CHK-054. Совместимость restic с S3-B проверена реальными synthetic upload/read/integrity/restore, EXEC-CHK-055. На VPS binary не установлен, независимый owner-комплект не испытан.
 
 ## Состав копий и контроля
 
+Реализация разрешённого пакета (статическая последовательность, оперативное состояние только STATUS):
+
+1. `infra/backup/guards.py` и независимые fault tests: scope/source identity, manifest/chain, media paths, prerequisites retention и бюджет; сначала RED, затем GREEN.
+2. `infra/backup/worker.py`: защищённый config/atomic receipts, независимые locks/cache/repository для base/media и minute binlog, dump+inventory/full/pre-update, native checksum, upload reconciliation и heartbeat только после подтверждения. Две repository внутри того же разрешённого prefix исключают блокировку minute lane долгой full/prune. Credentials только отдельного S3-B, subprocess argv без secret values.
+3. Отдельный owner-kit: переносимая encrypted repository restic под известным владельцу новым паролем, с S3-B recovery credentials/password/manifest. Вход — защищённый локальный credential, выход — encrypted комплект; plaintext только tmpfs. Проверить независимую расшифровку без VPS/DPAPI и настоящий S3-read.
+4. Только после owner-kit: защищённая установка новых backup файлов и проверенного binary, stage dump/config rollback, ROW overlay/перезапуск только stage DB с прежним image/volume. Репозиторий/ключ/данные не удалять при ошибке.
+5. Настоящие S3 base/full/binlog snapshots и восстановление в новый control DB/каталог, поздние synthetic order/operation и все WordPress originals/sizes/gallery refs; negative gap/corruption/missing-media/unknown upload controls.
+6. Retention30д/prerequisites, измеренные запросы/bytes/egress и сверка биллинга → только затем восемь новых service/timer файлов и реальные срабатывания. При недостающем входе сохранить цепочку и конкретный blocker; частоту/30д не ослаблять. Независимое ревью точного изменения и оба foundation точного итогового SHA обязательны.
+
 - Hourly: транзакционный dump только stage schema, точные base file/position, полное логическое состояние uploads с передачей изменённых блоков, UTC/source-generation/instance identity, SHA/bytes. Live MariaDB datadir не заменяет dump. Сейчас61 таблица InnoDB; смена engine/DDL требует новой проверки согласованности.
 - Daily full и `pre-update`: дополнительно полный WordPress/WooCommerce, собственные plugins/theme/mu-plugin и bind-mounted файлы, конфигурация и версионный манифест. Full восстанавливается без файлов рабочей площадки. Успешный pre-update receipt обязателен до существенного обновления.
-- Binlog: immutable закрытые файлы, выгрузка не реже минуты, SHA/bytes, проверка checksum штатным `mariadb-binlog`, непрерывная цепочка одной generation и heartbeat **после** подтверждённого upload. Lag>60с, gap/смена generation/rollback clock дают ошибку. Exit0 timer не доказывает сохранённые данные.
+- Binlog: immutable закрытые файлы, выгрузка не реже минуты, SHA/bytes, проверка checksum штатным `mariadb-binlog`, непрерывная цепочка одной generation и heartbeat **после** подтверждённого upload с сохранением времени захвата данных; позднее reconciliation не делает старый payload свежим. Lag>60с, gap/смена generation/rollback clock дают ошибку. Exit0 timer не доказывает сохранённые данные.
 
 `mariadb-dump --single-transaction --master-data=2` — кандидат для InnoDB согласно [MariaDB dump](https://mariadb.com/docs/server/clients-and-utilities/backup-restore-and-import-clients/mariadb-dump). При изменении media во время захвата проверить согласованность, не принимать snapshot автоматически. Полная owner-проверка включает реально прочитанные и расшифрованные данные, а не только наличие объектов.
 
@@ -30,7 +39,7 @@ DPAPI credential привязан к текущему Windows-профилю. П
 
 ## Retention, ресурсы и ошибки
 
-Сохранять точки30д и prerequisite base перед началом окна с её цепочкой; prerequisite может временно лежать сверх30д. Перед forget/prune проверить старейшую остающуюся точку реальным восстановлением. Unknown snapshots/другой источник/gap/ошибка integrity/restore/отсутствие owner-key останавливают удаление. Автоматический retention ещё не реализован. [Restic retention](https://restic.readthedocs.io/en/stable/060_forget.html) требует проверенных tags/grouping, а не слепого применения примера.
+Сохранять точки30д и prerequisite base перед началом окна с её цепочкой; prerequisite может временно лежать сверх30д. Перед forget/prune проверить старейшую остающуюся точку реальным восстановлением. Unknown snapshots/другой источник/gap/ошибка integrity/restore/отсутствие owner-key останавливают удаление. Автоматический retention ещё не реализован. Подготовленный pure planner отклоняет gap/overlap, всегда возвращает apply_allowed=false; Boolean flags не разрешают удаление. Нужен native verifier, связанный с текущим inventory/chain и результатом восстановления. [Restic retention](https://restic.readthedocs.io/en/stable/060_forget.html) требует проверенных tags/grouping, а не слепого применения примера.
 
 Контролировать disk/inodes/spool/cache, S3 bytes, paid requests/egress, job duration, latest successful base/full/binlog heartbeat и ошибки. Нужны согласованные RUB/GiB ceilings, тарифы, фактические счётчики и сверка биллинга. При превышении сохранить годные копии, сообщить ошибку и условие снятия в STATUS; не сокращать30д/частоту и не удалять prerequisite ради зелёного статуса. Настоящая почта alerts — TASK-046, стенд — Mailpit; мониторинг пока не установлен.
 
@@ -74,3 +83,19 @@ if ($LASTEXITCODE -ne 0) { throw 'Local MariaDB PITR rehearsal failed' }
 ```
 
 CI выполняет тот же сценарий с официальным restic0.19.1, закреплённым archive SHA и проверкой binary SHA в script. Это дополнение foundation, без target credentials/S3/VPS. Локальный окончательный прогон12.10.2026 06:21:36–44 UTC exit0; первичный отказ ожидания версии исправлен: MariaDB при binlog=ON возвращает суффикс `-log`. Обязательные целевые критерии остаются в начале документа.
+
+## Проверка записей медиа
+
+[media.php](../infra/backup/media.php) без WordPress bootstrap извлекает core attachment paths, `_wp_attachment_metadata` originals/sizes/original_image, backup sizes, product thumbnail/gallery IDs и uploads URLs из **предоставленных** records. Ошибочные/повторные metadata, неизвестный attachment ID, object/cyclic serialization и path traversal останавливают проверку. Inventory/verify требуют каждого файла внутри uploads, SHA/bytes и отсутствия file/directory symlinks. Основание: [WordPress metadata](https://developer.wordpress.org/reference/functions/wp_get_attachment_metadata/) и [WooCommerce gallery API](https://woocommerce.github.io/code-reference/classes/WC-Product.html), изучены12.10.2026. Это подготовленная функция, полнота экспорта восстановленной DB и runtime compatibility ещё требуют целевого контроля.
+
+[backup-media.php](../tests/backup-media.php) использует только synthetic PHP records/files, включая scaled original/thumbnail/backup/gallery. Запуск из корня проекта:
+
+```powershell
+$taskRoot = (Get-Location).Path
+docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /control:rw,nosuid,nodev,size=16777216 --mount "type=bind,source=$taskRoot/tests,target=/tests,readonly" --mount "type=bind,source=$taskRoot/infra/backup,target=/input,readonly" --entrypoint php wordpress:7.1.3-php8.3-apache@sha256:8ecd8d8e374167ea22235acf30f80d1165b82f07ffa5bcef90c1cad8f7be251f /tests/backup-media.php
+if ($LASTEXITCODE -ne 0) { throw 'Synthetic media guards failed' }
+```
+
+`python3 tests/backup_runtime_test.py` проверяет источник/prefix, gaps, retention prerequisites, durable intent до put, lost-response reconciliation без второго put, запрет retry неизвестного результата, digest реального manifest-read через injected runner, clock rollback и stale data watermark. Эти synthetic faults не доказывают настоящий S3 client/DB exporter/fsync на VPS. Все native restic commands адаптера закрепляют проверенный repository через `--repo`; credentials должен задавать защищённый native runner, который ещё не установлен.
+
+Для ограничения запросов fresh durable intent с attempted=false не делает remote find до первого put. Native JSON response snapshot ID используется только как hint: затем `cat snapshot <exact-id>` и `dump <exact-id> <manifest>` подтверждают аутентифицированные tags/bytes; parent_id берётся из прежнего confirmed state. После неизвестного ответа без hint остаётся полный tag inventory scan без автоматического второго put. По [restic0.19.1 find](https://raw.githubusercontent.com/restic/restic/v0.19.1/cmd/restic/find.go) и [snapshot filter](https://raw.githubusercontent.com/restic/restic/v0.19.1/internal/data/snapshot_find.go), изученным12.10.2026, обычный tag filter перебирает снимки; точный full ID загружает конкретный snapshot. Оптимизация не доказывает месячный бюджет/lag: нужны measured requests/latency при30д объёме.33 synthetic runtime tests PASS; native cat/dump S3 command compatibility отдельно PASS, весь защищённый worker/runner ещё не испытан.
