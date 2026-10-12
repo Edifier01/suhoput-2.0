@@ -63,6 +63,22 @@ def publish_history(worker):
     with backup_catalog.ArchiveCatalog(w).open_reader() as reader:inventory=retention_cohort.CohortStore(w).load(reader)
     planned=guards.utc(inventory['cohort']['planned_at']);cutoff=planned-dt.timedelta(days=30)
     indexed={row['id']:row for row in inventory['snapshots']};groups={'binlog':[],'hourly':[],'full':[]}
+    # Cadence spans the original confirmations, including an archive at the
+    # cutoff that a prior exact native retention legitimately removed. Its
+    # identity/time must still match the verified immutable original intent.
+    retired={row['id']:row for row in retention_native.verified_tombstones(w)}
+    if retired:
+        for path in (w.root/'receipts/retention-applies').iterdir():
+            intent=retention_native.IntentStore(path).load()
+            body={key:value for key,value in intent.items() if key!='intent_sha256'}
+            guards.require(retention_native.retention_apply.document_digest(body)==intent['intent_sha256'],'Historical retention intent changed')
+            for row in intent['before_inventory']['snapshots']:
+                proof=retired.get(row['id'])
+                if proof is None:continue
+                guards.require(row['id'] in intent['candidate_ids'] and all(row[key]==proof[key] for key in ('id','lane','token','manifest_sha256','generation')),
+                               'Historical cadence retirement identity differs')
+                if row['id'] in indexed:guards.require(indexed[row['id']]==row,'Conflicting historical cadence identity')
+                else:indexed[row['id']]=row
     for lane,journal in journals.items():
         for proof in journal['confirmed']:
             row=indexed.get(proof['id'])

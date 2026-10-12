@@ -86,6 +86,38 @@ class CohortTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             w=SimpleNamespace(root=pathlib.Path(temp))
             with self.assertRaises((guards.GuardError,FileNotFoundError)):budget.publish_budget(w)
+    def test_history_frequency_survives_authenticated_retirement_of_pre_window_samples(self):
+        import contextlib,retention_cohort,backup_catalog
+        with tempfile.TemporaryDirectory() as temp:
+            w=SimpleNamespace(root=pathlib.Path(temp),c={'generation':'a'*32});live=[];old=[];journals={'base':[],'binlog':[]}
+            if os.name=='nt':
+                self.enterContext(mock.patch.object(retention_native,'private_path',lambda p:pathlib.Path(p)))
+                self.enterContext(mock.patch.object(retention_native,'protected_directory',lambda p:pathlib.Path(p)))
+            for kind,interval in (('binlog',60),('hourly',3600),('full',86400)):
+                count=30*86400//interval
+                for index in range(count+1):
+                    at=NOW-dt.timedelta(seconds=(count-index)*interval);identity=hashlib.sha256((kind+str(index)).encode()).hexdigest()
+                    row={'id':identity,'kind':kind,'lane':'binlog' if kind=='binlog' else 'base','token':identity[:32],
+                         'manifest_sha256':identity,'generation':'a'*32,'time':at.isoformat()}
+                    (old if index==0 else live).append(row)
+                    journals[row['lane']].append({key:row[key] for key in ('id','token','manifest_sha256') }|{'captured_at':row['time'],'prepared_at':row['time'],'confirmed_at':row['time']})
+            for lane,rows in journals.items():runtime.atomic_json(w.root/'receipts'/lane/'state.json',{'generation':'a'*32,'confirmed':rows})
+            directory=w.root/'receipts/retention-applies'/('b'*64);directory.mkdir(mode=0o700,parents=True)
+            body={'before_inventory':{'snapshots':old},'candidate_ids':[r['id'] for r in old]}
+            runtime.atomic_json(directory/'intent.json',{**body,'intent_sha256':retention_apply.document_digest(body)})
+            tombstones=[{key:row[key] for key in ('id','lane','token','manifest_sha256','generation')} for row in old]
+            inventory={'snapshots':live,'cohort':{'planned_at':NOW.isoformat()}}
+            @contextlib.contextmanager
+            def reader(*args):yield None
+            with mock.patch.object(backup_catalog.ArchiveCatalog,'__init__',return_value=None),mock.patch.object(backup_catalog.ArchiveCatalog,'open_reader',reader), \
+                 mock.patch.object(retention_cohort.CohortStore,'__init__',return_value=None),mock.patch.object(retention_cohort.CohortStore,'load',return_value=inventory), \
+                 mock.patch.object(retention_native,'verified_tombstones',return_value=tombstones),mock.patch.object(retention_native,'publish_evidence',side_effect=lambda w,n,d,*a:d):
+                try:proof=runtime.publish_history(w)
+                except guards.GuardError as error:self.fail('Authenticated rolling cadence was discarded: '+str(error))
+                self.assertEqual(proof['result'],'PASS');self.assertEqual(guards.utc(proof['observed_from']),NOW-dt.timedelta(days=30))
+                altered=runtime.load_json(directory/'intent.json');altered['before_inventory']['snapshots'][0]['time']=(NOW-dt.timedelta(days=29)).isoformat()
+                runtime.atomic_json(directory/'intent.json',altered)
+                with self.assertRaises(guards.GuardError):runtime.publish_history(w)
 
 
 class NativeCohortTests(unittest.TestCase):
