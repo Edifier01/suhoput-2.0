@@ -1,6 +1,6 @@
 """Protected STAGE-B backup CLI; native retention has a separate intent gate."""
 import os,sys,re,json,stat,hashlib,pathlib,subprocess,datetime as dt,uuid,shutil,time,tempfile
-import guards,runtime,restic_adapter,dump_records
+import guards,runtime,restic_adapter,dump_records,backup_catalog
 UTC=dt.timezone.utc
 DB_IMAGE='mariadb:10.11@sha256:7db29378d4fdab73f8123bbc2b48905c90d1a4b00cf848b028f1e81e623257f2'
 WP_IMAGE='wordpress:7.1.3-php8.3-apache@sha256:8ecd8d8e374167ea22235acf30f80d1165b82f07ffa5bcef90c1cad8f7be251f'
@@ -225,20 +225,38 @@ class Worker:
         history=runtime.load_json(self.root/'receipts/full.json');guards.hex_id(history['snapshot_id'],64)
         guards.require(history.get('source')==self.source and history.get('generation')==self.c['generation'] and history.get('stage_app_sha')==self.c['stage_app_sha'] and all(history.get(k)==v for k,v in identity.items()),'Full prerequisite application/generation mismatch')
         proofs=runtime.UploadJournal(self.root/'receipts/base',self.c['generation']).state()['confirmed'];guards.require(any(x['id']==history['snapshot_id'] and x['manifest_sha256']==history['manifest_sha256'] for x in proofs),'Full prerequisite confirmation absent');return history['snapshot_id']
-    def verify_archive(self,lane,sid,manifest):
+    def verify_archive(self,lane,sid,manifest,*,native_metadata,raw_manifest,reconcile=False):
         # Read back into a new owned root-only directory, including every file;
         # metadata/manifest presence alone cannot acknowledge partial snapshots.
+        guards.require(lane in ('base','binlog'),'Wrong archive verification lane');guards.hex_id(sid,64)
+        repo=self.c['repositories'][lane]
+        config=backup_catalog.decode(self.restic(lane,['--repo',repo,'cat','config']))
+        initialization=backup_catalog.decode(backup_catalog.read_file(self.root/'receipts'/('init-'+lane+'.json'),backup_catalog.MAX_RECORD_BYTES))
+        guards.require(config['version']==2 and config['id']==guards.hex_id(initialization['repository_id'],64) and
+                       initialization['generation']==self.c['generation'],'Native archive repository identity differs')
+        scope=str(self.root/'spool'/(lane+'-payload'))
+        listing=self.restic(lane,['--repo',self.c['repositories'][lane],'ls','--json','--recursive',sid,scope],timeout=50 if lane=='binlog' else 900)
+        restic_adapter.verify_tree_listing(listing,sid,scope,native_metadata,raw_manifest)
+        guards.require(backup_catalog.decode(raw_manifest)==manifest,'Native callback manifest differs')
         token=uuid.uuid4().hex;temporary=self.root/'cache'/('verify-'+token);temporary.mkdir(mode=0o700)
         runtime.atomic_json(temporary/'owner.json',{'generation':self.c['generation'],'token':token,'snapshot_id':sid});target=temporary/'archive'
         self.restic(lane,['--repo',self.c['repositories'][lane],'restore',sid,'--target',str(target),'--verify'],timeout=50 if lane=='binlog' else 900)
-        restored=target/str(self.root/'spool'/(lane+'-payload')).lstrip('/');guards.require(runtime.load_json(restored/'manifest.json')==manifest,'Readback manifest drift');verify_payload(restored,manifest)
+        source_path=pathlib.Path(scope);restored=target/source_path.relative_to(source_path.anchor)
+        guards.require(backup_catalog.read_file(restored/'manifest.json',backup_catalog.MAX_RAW_BYTES)==raw_manifest,'Readback raw manifest drift');verify_payload(restored,manifest)
         if lane=='base':
             inventory=self.media(restored/'uploads',dump_records.records((restored/'db.sql').read_bytes()));guards.require(inventory==runtime.load_json(restored/'media.json')['inventory'],'Restored media references/directories differ')
+        else:
+            for item in manifest['logs']:
+                guards.log_number(item['file'])
+                self.native.run(['docker','run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--cpus','0.5','--memory','384m','--pids-limit','128','--mount','type=bind,source='+str(restored/'logs')+',target=/logs,readonly','--entrypoint','mariadb-binlog',DB_IMAGE,'--no-defaults','--verify-binlog-checksum','/logs/'+item['file']],timeout=20)
+        # Admission copies only actual restored, all-file verified bytes. The
+        # native header is independently bound to the archive before restore.
+        backup_catalog.ArchiveCatalog(self).admit(lane,sid,native_metadata,raw_manifest,restored,reconcile=reconcile)
         guards.require(temporary.resolve()==temporary and temporary.parent==self.root/'cache' and not temporary.is_symlink(),'Readback cleanup scope changed');tree_inventory(temporary)
         shutil.rmtree(temporary);runtime.directory_sync(temporary.parent);return True
     def upload(self,lane,payload):
         manifest=runtime.load_json(payload/'manifest.json');verify_payload(payload,manifest)
-        adapter=restic_adapter.ResticAdapter(self.c['repositories'][lane],self.c['generation'],str(payload),runner=lambda args:self.restic(lane,args,timeout=50 if lane=='binlog' else 900),verify_archive=lambda sid,metadata:self.verify_archive(lane,sid,metadata))
+        adapter=restic_adapter.ResticAdapter(self.c['repositories'][lane],self.c['generation'],str(payload),runner=lambda args:self.restic(lane,args,timeout=50 if lane=='binlog' else 900),verify_archive=lambda sid,metadata,**proof:self.verify_archive(lane,sid,metadata,**proof))
         capture=self.capture_intent(lane,payload);runtime.atomic_json(self.root/'receipts'/('capture-'+lane+'.json'),{**capture,'phase':'upload'})
         sid=runtime.UploadJournal(self.root/'receipts'/lane,self.c['generation']).upload(payload,sha(payload/'manifest.json'),adapter)
         return sid
@@ -268,7 +286,7 @@ class Worker:
                 for name in ('.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf'):
                     source=self.stage/name;guards.require(source.is_file() and not source.is_symlink(),'Missing full configuration');dest=payload/'configuration'/name;dest.parent.mkdir(mode=0o700,parents=True,exist_ok=True);shutil.copyfile(source,dest);os.chmod(dest,0o600)
                 public=payload/'configuration/backup-public';public.mkdir(mode=0o700)
-                for name in ('worker.py','restore.py','retention.py','retention_native.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
+                for name in ('worker.py','restore.py','retention.py','retention_native.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','backup_catalog.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
                     source=self.bin/name;guards.require(source.is_file() and not source.is_symlink(),'Missing recovery public helper');shutil.copyfile(source,public/name);os.chmod(public/name,0o600)
             guards.require(media_before==tree_inventory(uploads)==tree_inventory(payload/'uploads'),'Uploads changed during capture')
             if kind in ('full','pre-update'):guards.require(identity==self.captured_identity(payload),'Captured application/configuration differs from baseline')

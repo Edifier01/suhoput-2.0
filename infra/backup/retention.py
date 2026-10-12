@@ -1,6 +1,6 @@
 """Read-only native inventory/anchor audit. No remote deletion or scheduling."""
 import argparse,contextlib,datetime as dt,hashlib,io,json,os,pathlib,sys,uuid
-import guards,runtime,restic_adapter
+import guards,runtime,restic_adapter,backup_catalog
 from worker import Worker,DB_IMAGE,sha,private_path,now
 from restore import Recovery,replay_range
 
@@ -19,12 +19,14 @@ def same_inventory(before,after):
 def decode(data):
     try:
         guards.require(isinstance(data,bytes) and len(data)<=64*1024*1024,'Native JSON oversized')
-        return json.loads(data,object_pairs_hook=runtime.no_duplicates)
-    except (ValueError,UnicodeError) as error:
+        return json.loads(data,object_pairs_hook=runtime.no_duplicates,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+    except (ValueError,UnicodeError,RecursionError) as error:
         raise guards.GuardError('Invalid authenticated JSON') from error
 
 def native_inventory(worker,at,repository_ids,clock=None):
     w=worker;entries=[];manifests={};tokens=set();observed=at
+    catalog=backup_catalog.ArchiveCatalog(w);records=catalog.entries();backfilled=False;live={}
     for lane in ('base','binlog'):
         repo=w.c['repositories'][lane];scope=str(w.root/'spool'/(lane+'-payload'))
         run=lambda args:w.restic(lane,['--repo',repo,*args])
@@ -47,8 +49,18 @@ def native_inventory(worker,at,repository_ids,clock=None):
             guards.require(tag('generation:')==w.c['generation'],'Foreign generation in repository')
             token=guards.hex_id(tag('token:'),32);digest=guards.hex_id(tag('manifest-sha:'),64)
             guards.require(token not in tokens,'Duplicate upload token');tokens.add(token)
-            body=run(['dump',sid,scope+'/manifest.json']);guards.require(hashlib.sha256(body).hexdigest()==digest,'Authenticated manifest digest differs')
-            manifest=decode(body);kind=manifest['kind']
+            native,_,_=backup_catalog.native_identity(metadata,sid,scope,w.c['generation']);live[sid]=(lane,native)
+            if sid in records:
+                record=records[sid]
+                guards.require(record['lane']==lane and record['repository_id']==config['id'] and record['native']==native and record['manifest_sha256']==digest,
+                               'Native metadata differs from verified catalog')
+                manifest=record['projection']
+            else:
+                # Cold backfill reuses native unfiltered metadata, then performs
+                # actual all-file restore verification. No tags/flags import.
+                body=run(['dump',sid,scope+'/manifest.json']);guards.require(isinstance(body,bytes) and hashlib.sha256(body).hexdigest()==digest,'Authenticated manifest digest differs')
+                manifest=decode(body)
+            kind=manifest['kind']
             guards.require(manifest['format']==1 and manifest['generation']==w.c['generation'] and manifest['source']==w.source,'Foreign snapshot manifest')
             guards.require(kind in (('full','pre-update','hourly') if lane=='base' else ('binlog',)),'Wrong snapshot lane/kind')
             guards.hex_id(manifest['code_sha'],40)
@@ -60,9 +72,20 @@ def native_inventory(worker,at,repository_ids,clock=None):
                 observed=current.astimezone(dt.timezone.utc)
             guards.require(captured<=uploaded<=observed,'Future snapshot or capture timestamp mismatch')
             if lane=='base':guards.require(manifest['stage_app_sha']==w.c['stage_app_sha'],'Unknown stage application')
+            if sid not in records:
+                guards.require(callable(getattr(w,'verify_archive',None)) and
+                               w.verify_archive(lane,sid,manifest,native_metadata=metadata,raw_manifest=body) is True,
+                               'Actual native catalog backfill required');backfilled=True
             entries.append({'id':sid,'lane':lane,'token':token,'manifest_sha256':digest,'kind':kind,
-                            'generation':w.c['generation'],'time':manifest['captured_at'],'snapshot_time':metadata['time']})
-            manifests[sid]=manifest
+                            'generation':w.c['generation'],'time':manifest['captured_at'],'snapshot_time':metadata['time'],'tree':native['tree']})
+            manifests[sid]={k:v for k,v in manifest.items() if k!='files'}
+    if backfilled:
+        # One full seal scan for the cold run, never one scan per admission.
+        records=catalog.entries()
+        for sid,(lane,native) in live.items():
+            record=records.get(sid)
+            guards.require(record is not None and record['native']==native and record['repository_id']==repository_ids[lane] and
+                           record['lane']==lane and record['projection']==manifests[sid],'Native backfill was not committed to verified catalog')
     return {'generation':w.c['generation'],'repositories':dict(repository_ids),'snapshots':entries,'manifests':manifests,
             'observed_at':observed.isoformat()}
 
@@ -182,7 +205,7 @@ class Inspector:
             for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
             for row in before['snapshots']:
                 lane=row['lane'];sid=row['id'];scope=str(w.root/'spool'/(lane+'-payload'))
-                adapter=restic_adapter.ResticAdapter(w.c['repositories'][lane],w.c['generation'],scope,runner=lambda args,lane=lane:w.restic(lane,args),verify_archive=lambda sid,manifest,lane=lane:w.verify_archive(lane,sid,manifest))
+                adapter=restic_adapter.ResticAdapter(w.c['repositories'][lane],w.c['generation'],scope,runner=lambda args,lane=lane:w.restic(lane,args),verify_archive=lambda sid,manifest,lane=lane,**proof:w.verify_archive(lane,sid,manifest,**proof))
                 adapter.hints[row['token']]=sid;matches=adapter.find(row['token'])
                 guards.require(len(matches)==1 and matches[0]['id']==sid and matches[0]['manifest_sha256']==row['manifest_sha256'],'Incomplete authenticated archive readback')
                 if lane=='binlog':
