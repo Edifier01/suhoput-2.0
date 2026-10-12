@@ -153,7 +153,7 @@ class NativeApply:
              runtime.lane_lock(w.root/'receipts/base/lane.lock'),runtime.lane_lock(w.root/'receipts/binlog/lane.lock'):
             for lane in ('base','binlog'):guards.require(not (w.root/'receipts'/lane/'pending.json').exists(),'Unknown pending upload; preserve')
             ids={lane:runtime.load_json(private_path(w.root/'receipts'/('init-'+lane+'.json')))['repository_id'] for lane in ('base','binlog')}
-            read=lambda:retention.native_inventory(w,dt.datetime.now(dt.timezone.utc),ids)
+            read=lambda:retention.native_inventory(w,dt.datetime.now(dt.timezone.utc),ids,lambda:dt.datetime.now(dt.timezone.utc))
             unfinished=[]
             for path in directory.iterdir():
                 guards.hex_id(path.name,64);old=IntentStore(path)

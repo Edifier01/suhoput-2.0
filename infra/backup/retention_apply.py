@@ -176,7 +176,7 @@ def validate_apply(inventory, plan, evidence, at):
                                ('inventory_sha256', plan['inventory_sha256'])]:
                 guards.require(document[key] == value, 'Evidence inventory/source binding differs')
             started = guards.utc(document['started_at']); completed = guards.utc(document['completed_at'])
-            guards.require(started <= completed <= at and completed >= planned - dt.timedelta(seconds=MAX_PLAN_AGE_SECONDS),
+            guards.require(started <= completed <= at and completed >= at - dt.timedelta(seconds=MAX_PLAN_AGE_SECONDS),
                            'Evidence clock window differs')
             documents[name] = document
         audit = documents['audit']
@@ -232,6 +232,18 @@ def validate_apply(inventory, plan, evidence, at):
                 'proof_sha256': copy.deepcopy(plan['proof_sha256']), 'source': copy.deepcopy(source)}
     except (KeyError, TypeError, ValueError, StopIteration) as error:
         raise guards.GuardError('Incomplete native apply prerequisites') from error
+
+
+def current_freshness(plan,evidence,at):
+    """Constant-size final clock gate, after all potentially expensive checks."""
+    planned=guards.utc(plan['planned_at'])
+    guards.require(planned<=at and (at-planned).total_seconds()<=MAX_PLAN_AGE_SECONDS,
+                   'Plan expired immediately before effect')
+    guards.require(set(evidence)==EVIDENCE_TYPES,'Complete native evidence required before effect')
+    for name in EVIDENCE_TYPES:
+        document=evidence[name]['document'];started=guards.utc(document['started_at']);completed=guards.utc(document['completed_at'])
+        guards.require(started<=completed<=at and (at-completed).total_seconds()<=MAX_PLAN_AGE_SECONDS,
+                       'Proof expired immediately before effect')
 
 
 class Executor:
@@ -309,6 +321,11 @@ class Executor:
         except (KeyError, TypeError, ValueError) as failure:
             raise guards.GuardError('Incomplete retention plan') from failure
         before = self.read_inventory()
+        at = self._now(at)
+        if plan['candidates']:
+            validate_apply(inventory, plan, evidence, at)
+        else:
+            _plan(inventory, plan, at)
         comparison = compatible_inventory(inventory, before, at)
         protected_dependencies(before, binding['candidate_ids'], at)
         body = {**binding, 'operation': 'native-retention-forget', 'token': uuid.uuid4().hex,
@@ -331,8 +348,15 @@ class Executor:
                 guards.require((at - guards.utc(plan['planned_at'])).total_seconds() <= MAX_PLAN_AGE_SECONDS,
                                'Plan expired before lane command')
                 current = self.read_inventory()
+                at = self._now(at)
                 compatible_inventory(before, current, at, removed)
                 protected_dependencies(current, intent['candidate_ids'], at)
+                # A slow read (or dependency check) must never turn a fresh
+                # pre-read proof into permission for a later expired effect.
+                at = self._now(at)
+                validate_apply(inventory, plan, evidence, at)
+                at = self._now(at)
+                current_freshness(plan,evidence,at)
                 calls += 1
                 result = self.runner(lane, ['--repo', self.repositories[lane], 'forget', *candidates])
                 guards.require(result is None or isinstance(result, bytes), 'Runner must raise on nonzero/ambiguous exit')

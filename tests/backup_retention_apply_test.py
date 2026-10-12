@@ -279,10 +279,74 @@ class ApplyTests(unittest.TestCase):
         result=ex.apply(before,self.plan,self.evidence,NOW)
         self.assertEqual(result['result'],'APPLIED'); self.assertEqual(result['protected_arrival_ids'],['9'*64])
     def test_clock_rollback_before_lane_command_has_no_effect(self):
-        before=copy.deepcopy(self.inventory); clocks=iter([NOW,NOW-dt.timedelta(seconds=1)])
+        # The second clock read is now after the initial inventory, before
+        # intent. Advance to the lane phase before injecting its rollback.
+        before=copy.deepcopy(self.inventory); clocks=iter([NOW,NOW,NOW-dt.timedelta(seconds=1)])
         ex=self.executor(); ex.clock=lambda:next(clocks,NOW-dt.timedelta(seconds=1))
         result=ex.apply(before,self.plan,self.evidence,NOW)
         self.assertEqual(self.calls,[]); self.assertEqual(result['result'],'RECONCILE_REQUIRED')
+
+    def test_clock_rollback_during_initial_inventory_has_no_intent(self):
+        before=copy.deepcopy(self.inventory);current=[NOW]
+        def reader():
+            current[0]=NOW-dt.timedelta(seconds=1)
+            return copy.deepcopy(self.inventory)
+        ex=self.executor(reader=reader);ex.clock=lambda:current[0]
+        with self.assertRaises(guards.GuardError):ex.apply(before,self.plan,self.evidence,NOW)
+        self.assertEqual(self.calls,[]);self.assertIsNone(self.store.value)
+
+    def test_last_inventory_cannot_let_expired_plan_reach_forget(self):
+        before=copy.deepcopy(self.inventory); current=[NOW]; reads=0
+        def reader():
+            nonlocal reads
+            reads+=1
+            if reads==2:current[0]=NOW+dt.timedelta(seconds=901)
+            return copy.deepcopy(self.inventory)
+        ex=self.executor(reader=reader);ex.clock=lambda:current[0]
+        result=ex.apply(before,self.plan,self.evidence,NOW)
+        self.assertEqual(self.calls,[])
+        self.assertEqual(result['result'],'RECONCILE_REQUIRED')
+        self.assertEqual(result['present_candidate_ids'],[OLD])
+        self.assertEqual(result['remote_delete_calls'],0)
+        ex.apply(before,self.plan,self.evidence,current[0])
+        self.assertEqual(self.calls,[])
+
+    def test_slow_initial_inventory_expires_before_durable_intent(self):
+        before=copy.deepcopy(self.inventory);current=[NOW]
+        def reader():
+            current[0]=NOW+dt.timedelta(seconds=901)
+            return copy.deepcopy(self.inventory)
+        ex=self.executor(reader=reader);ex.clock=lambda:current[0]
+        with self.assertRaises(guards.GuardError):ex.apply(before,self.plan,self.evidence,NOW)
+        self.assertEqual(self.calls,[]);self.assertIsNone(self.store.value)
+
+    def test_proof_age_is_relative_to_current_effect_clock(self):
+        self.evidence['owner']['document']['started_at']=(NOW-dt.timedelta(minutes=15)).isoformat()
+        self.evidence['owner']['document']['completed_at']=(NOW-dt.timedelta(minutes=14)).isoformat()
+        self.rebind('owner')
+        ex=self.executor();ex.clock=lambda:NOW+dt.timedelta(minutes=2)
+        with self.assertRaises(guards.GuardError):ex.apply(copy.deepcopy(self.inventory),self.plan,self.evidence,NOW)
+        self.assertEqual(self.calls,[]);self.assertIsNone(self.store.value)
+
+    def test_final_validation_cannot_cross_freshness_deadline_or_roll_back(self):
+        from unittest.mock import patch
+        for final_time in (NOW+dt.timedelta(seconds=901),NOW+dt.timedelta(seconds=898)):
+            self.setUp();before=copy.deepcopy(self.inventory);current=[NOW];reads=0;validations=0;m=subject();original=m.validate_apply
+            def reader():
+                nonlocal reads
+                reads+=1
+                if reads==2:current[0]=NOW+dt.timedelta(seconds=899)
+                return copy.deepcopy(self.inventory)
+            def validate(*args):
+                nonlocal validations
+                result=original(*args);validations+=1
+                if validations==3:current[0]=final_time
+                return result
+            ex=self.executor(reader=reader);ex.clock=lambda:current[0]
+            with self.subTest(final_time=final_time),patch.object(m,'validate_apply',validate):
+                result=ex.apply(before,self.plan,self.evidence,NOW)
+                self.assertEqual(self.calls,[]);self.assertEqual(result['result'],'RECONCILE_REQUIRED')
+                self.assertEqual(result['present_candidate_ids'],[OLD])
 
     def test_noop_with_unknown_post_inventory_requires_reconcile(self):
         self.inventory['snapshots']=[r for r in self.inventory['snapshots'] if r['id']!=OLD]; self.inventory['manifests'].pop(OLD)

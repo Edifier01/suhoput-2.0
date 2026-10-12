@@ -221,7 +221,7 @@ class Recovery:
             from retention import native_inventory
             from retention_native import publish_evidence
             ids={lane:runtime.load_json(private_path(w.root/'receipts'/('init-'+lane+'.json')))['repository_id'] for lane in ('base','binlog')}
-            inventory=native_inventory(w,dt.datetime.now(dt.timezone.utc),ids)
+            inventory=native_inventory(w,dt.datetime.now(dt.timezone.utc),ids,lambda:dt.datetime.now(dt.timezone.utc))
             intent=runtime.load_json(private_path(self.intent));started=intent['started_at']
             receipt=publish_evidence(w,'tip' if self.profile=='tip' else 'anchor',receipt,inventory,started)
         print(json.dumps(receipt));return receipt

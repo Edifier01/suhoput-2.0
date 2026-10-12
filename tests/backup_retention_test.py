@@ -83,12 +83,13 @@ class NativeInventoryFaults(unittest.TestCase):
         from types import SimpleNamespace
         self.source={'root':'/srv/suhoput2-stage-20261011','generation':GEN};scope='/srv/suhoput2-stage-20261011/backup/spool/base-payload'
         self.payload={'format':1,'generation':GEN,'source':self.source,'kind':'full','code_sha':'f'*40,'stage_app_sha':'f'*40,'captured_at':'2026-10-12T11:00:00Z','files':[]}
-        self.body=json.dumps(self.payload).encode();self.metadata={'paths':[scope],'time':'2026-10-12T11:01:00Z','tags':['task047','generation:'+GEN,'token:'+'c'*32,'manifest-sha:'+hashlib.sha256(self.body).hexdigest()]};self.foreign=False;self.duplicate=False
+        self.body=json.dumps(self.payload).encode();self.metadata={'paths':[scope],'tree':'2'*64,'time':'2026-10-12T11:01:00Z','tags':['task047','generation:'+GEN,'token:'+'c'*32,'manifest-sha:'+hashlib.sha256(self.body).hexdigest()]};self.foreign=False;self.duplicate=False;self.commands=[];self.partial_list=False
         def restic(lane,args):
             command=args[2:]
+            self.commands.append(command)
             if command==['cat','config']:return json.dumps({'version':2,'id':('7' if lane=='base' else '8')*64}).encode()
             if command==['snapshots','--json']:
-                rows=[{'id':'1'*64}] if lane=='base' else []
+                rows=[{'id':'1'*64,**({} if self.partial_list else self.metadata)}] if lane=='base' else []
                 return json.dumps(rows*2 if self.duplicate else rows).encode()
             if command[:2]==['cat','snapshot']:return json.dumps(self.metadata).encode()
             if command[0]=='dump':return self.body
@@ -113,4 +114,27 @@ class NativeInventoryFaults(unittest.TestCase):
             if mutation=='missing':bad['snapshots']=bad['snapshots'][1:]
             if mutation=='digest':bad['snapshots'][0]['manifest_sha256']='9'*64
             with self.assertRaises(guards.GuardError):m.confirmed_inventory(bad,journals)
+
+    def test_trusted_observation_clock_accepts_snapshot_uploaded_during_scan(self):
+        m=subject();w=self.worker();self.metadata['time']=(NOW+dt.timedelta(seconds=1)).isoformat()
+        result=m.native_inventory(w,NOW,{'base':'7'*64,'binlog':'8'*64},lambda:NOW+dt.timedelta(seconds=2))
+        self.assertEqual(len(result['snapshots']),1)
+        self.assertEqual(guards.utc(result['observed_at']),NOW+dt.timedelta(seconds=2))
+
+    def test_native_authenticated_listing_reuses_metadata_without_per_snapshot_cat(self):
+        m=subject();w=self.worker();result=m.native_inventory(w,NOW,{'base':'7'*64,'binlog':'8'*64})
+        self.assertEqual(len(result['snapshots']),1)
+        self.assertFalse(any(cmd[:2]==['cat','snapshot'] for cmd in self.commands))
+        self.assertEqual(len(self.commands),5)
+
+    def test_partial_native_listing_metadata_is_rejected(self):
+        m=subject();w=self.worker();self.partial_list=True
+        with self.assertRaises(guards.GuardError):m.native_inventory(w,NOW,{'base':'7'*64,'binlog':'8'*64})
+
+    def test_advancing_observation_clock_still_rejects_future_and_rollback(self):
+        m=subject()
+        for uploaded,observed in ((NOW+dt.timedelta(seconds=3),NOW+dt.timedelta(seconds=2)),(NOW,NOW-dt.timedelta(seconds=1))):
+            w=self.worker();self.metadata['time']=uploaded.isoformat()
+            with self.subTest(uploaded=uploaded),self.assertRaises(guards.GuardError):
+                m.native_inventory(w,NOW,{'base':'7'*64,'binlog':'8'*64},lambda:observed)
 if __name__=='__main__':unittest.main()

@@ -23,8 +23,8 @@ def decode(data):
     except (ValueError,UnicodeError) as error:
         raise guards.GuardError('Invalid authenticated JSON') from error
 
-def native_inventory(worker,at,repository_ids):
-    w=worker;entries=[];manifests={};tokens=set()
+def native_inventory(worker,at,repository_ids,clock=None):
+    w=worker;entries=[];manifests={};tokens=set();observed=at
     for lane in ('base','binlog'):
         repo=w.c['repositories'][lane];scope=str(w.root/'spool'/(lane+'-payload'))
         run=lambda args:w.restic(lane,['--repo',repo,*args])
@@ -33,7 +33,13 @@ def native_inventory(worker,at,repository_ids):
         listed=decode(run(['snapshots','--json']));guards.require(isinstance(listed,list),'Complete snapshot inventory required')
         for row in listed:
             sid=guards.hex_id(row['id'],64);guards.require(sid not in manifests,'Duplicate snapshot across inventory')
-            metadata=decode(run(['cat','snapshot',sid]));tags=metadata['tags']
+            # Native snapshots --json already decrypts/authenticates each
+            # snapshot. Reopening the same metadata in N new native processes
+            # adds no proof; manifests still require actual archived raw bytes.
+            metadata=row
+            guards.require(all(key in metadata for key in ('tags','paths','time','tree')),
+                           'Incomplete native authenticated snapshot metadata')
+            guards.hex_id(metadata['tree'],64);tags=metadata['tags']
             guards.require(metadata['paths']==[scope] and isinstance(tags,list) and all(isinstance(x,str) for x in tags) and len(tags)==len(set(tags)) and 'task047' in tags,'Unknown snapshot source or tags')
             def tag(prefix):
                 values=[x[len(prefix):] for x in tags if x.startswith(prefix)]
@@ -47,12 +53,18 @@ def native_inventory(worker,at,repository_ids):
             guards.require(kind in (('full','pre-update','hourly') if lane=='base' else ('binlog',)),'Wrong snapshot lane/kind')
             guards.hex_id(manifest['code_sha'],40)
             captured=guards.utc(manifest['captured_at']);uploaded=guards.utc(metadata['time'])
-            guards.require(captured<=uploaded<=at,'Future snapshot or capture timestamp mismatch')
+            if clock is not None:
+                current=clock()
+                guards.require(isinstance(current,dt.datetime) and current.tzinfo is not None and current>=observed,
+                               'Trusted observation clock rolled back')
+                observed=current.astimezone(dt.timezone.utc)
+            guards.require(captured<=uploaded<=observed,'Future snapshot or capture timestamp mismatch')
             if lane=='base':guards.require(manifest['stage_app_sha']==w.c['stage_app_sha'],'Unknown stage application')
             entries.append({'id':sid,'lane':lane,'token':token,'manifest_sha256':digest,'kind':kind,
                             'generation':w.c['generation'],'time':manifest['captured_at'],'snapshot_time':metadata['time']})
             manifests[sid]=manifest
-    return {'generation':w.c['generation'],'repositories':dict(repository_ids),'snapshots':entries,'manifests':manifests}
+    return {'generation':w.c['generation'],'repositories':dict(repository_ids),'snapshots':entries,'manifests':manifests,
+            'observed_at':observed.isoformat()}
 
 def confirmed_inventory(inventory,journals,tombstones=()):
     retired={}
@@ -160,7 +172,7 @@ class Inspector:
             self.root.mkdir(mode=0o700);(self.root/'logs').mkdir(mode=0o700)
             runtime.atomic_json(self.root/'intent.json',{'generation':w.c['generation'],'code_sha':w.c['code_sha'],'started_at':now(),'remote_delete':False})
             repository_ids={lane:runtime.load_json(private_path(w.root/'receipts'/('init-'+lane+'.json')))['repository_id'] for lane in ('base','binlog')}
-            before=native_inventory(w,dt.datetime.now(dt.timezone.utc),repository_ids)
+            before=native_inventory(w,dt.datetime.now(dt.timezone.utc),repository_ids,lambda:dt.datetime.now(dt.timezone.utc))
             journals={}
             for lane in ('base','binlog'):
                 guards.require(not (w.root/'receipts'/lane/'pending.json').exists(),'Unknown pending upload; retention audit stopped')
@@ -188,7 +200,7 @@ class Inspector:
             for item in proof['verified_binlogs']:
                 path=recovery.root/'logs'/item['file']
                 guards.require(path.resolve()==path and not path.is_symlink() and path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Recovery file differs from audited S3 binlog')
-            after=native_inventory(w,dt.datetime.now(dt.timezone.utc),repository_ids);same_inventory(before,after)
+            after=native_inventory(w,dt.datetime.now(dt.timezone.utc),repository_ids,lambda:dt.datetime.now(dt.timezone.utc));same_inventory(before,after)
             blockers=['native_delete_executor_disabled','measured_monthly_budget/account_billing_unverified','independent_owner_full_restore_not_run']
             if not plan['pre_window_anchor_present']:blockers.append('real_30_day_history_not_present')
             if proof['stop']!={'file':plan['chain_last_file'],'position':plan['chain_last_position']}:blockers.append('verified_restore_stop_precedes_archived_chain_tip')
