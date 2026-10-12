@@ -8,7 +8,7 @@
 
 DPAPI credential привязан к текущему Windows-профилю. Переносимый защищённый экспорт и восстановление на другом компьютере ещё не подготовлены/не испытаны. Секреты не передавать в чат, Git, PR, receipt или argv. Серверные credential/password files — root0600 в root0700 каталоге. Проверять происхождение/права, читать env как данные, не исполнять его как shell-код.
 
-Кандидат — [restic0.19.1](https://restic.net/blog/2026-07-05/restic-0.19.1-released/), repository format2, проверка TLS/hostname и path-style S3. Документация [repository/S3](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html) изучена11.10.2026. Официальный binary скачан локально, SHA-256 совпал с Release SHA256SUMS; локальное архивирование/чтение/restore испытаны. Подпись Release ещё не проверена; на VPS binary не установлен, совместимость S3-B не испытана. До целевого применения проверить подпись, фиксировать версию в ACCEPTANCE.
+Кандидат — [restic0.19.1](https://restic.net/blog/2026-07-05/restic-0.19.1-released/), repository format2, проверка TLS/hostname и path-style S3. Документация [repository/S3](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html) изучена11.10.2026. Официальный binary скачан локально, SHA-256 совпал с Release SHA256SUMS. 12.10.2026 подпись SHA256SUMS проверена GPGV2.4.9 с fingerprint из [официальной инструкции](https://restic.readthedocs.io/en/stable/020_installation.html#stable-releases); изменённый manifest отвергнут. Локальные архивирование и MariaDB replay испытаны, EXEC-CHK-054. На VPS binary не установлен, совместимость S3-B и независимый owner-комплект не испытаны.
 
 ## Состав копий и контроля
 
@@ -58,3 +58,19 @@ if ($LASTEXITCODE -ne 0) { throw 'Local archive control failed' }
 ```
 
 Скрипт проверяет digest restic, не удаляет host-файлы и повреждает только собственный ephemeral pack после успешного восстановления. Первый trial11.10.2026 остановился на fault injection: pack mode read-only вместе с cap-drop ALL запретил truncate. Исправлен fixture — проверка своего uid/chmod своего tmpfs-файла; ограничения контейнера сохранены. Повтор17:51 UTC exit0, [EXEC-CHK-053](ACCEPTANCE.md#exec-chk-053). Этот сценарий не доказывает восстановление владельцем на независимом компьютере или выполнение TASK-047/048.
+
+## Локальная репетиция MariaDB PITR
+
+[backup-mariadb-local.sh](../tests/backup-mariadb-local.sh) создаёт две отдельные MariaDB10.11.19 instance внутри одного нового network-none контейнера, только в пустом tmpfs. У них собственные datadir/socket, исходное имя synthetic schema одинаково; TCP и event scheduler выключены. Пароль socket-root отсутствует **только в одноразовом изолированном тесте**; такая настройка не разрешена для постоянного стенда. Контейнер не монтирует существующие тома или credentials и не открывает порты.
+
+Сценарий делает настоящий single-transaction/master-data dump, две последующие ROW binlog, локальный encrypted restic archive/check --read-data/restore --verify и импорт в вторую DB. Исходная DB перед восстановлением остановлена. Координаты читаются из восстановленного архива; replay заканчивается на проверенной committed target и исключает более позднюю транзакцию. Все две ссылки synthetic `media_refs` из восстановленной DB, включая thumbnail, проверяются по SHA/bytes. Отсутствующий/повреждённый thumbnail и усечённый binlog должны вызвать отказ. Это реальные локальные DB/archive операции, **не полноценная WordPress DB→media extraction, не S3-B, не испытание целевого расписания/owner restore**.
+
+```powershell
+$taskRoot = (Get-Location).Path
+$taskBinary = Join-Path $taskRoot '.cache/infrastructure/restic-0.19.1/restic'
+$taskScript = Join-Path $taskRoot 'tests/backup-mariadb-local.sh'
+docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 1 --pids-limit 256 --tmpfs /control:rw,exec,nosuid,nodev,size=805306368,mode=0700 --tmpfs /tmp:rw,nosuid,nodev,size=16777216 --mount "type=bind,source=$taskBinary,target=/input/restic,readonly" --mount "type=bind,source=$taskScript,target=/input/test.sh,readonly" --entrypoint bash mariadb:10.11@sha256:7db29378d4fdab73f8123bbc2b48905c90d1a4b00cf848b028f1e81e623257f2 /input/test.sh
+if ($LASTEXITCODE -ne 0) { throw 'Local MariaDB PITR rehearsal failed' }
+```
+
+CI выполняет тот же сценарий с официальным restic0.19.1, закреплённым archive SHA и проверкой binary SHA в script. Это дополнение foundation, без target credentials/S3/VPS. Локальный окончательный прогон12.10.2026 06:21:36–44 UTC exit0; первичный отказ ожидания версии исправлен: MariaDB при binlog=ON возвращает суффикс `-log`. Обязательные целевые критерии остаются в начале документа.
