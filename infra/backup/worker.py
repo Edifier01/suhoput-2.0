@@ -1,4 +1,4 @@
-"""Protected STAGE-B backup CLI. No production targets or retention deletion."""
+"""Protected STAGE-B backup CLI; native retention has a separate intent gate."""
 import os,sys,re,json,stat,hashlib,pathlib,subprocess,datetime as dt,uuid,shutil,time,tempfile
 import guards,runtime,restic_adapter,dump_records
 UTC=dt.timezone.utc
@@ -119,6 +119,13 @@ class Worker:
         if command in ('cat','dump','snapshots','check','restore','stats','ls'):opts.append('--no-lock')
         env={**self.credentials,'AWS_REGION':self.c['region']}
         return self.native.run([str(self.binary),*opts,*args],environment=env,timeout=timeout,target=target)
+    def retention_forget(self,lane,ids):
+        """Only the trusted retention executor calls this exact-ID boundary."""
+        guards.require(lane in ('base','binlog') and isinstance(ids,list) and 0<len(ids)<=256 and ids==sorted(set(ids)),'Bounded exact snapshot IDs required')
+        for sid in ids:guards.hex_id(sid,64)
+        opts=['--password-file',str(self.password),'--cache-dir',str(self.root/'cache'/lane),'-o','s3.bucket-lookup=path','-o','s3.connections=1']
+        # Restic's native exclusive repository lock serializes the effect.
+        return self.native.run([str(self.binary),*opts,'--repo',self.c['repositories'][lane],'forget',*ids],environment={**self.credentials,'AWS_REGION':self.c['region']},timeout=900)
     def initialize(self,lane):
         repo=self.c['repositories'][lane];intent=self.root/'receipts'/('init-'+lane+'.json')
         if not intent.exists():
@@ -261,7 +268,7 @@ class Worker:
                 for name in ('.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf'):
                     source=self.stage/name;guards.require(source.is_file() and not source.is_symlink(),'Missing full configuration');dest=payload/'configuration'/name;dest.parent.mkdir(mode=0o700,parents=True,exist_ok=True);shutil.copyfile(source,dest);os.chmod(dest,0o600)
                 public=payload/'configuration/backup-public';public.mkdir(mode=0o700)
-                for name in ('worker.py','restore.py','retention.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
+                for name in ('worker.py','restore.py','retention.py','retention_native.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
                     source=self.bin/name;guards.require(source.is_file() and not source.is_symlink(),'Missing recovery public helper');shutil.copyfile(source,public/name);os.chmod(public/name,0o600)
             guards.require(media_before==tree_inventory(uploads)==tree_inventory(payload/'uploads'),'Uploads changed during capture')
             if kind in ('full','pre-update'):guards.require(identity==self.captured_identity(payload),'Captured application/configuration differs from baseline')

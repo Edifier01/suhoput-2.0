@@ -39,6 +39,7 @@ def _index(inventory, at):
     for rid in inventory['repositories'].values():
         guards.hex_id(rid, 64)
     rows = {}; tokens = set(); sources = []
+    compact = inventory.get('format') == 'authenticated-retention-identities-v1'
     for row in inventory['snapshots']:
         sid = guards.hex_id(row['id'], 64)
         guards.require(sid not in rows and row['generation'] == inventory['generation'],
@@ -51,14 +52,27 @@ def _index(inventory, at):
         tokens.add(token); guards.hex_id(row['manifest_sha256'], 64)
         guards.require(guards.utc(row['time']) <= guards.utc(row['snapshot_time']) <= at,
                        'Inventory capture/upload clock mismatch')
-        manifest = inventory['manifests'][sid]
-        guards.require(isinstance(manifest['source'], dict) and manifest['source'] and
-                       manifest['source'].get('generation') == inventory['generation'],
+        source = inventory['source'] if compact else inventory['manifests'][sid]['source']
+        guards.require(isinstance(source, dict) and source and
+                       source.get('generation') == inventory['generation'],
                        'Authenticated source missing')
-        sources.append(manifest['source']); rows[sid] = row
-    guards.require(rows and set(inventory['manifests']) == set(rows), 'Manifest inventory differs')
+        sources.append(source); rows[sid] = row
+    guards.require(rows and (compact or set(inventory['manifests']) == set(rows)), 'Manifest inventory differs')
     guards.require(all(source == sources[0] for source in sources), 'Mixed snapshot sources')
     return rows, sources[0]
+
+
+def compact_authenticated_inventory(inventory, at):
+    """Persist every authenticated identity, without duplicating payload lists.
+
+    Native readers verify full manifest bytes against each row's SHA before
+    this boundary. That digest binds files, coordinates and dependencies too.
+    Current inventories/arrivals still use full manifests for dependency gates.
+    """
+    _, source = _index(inventory, at)
+    return {'format': 'authenticated-retention-identities-v1',
+            'generation': inventory['generation'], 'repositories': copy.deepcopy(inventory['repositories']),
+            'source': copy.deepcopy(source), 'snapshots': copy.deepcopy(inventory['snapshots'])}
 
 
 def compatible_inventory(before, after, at, allowed_absent=()):
@@ -74,8 +88,9 @@ def compatible_inventory(before, after, at, allowed_absent=()):
         missing = set(original) - set(current)
         guards.require(missing <= allowed, 'Protected snapshot disappeared')
         for sid in set(original) & set(current):
-            guards.require(original[sid] == current[sid] and
-                           before['manifests'][sid] == after['manifests'][sid],
+            full_documents_equal = ('manifests' not in before or 'manifests' not in after or
+                                    before['manifests'][sid] == after['manifests'][sid])
+            guards.require(original[sid] == current[sid] and full_documents_equal,
                            'Known snapshot or manifest changed')
         return {'absent_ids': sorted(missing), 'arrival_ids': sorted(set(current) - set(original))}
     except (KeyError, TypeError, ValueError) as error:
@@ -113,7 +128,7 @@ def _plan(inventory, plan, at):
     planned = guards.utc(plan['planned_at'])
     guards.require(0 <= (at - planned).total_seconds() <= MAX_PLAN_AGE_SECONDS,
                    'Plan stale or clock rollback')
-    calculated = retention.inventory_plan(inventory, planned)
+    calculated = retention.bounded_plan(inventory, retention.inventory_plan(inventory, planned), MAX_CANDIDATES)
     for key in ('anchor_id', 'keep', 'candidates', 'inventory_sha256',
                 'pre_window_anchor_present', 'chain_last_file', 'chain_last_position', 'logs'):
         guards.require(plan[key] == calculated[key], 'Plan differs from authenticated inventory')
@@ -189,8 +204,10 @@ def validate_apply(inventory, plan, evidence, at):
         guards.require(all(isinstance(owner[k], str) and owner[k].strip() for k in
                            ('machine_id', 'source_machine_id', 'medium_id')) and
                        owner['machine_id'] != owner['source_machine_id'] and
-                       owner['origin'] == 'independent-physical-medium' and
-                       owner['restore_method'] == 'full-native-database-media',
+                       owner['origin'] in ('independent-physical-medium','separately-stored-encrypted-kit') and
+                       owner['restore_method'] == 'full-native-database-media' and
+                       owner.get('executed_by') == 'owner' and
+                       owner.get('bundle_storage_separate') is True and owner.get('password_storage_separate') is True,
                        'Independent full owner restore absent')
         for key in ('recovery_bundle_sha256', 'restore_receipt_sha256'):
             guards.hex_id(owner[key], 64)
@@ -295,7 +312,7 @@ class Executor:
         comparison = compatible_inventory(inventory, before, at)
         protected_dependencies(before, binding['candidate_ids'], at)
         body = {**binding, 'operation': 'native-retention-forget', 'token': uuid.uuid4().hex,
-                'prepared_at': at.isoformat(), 'before_inventory': copy.deepcopy(before),
+                'prepared_at': at.isoformat(), 'before_inventory': compact_authenticated_inventory(before, at),
                 'protected_arrival_ids': comparison['arrival_ids'],
                 'repository_paths': self.repositories}
         intent = {**body, 'intent_sha256': document_digest(body)}

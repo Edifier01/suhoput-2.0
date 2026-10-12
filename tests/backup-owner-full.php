@@ -73,6 +73,12 @@ $bad=$full;$bad['manifest']['application_sha256']=str_repeat('9',64);denied(fn()
 denied(fn()=>SuhoputBackup\validateOwnerFullSelection($base,$full,$chains,['file'=>$tip['file'],'position'=>49]));
 denied(fn()=>SuhoputBackup\validateOwnerFullSelection($base,$full,[],$tip));
 echo "PASS exact full/base binding, contiguous closed chain from prefix 1 and end target\n";
+$suffix=$chains;$suffix[0]['manifest']['logs']=[$logs[1]];$suffix[0]['manifest']['previous_count']=1;$suffix[0]['manifest']['first_log']=2;
+$suffixBase=$base;$suffixBase['manifest']['coordinates']=['file'=>'suhoput2-binlog.000002','position'=>4];$suffixFull=$suffixBase;
+must(SuhoputBackup\validateOwnerFullSelection($suffixBase,$suffixFull,$suffix,$tip)===[$logs[1]]);
+$bad=$suffix;$bad[0]['manifest']['previous_count']=0;denied(fn()=>SuhoputBackup\validateOwnerFullSelection($suffixBase,$suffixFull,$bad,$tip));
+denied(fn()=>SuhoputBackup\validateOwnerFullSelection($base,$full,$suffix,$tip));
+echo "PASS retained suffix uses original offset; fabricated prefix and unavailable base rejected\n";
 if(PHP_OS_FAMILY!=='Windows'){
  $private='/control/owner-full-private-'.bin2hex(random_bytes(8));mkdir($private,0700);file_put_contents($private.'/file','private');
  SuhoputBackup\fullPrivate($private,true);SuhoputBackup\fullPrivate($private.'/file');chmod($private.'/file',0644);clearstatcache(true,$private.'/file');denied(fn()=>SuhoputBackup\fullPrivate($private.'/file'));chmod($private.'/file',0600);

@@ -80,6 +80,12 @@ def new_logs(known, available):
     except (KeyError,TypeError) as error:
         raise GuardError('Incomplete log evidence') from error
 
+def retained_logs(logs):
+    """An authenticated suffix keeps original numbers; never renumber to 1."""
+    numbers=checked_logs(logs)
+    require(numbers and numbers==list(range(numbers[0],numbers[-1]+1)), 'Gap in retained suffix')
+    return numbers
+
 def utc(value):
     try:
         stamp=dt.datetime.fromisoformat(value.replace('Z','+00:00'))

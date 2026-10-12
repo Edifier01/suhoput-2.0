@@ -12,7 +12,7 @@ def control_profile(profile):
     return {'control':'suhoput2-stage-restore-tip-047-db-1','volume':'suhoput2-stage-restore-tip-047_db','project':'suhoput2-stage-restore-tip-047','plan':'restore-tip-plan.json','intent':'restore-tip-intent.json','prefix':'restore-tip','receipt':'restored-tip.json'}
 
 def validate_tip_end(stop,logs):
-    guards.new_logs([],logs);guards.require(logs and stop=={'file':logs[-1]['file'],'position':logs[-1]['size']},'Target differs from exact archived chain tip');return stop
+    guards.retained_logs(logs);guards.require(logs and stop=={'file':logs[-1]['file'],'position':logs[-1]['size']},'Target differs from exact archived chain tip');return stop
 
 def validate_tip_plan(plan,generation):
     guards.require(type(plan.get('format')) is int and plan['format']==1 and plan.get('generation')==generation,'Tip generation mismatch')
@@ -94,6 +94,8 @@ class Recovery:
         return f"SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={first};SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={second};SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{op1}';SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{op2}';"
     def selected_logs(self,base,chain):
         guards.require(chain['generation']==self.w.c['generation'],'Chain generation mismatch')
+        from retention_native import retained_chain,verified_tombstones
+        chain=retained_chain(chain,verified_tombstones(self.w))
         if self.profile=='tip':validate_tip_end(self.plan['stop'],chain['logs'])
         return replay_range(base['coordinates'],self.plan['stop'],chain['logs'])
     def snapshot(self,lane,sid,*,existing=False):
@@ -213,7 +215,16 @@ class Recovery:
         else:raise guards.GuardError('Truncated binlog accepted')
         # Positive result remains unchanged by negatives (separate copies only).
         guards.require(self.media(bpath/'uploads')==restored,'Positive restore drift after negatives')
-        receipt={'before_replay_control_records_absent':True,'before_replay_proof':self.before_proof,'before_replay_proof_kind':self.before_proof_kind,'result':'PASS','started_from':'private encrypted S3-B base+binlogs; original source reads=0','source':w.source,'code_sha':w.c['code_sha'],'stage_app_sha':base['stage_app_sha'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'full_id':self.plan['full_id'],'full_manifest_sha256':fmd,'coordinates':base['coordinates'],'stop':self.plan['stop'],'replayed_logs':len(selected),'verified_binlogs':selected,'synthetic_order_after_base':True,'synthetic_operation_after_base':True,'later_order_operation_excluded':self.profile=='point','additional_order_operation_present':self.profile=='tip','profile':self.profile,'media':restored,'negatives':negatives,'control_objects':[self.control,self.volume],'owner_independent_machine':'not_run','timers':'disabled;usage/account tariff prerequisite','completed_at':now()};runtime.atomic_json(w.root/'receipts'/self.receipt_name,receipt);print(json.dumps(receipt));return receipt
+        receipt={'before_replay_control_records_absent':True,'before_replay_proof':self.before_proof,'before_replay_proof_kind':self.before_proof_kind,'result':'PASS','started_from':'private encrypted S3-B base+binlogs; original source reads=0','source':w.source,'code_sha':w.c['code_sha'],'stage_app_sha':base['stage_app_sha'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'full_id':self.plan['full_id'],'full_manifest_sha256':fmd,'coordinates':base['coordinates'],'stop':self.plan['stop'],'replayed_logs':len(selected),'verified_binlogs':selected,'synthetic_order_after_base':True,'synthetic_operation_after_base':True,'later_order_operation_excluded':self.profile=='point','additional_order_operation_present':self.profile=='tip','profile':self.profile,'media':restored,'negatives':negatives,'control_objects':[self.control,self.volume],'owner_independent_machine':'not_run','timers':'disabled;usage/account tariff prerequisite','completed_at':now()}
+        runtime.atomic_json(w.root/'receipts'/self.receipt_name,receipt)
+        if self.before_proof_kind=='native-journals':
+            from retention import native_inventory
+            from retention_native import publish_evidence
+            ids={lane:runtime.load_json(private_path(w.root/'receipts'/('init-'+lane+'.json')))['repository_id'] for lane in ('base','binlog')}
+            inventory=native_inventory(w,dt.datetime.now(dt.timezone.utc),ids)
+            intent=runtime.load_json(private_path(self.intent));started=intent['started_at']
+            receipt=publish_evidence(w,'tip' if self.profile=='tip' else 'anchor',receipt,inventory,started)
+        print(json.dumps(receipt));return receipt
 
 def main():
     import argparse

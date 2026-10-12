@@ -89,7 +89,7 @@ class NativeProgressReceiptTests(unittest.TestCase):
         logs=[];(r.root/'logs').mkdir()
         for index in range(1,4):
             data=b'\xfebin'+bytes(996);name=f'suhoput2-binlog.{index:06d}';(r.root/'logs'/name).write_bytes(data);logs.append({'file':name,'size':1000,'sha256':hashlib.sha256(data).hexdigest()})
-        runtime.atomic_json(r.w.root/'receipts/binlog-chain.json',{'generation':'a'*32,'logs':logs})
+        runtime.atomic_json(r.w.root/'receipts/binlog-chain.json',{'generation':'a'*32,'logs':logs,'snapshots':[{'id':'3'*64,'first_log':1,'last_log':3,'manifest_sha256':'4'*64}]})
         row={'Id':'9'*64,'Config':{'Image':restore.DB_IMAGE,'Labels':{'task047.generation':'a'*32}},'HostConfig':{'NetworkMode':'none'},'NetworkSettings':{'Ports':{}},'Mounts':[{'Source':str(r.root/'socket'),'Destination':'/run/mysqld','Type':'bind'},{'Name':r.volume,'Destination':'/var/lib/mysql'}]}
         class Native:
             def run(self,args,**kwargs):

@@ -31,7 +31,7 @@ def fixture(split=False):
     docs={'audit':{**common,'checked_repositories':inventory['repositories'],'readback_snapshots':{r['id']:r['manifest_sha256'] for r in rows},'verified_binlogs':logs,'check_mode':'read-data','binlog_check_mode':'native-checksum'},
           'history':{**common,'observed_from':'2026-09-01T12:00:00Z','observed_until':plan['planned_at'],'observation_source':'native-confirmed-upload-journal','journal_sha256':'9'*64},
           'budget':{**common,'measurement_from':'2026-10-01T00:00:00Z','measurement_until':'2026-10-12T12:30:00Z','provider_usage_sha256':'9'*64,'account_billing_sha256':'b'*64,'tariff_sha256':'c'*64,'projected_monthly_rub':300,'projected_storage_bytes':1000000,'measured_requests':{'PUT':100,'GET':200,'DELETE':0},'measured_egress_bytes':1024},
-          'owner':{**common,'machine_id':'independent-owner-pc','source_machine_id':'vps-stage','medium_id':'physical-owner-disk','recovery_bundle_sha256':'d'*64,'restore_receipt_sha256':'e'*64,'restore_method':'full-native-database-media','origin':'independent-physical-medium'}}
+          'owner':{**common,'machine_id':'independent-owner-pc','source_machine_id':'vps-stage','medium_id':'physical-owner-disk','recovery_bundle_sha256':'d'*64,'restore_receipt_sha256':'e'*64,'restore_method':'full-native-database-media','origin':'independent-physical-medium','executed_by':'owner','bundle_storage_separate':True,'password_storage_separate':True}}
     for name,sid in [('anchor',ANCHOR),('tip',TIP)]:
         docs[name]={**common,'base_id':sid,'base_manifest_sha256':sid,'full_id':sid,'full_manifest_sha256':sid,'stage_app_sha':'f'*40,'coordinates':manifests[sid]['coordinates'],'stop':{'file':logs[-1]['file'],'position':500},'replayed_logs':1,'verified_binlogs':[logs[-1]],'media':{'inventory':[]},'synthetic_order_after_base':True,'synthetic_operation_after_base':True,'later_order_operation_excluded':True,'started_from':'private encrypted S3-B base+binlogs; original source reads=0'}
     docs['tip'].update(profile='tip',additional_order_operation_present=True,later_order_operation_excluded=False)
@@ -51,6 +51,45 @@ class ApplyTests(unittest.TestCase):
     def rebind(self,name):
         self.evidence[name]['sha256']=digest(self.evidence[name]['document'])
         self.plan['proof_sha256'][name]=self.evidence[name]['sha256']
+    def test_large_expired_backlog_selects_safe_bounded_batch_and_protects_deferred_ids(self):
+        for i in range(256):
+            sid=format(i+16,'064x')
+            self.inventory['snapshots'].append({**self.inventory['snapshots'][0],'id':sid,'token':format(i+16,'032x'),'manifest_sha256':sid})
+            self.inventory['manifests'][sid]=copy.deepcopy(self.inventory['manifests'][OLD])
+        full=retention.inventory_plan(self.inventory,NOW)
+        self.plan=retention.bounded_plan(self.inventory,full);self.plan['planned_at']=NOW.isoformat();self.plan['proof_sha256']={}
+        self.assertEqual(len(full['candidates']),257);self.assertEqual(len(self.plan['candidates']),256)
+        deferred=set(full['candidates'])-set(self.plan['candidates']);self.assertEqual(len(deferred),1)
+        self.assertTrue(deferred<=set(self.plan['keep']))
+        for name,entry in self.evidence.items():
+            entry['document']['inventory_sha256']=full['inventory_sha256']
+            if name=='audit':entry['document']['readback_snapshots']={r['id']:r['manifest_sha256'] for r in self.inventory['snapshots']}
+            self.rebind(name)
+        before=copy.deepcopy(self.inventory);result=self.executor().apply(before,self.plan,self.evidence,NOW)
+        self.assertEqual(result['result'],'APPLIED');self.assertEqual(len(result['forgotten_ids']),256)
+        self.assertTrue(deferred<={r['id'] for r in self.inventory['snapshots']})
+    def test_backlog_batch_keeps_hourly_full_dependencies_and_original_binlog_prefix(self):
+        inv,_,_=fixture(split=True);rows=[];manifests={};old=copy.deepcopy(inv['snapshots'][-1])
+        for i in range(1,261):
+            sid=format(i+4096,'064x');stamp='2026-08-02T12:00:00Z' if i<259 else '2026-10-12T12:00:00Z'
+            rows.append({**old,'id':sid,'token':format(i+4096,'032x'),'manifest_sha256':sid,'time':stamp,'snapshot_time':stamp})
+            manifests[sid]={'source':SOURCE,'first_log':i,'last_log':i,'previous_count':i-1,
+                            'logs':[{'file':'suhoput2-binlog.%06d'%i,'size':500,'sha256':sid}]}
+        inv['snapshots']=[r for r in inv['snapshots'] if r['lane']=='base']+rows
+        inv['manifests']={sid:m for sid,m in inv['manifests'].items() if sid in (OLD,ANCHOR,TIP)}|manifests
+        inv['manifests'][ANCHOR]['coordinates']['file']='suhoput2-binlog.000259'
+        inv['manifests'][TIP]['coordinates']['file']='suhoput2-binlog.000260'
+        full=retention.inventory_plan(inv,NOW);batch=retention.bounded_plan(inv,full)
+        selected=[r for r in rows if r['id'] in batch['candidates']]
+        self.assertEqual([manifests[r['id']]['first_log'] for r in selected],list(range(1,256)))
+        remaining={'generation':GEN,'repositories':inv['repositories'],
+                   'snapshots':[r for r in inv['snapshots'] if r['id'] not in batch['candidates']],
+                   'manifests':{sid:m for sid,m in inv['manifests'].items() if sid not in batch['candidates']}}
+        self.assertEqual(retention.inventory_plan(remaining,NOW)['logs'][0]['file'],'suhoput2-binlog.000256')
+        hourly=format(99999,'064x');inv['snapshots'].append({**inv['snapshots'][0],'kind':'hourly','id':hourly})
+        inv['manifests'][hourly]={**inv['manifests'][OLD],'full_id':OLD}
+        restricted=retention.bounded_plan(inv,retention.inventory_plan(inv,NOW),1)
+        self.assertEqual(restricted['candidates'],[hourly]);self.assertIn(OLD,restricted['keep'])
     def executor(self,reader=None,runner=None,store=None,writer=None):
         self.calls=[]; self.receipts=[]; self.store=store or MemoryIntent()
         def invoke(lane,args):
@@ -105,6 +144,13 @@ class ApplyTests(unittest.TestCase):
             self.setUp(); self.evidence[name]['document'][key]=value; self.rebind(name); ex=self.executor()
             with self.subTest(key=key),self.assertRaises(guards.GuardError): ex.apply(self.inventory,self.plan,self.evidence,NOW)
             self.assertEqual(self.calls,[])
+    def test_same_owner_pc_with_separate_cloud_kit_is_allowed_but_agent_run_is_not(self):
+        self.evidence['owner']['document'].update(machine_id='owner-current-pc',medium_id='owner-google-drive',origin='separately-stored-encrypted-kit')
+        self.rebind('owner');subject().validate_apply(self.inventory,self.plan,self.evidence,NOW)
+        for key,value in [('executed_by','agent'),('bundle_storage_separate',False),('password_storage_separate',False)]:
+            self.evidence['owner']['document'][key]=value;self.rebind('owner')
+            with self.subTest(key=key),self.assertRaises(guards.GuardError):subject().validate_apply(self.inventory,self.plan,self.evidence,NOW)
+            self.evidence['owner']['document'][key]='owner' if key=='executed_by' else True
     def test_append_only_arrival_is_protected_without_invalidating_plan(self):
         before=copy.deepcopy(self.inventory); new={**self.inventory['snapshots'][2],'id':'9'*64,'token':'9'*32}
         self.inventory['snapshots'].append(new); self.inventory['manifests'][new['id']]=copy.deepcopy(self.inventory['manifests'][TIP])

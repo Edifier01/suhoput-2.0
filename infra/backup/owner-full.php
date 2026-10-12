@@ -73,23 +73,25 @@ function fullLogs(mixed $logs): array {
  fullNeed(is_array($logs)&&array_is_list($logs)&&$logs!==[]);$last=0;
  foreach($logs as $row){fullNeed(is_array($row)&&count($row)===3);$number=fullLogNumber($row['file']??null);fullNeed($number>$last&&is_int($row['size']??null)&&$row['size']>=4);fullHex($row['sha256']??null,64);$last=$number;}return $logs;
 }
-/** Derive a complete 1..last closed chain from authenticated manifests. */
+/** Derive an original-numbered contiguous suffix from authenticated manifests. */
 function validateOwnerFullSelection(array $base,array $full,array $chains,array $tip): array {
  fullHex($base['id']??null,64);fullHex($full['id']??null,64);$b=$base['manifest']??[];$f=$full['manifest']??[];
  fullNeed(in_array($b['kind']??null,['full','pre-update','hourly'],true)&&in_array($f['kind']??null,['full','pre-update'],true));
  fullNeed(($b['kind']==='hourly'&&($b['full_id']??null)===$full['id'])||($b['kind']!=='hourly'&&$base['id']===$full['id']),'full-id-binding');
  foreach(['generation','source','stage_app_sha','application_sha256','configuration_sha256'] as $key)fullNeed(isset($b[$key],$f[$key])&&$b[$key]==$f[$key],'full-application-binding');
  fullHex($b['stage_app_sha'],40);fullHex($b['application_sha256'],64);fullHex($b['configuration_sha256'],64);
- $logs=[];$seen=[];$ids=[];fullNeed($chains!==[]&&array_is_list($chains));
+ $logs=[];$seen=[];$ids=[];$offset=null;fullNeed($chains!==[]&&array_is_list($chains));
  foreach($chains as $proof){$id=fullHex($proof['id']??null,64);fullNeed(!isset($ids[$id]));$ids[$id]=true;$m=$proof['manifest']??[];
-  fullNeed(($m['kind']??null)==='binlog'&&($m['previous_count']??null)===count($logs),'chain-prefix');$fresh=fullLogs($m['logs']??null);
+  $fresh=fullLogs($m['logs']??null);if($offset===null)$offset=fullLogNumber($fresh[0]['file'])-1;
+  fullNeed(($m['kind']??null)==='binlog'&&($m['previous_count']??null)===$offset+count($logs),'chain-original-offset');
   fullNeed(($m['first_log']??null)===fullLogNumber($fresh[0]['file'])&&($m['last_log']??null)===fullLogNumber($fresh[count($fresh)-1]['file']));
-  foreach($fresh as $row){fullNeed(fullLogNumber($row['file'])===count($logs)+1&&!isset($seen[$row['file']]),'chain-gap');$seen[$row['file']]=true;$logs[]=$row;}
-  fullNeed(fullLogNumber($m['active_file']??null)===count($logs)+1,'closed-log-boundary');
+  foreach($fresh as $row){fullNeed(fullLogNumber($row['file'])===$offset+count($logs)+1&&!isset($seen[$row['file']]),'chain-gap');$seen[$row['file']]=true;$logs[]=$row;}
+  fullNeed(fullLogNumber($m['active_file']??null)===$offset+count($logs)+1,'closed-log-boundary');
  }
  $last=$logs[count($logs)-1];fullNeed(count($tip)===2&&($tip['file']??null)===$last['file']&&($tip['position']??null)===$last['size'],'closed-chain-tip');
- $coords=$b['coordinates']??[];$start=fullLogNumber($coords['file']??null);fullNeed(count($coords)===2&&is_int($coords['position']??null)&&$coords['position']>=4&&$start<=count($logs)&&$coords['position']<=$logs[$start-1]['size'],'base-coordinate-range');
- return array_slice($logs,$start-1);
+ $coords=$b['coordinates']??[];$start=fullLogNumber($coords['file']??null);$index=$start-$offset-1;
+ fullNeed(count($coords)===2&&is_int($coords['position']??null)&&$coords['position']>=4&&$index>=0&&$index<count($logs)&&$coords['position']<=$logs[$index]['size'],'base-coordinate-range');
+ return array_slice($logs,$index);
 }
 function fullIdentityDigest(array $rows): string {
  usort($rows,static fn(array $a,array $b):int=>strcmp($a['path'],$b['path']));$ordered=[];

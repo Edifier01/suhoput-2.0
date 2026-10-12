@@ -91,6 +91,28 @@ class UploadJournal:
         guards.require(value.get('generation')==self.generation and isinstance(value.get('confirmed'),list),'Journal generation mismatch')
         return value
 
+    def retire(self,intent,receipt,lane):
+        """Append bound absences; the native caller holds this lane's lock.
+
+        Confirmed rows and original binlog coordinates remain immutable. The
+        caller must load the intent/receipt from the protected native store.
+        """
+        import retention_apply
+        guards.require(lane in ('base','binlog') and intent['generation']==self.generation,'Retirement scope mismatch')
+        rows=[r for r in retention_apply.retention_tombstones(intent,receipt) if r['lane']==lane]
+        state=self.state();confirmed={r['id']:r for r in state['confirmed']}
+        retired=state.setdefault('retention',[]);indexed={r['id']:r for r in retired}
+        guards.require(len(indexed)==len(retired),'Duplicate retired identity')
+        for row in rows:
+            known=confirmed.get(row['id'])
+            guards.require(known and all(known[k]==row[k] for k in ('id','token','manifest_sha256')),'Unknown retired confirmation')
+            if row['id'] in indexed:
+                guards.require(all(indexed[row['id']][k]==row[k] for k in ('id','lane','token','manifest_sha256','generation','intent_sha256','pre_inventory_sha256')),'Retirement identity drift')
+            else:retired.append(row);indexed[row['id']]=row
+        self.writer(self.root/'state.json',state)
+        guards.require(self.state()==state,'Retirement durable readback differs')
+        return rows
+
     def upload(self,payload,manifest_sha256,backend):
         with lane_lock(self.root/'lane.lock'):
             state=self.state()

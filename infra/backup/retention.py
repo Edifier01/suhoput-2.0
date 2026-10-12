@@ -54,12 +54,20 @@ def native_inventory(worker,at,repository_ids):
             manifests[sid]=manifest
     return {'generation':w.c['generation'],'repositories':dict(repository_ids),'snapshots':entries,'manifests':manifests}
 
-def confirmed_inventory(inventory,journals):
+def confirmed_inventory(inventory,journals,tombstones=()):
+    retired={}
+    for row in tombstones:
+        sid=guards.hex_id(row['id'],64)
+        guards.require(sid not in retired and row['generation']==inventory['generation'] and row['lane'] in ('base','binlog'),'Duplicate or foreign tombstone')
+        for key in ('manifest_sha256','intent_sha256','receipt_sha256','pre_inventory_sha256','post_inventory_sha256'):guards.hex_id(row[key],64)
+        guards.hex_id(row['token'],32);guards.utc(row['forgotten_at']);retired[sid]=row
     for lane in ('base','binlog'):
         rows=[x for x in inventory['snapshots'] if x['lane']==lane];confirmed=journals[lane]['confirmed']
         expected={x['id']:(x['token'],x['manifest_sha256']) for x in confirmed}
         actual={x['id']:(x['token'],x['manifest_sha256']) for x in rows}
-        guards.require(len(expected)==len(confirmed) and expected==actual,'Unknown or missing acknowledged snapshot; preserve/investigate')
+        removed={sid:(row['token'],row['manifest_sha256']) for sid,row in retired.items() if row['lane']==lane}
+        guards.require(not set(removed)&set(actual) and all(expected.get(sid)==value for sid,value in removed.items()),'Tombstone not bound to exact absent confirmation')
+        guards.require(len(expected)==len(confirmed) and {sid:value for sid,value in expected.items() if sid not in removed}==actual,'Unknown or missing acknowledged snapshot; preserve/investigate')
     return True
 
 def inventory_plan(inventory,at):
@@ -68,13 +76,15 @@ def inventory_plan(inventory,at):
     guards.require(batches,'No authenticated binlog chain')
     for row in batches:
         manifest=manifests[row['id']];batch=manifest['logs'];guards.checked_logs(batch)
-        guards.require(batch and manifest['previous_count']==len(logs) and manifest['first_log']==guards.log_number(batch[0]['file']) and manifest['last_log']==guards.log_number(batch[-1]['file']),'Binlog manifest range/previous count mismatch')
+        first=guards.log_number(batch[0]['file']) if batch else None
+        guards.require(batch and type(manifest['previous_count']) is int and manifest['previous_count']==first-1 and manifest['first_log']==first and manifest['last_log']==guards.log_number(batch[-1]['file']) and (not logs or first==guards.log_number(logs[-1]['file'])+1),'Binlog manifest range/previous count mismatch')
         logs.extend(batch);records.append({**row,'first_log':manifest['first_log'],'last_log':manifest['last_log']})
-    guards.new_logs([],logs)  # No native pruning exists: complete original prefix required.
+    guards.retained_logs(logs)
     indexed={x['id']:x for x in entries};guards.require(len(indexed)==len(entries),'Duplicate inventory identity')
     for row in entries:
         if row['kind']=='binlog':continue
-        manifest=manifests[row['id']];start=manifest['coordinates'];replay_range(start,start,logs)
+        manifest=manifests[row['id']];start=manifest['coordinates']
+        guards.require(type(start['position']) is int and start['position']>=4,'Invalid base coordinates')
         for key in ('application_sha256','configuration_sha256'):guards.hex_id(manifest[key],64)
         record={**row,'first_log':guards.log_number(start['file'])}
         if row['kind']=='hourly':
@@ -85,7 +95,43 @@ def inventory_plan(inventory,at):
             record['full_id']=full_id
         records.append(record)
     plan=guards.retention_candidates(records,inventory['generation'],at)
+    first=guards.log_number(logs[0]['file']);cutoff=at-dt.timedelta(days=30)
+    dependencies={manifests[r['id']]['full_id'] for r in entries if r['kind']=='hourly' and r['id'] in plan['keep']}
+    for row in entries:
+        if row['kind']=='binlog':continue
+        start=manifests[row['id']]['coordinates']
+        if guards.log_number(start['file'])<first:
+            guards.require((row['id'] in dependencies or row['id'] in plan['candidates']) and row['kind'] in ('full','pre-update') and guards.utc(row['time'])<cutoff and row['id']!=plan['anchor_id'],'Unavailable recovery base below retained suffix')
+        else:replay_range(start,start,logs)
     return {**plan,'logs':logs,'inventory_sha256':inventory_digest(inventory),'chain_last_file':logs[-1]['file'],'chain_last_position':logs[-1]['size']}
+
+def bounded_plan(inventory,plan,limit=256):
+    """One deterministic safe batch, retaining every deferred expired ID.
+
+    Expired bases go first: deferred hourly snapshots keep their full; binlog
+    deletion begins only after all deletable bases fit in this batch. The
+    remaining binlogs are always an original-numbered prefix, never random IDs.
+    A later batch needs a fresh inventory and all current proof gates again.
+    """
+    guards.require(type(limit) is int and 0<limit<=256,'Invalid native batch bound')
+    if len(plan['candidates'])<=limit:return dict(plan)
+    indexed={row['id']:row for row in inventory['snapshots']};manifests=inventory['manifests']
+    eligible=set(plan['candidates']);chosen=[]
+    bases=sorted((indexed[sid] for sid in eligible if indexed[sid]['lane']=='base'),
+                 key=lambda row:(row['kind']!='hourly',guards.utc(row['time']),row['id']))
+    for row in bases:
+        if len(chosen)==limit:break
+        if row['kind'] in ('full','pre-update') and any(r['kind']=='hourly' and
+                manifests[r['id']]['full_id']==row['id'] and r['id'] not in chosen
+                for r in inventory['snapshots']):continue
+        chosen.append(row['id'])
+    if all(row['id'] in chosen for row in bases):
+        logs=sorted((indexed[sid] for sid in eligible if indexed[sid]['lane']=='binlog'),
+                    key=lambda row:manifests[row['id']]['first_log'])
+        chosen.extend(row['id'] for row in logs[:limit-len(chosen)])
+    guards.require(chosen,'No safe bounded retention progress')
+    return {**plan,'eligible_candidates':sorted(eligible),'candidates':sorted(chosen),
+            'keep':sorted(set(plan['keep'])|(eligible-set(chosen)))}
 
 def bind_recovery(inventory,plan,proof):
     try:
@@ -109,7 +155,7 @@ class Inspector:
     def __init__(self,config):
         self.config=config;self.w=Worker(config);self.root=self.w.root/'spool'/('retention-audit-'+uuid.uuid4().hex)
     def run(self):
-        w=self.w;w.gate()
+        w=self.w;w.gate();started=now()
         with runtime.lane_lock(w.root/'receipts/retention-audit.lock'):
             self.root.mkdir(mode=0o700);(self.root/'logs').mkdir(mode=0o700)
             runtime.atomic_json(self.root/'intent.json',{'generation':w.c['generation'],'code_sha':w.c['code_sha'],'started_at':now(),'remote_delete':False})
@@ -119,7 +165,8 @@ class Inspector:
             for lane in ('base','binlog'):
                 guards.require(not (w.root/'receipts'/lane/'pending.json').exists(),'Unknown pending upload; retention audit stopped')
                 journals[lane]=runtime.UploadJournal(w.root/'receipts'/lane,w.c['generation']).state()
-            confirmed_inventory(before,journals);plan=inventory_plan(before,dt.datetime.now(dt.timezone.utc))
+            from retention_native import verified_tombstones
+            confirmed_inventory(before,journals,verified_tombstones(w));plan=inventory_plan(before,dt.datetime.now(dt.timezone.utc))
             for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
             for row in before['snapshots']:
                 lane=row['lane'];sid=row['id'];scope=str(w.root/'spool'/(lane+'-payload'))
@@ -146,7 +193,14 @@ class Inspector:
             if not plan['pre_window_anchor_present']:blockers.append('real_30_day_history_not_present')
             if proof['stop']!={'file':plan['chain_last_file'],'position':plan['chain_last_position']}:blockers.append('verified_restore_stop_precedes_archived_chain_tip')
             receipt={'result':'PASS','operation':'read-only native retention inventory/anchor audit','generation':w.c['generation'],'code_sha':w.c['code_sha'],'repositories':repository_ids,'inventory_sha256':plan['inventory_sha256'],'snapshots':before['snapshots'],'verified_snapshots':len(before['snapshots']),'verified_binlogs':len(plan['logs']),'chain_last_file':plan['chain_last_file'],'anchor_recovery':binding,'keep':plan['keep'],'candidates':plan['candidates'],'pre_window_anchor_present':plan['pre_window_anchor_present'],'history_coverage_verified':False,'apply_allowed':False,'remote_delete_calls':0,'timers_enabled':False,'account_api_requests':'not_measured;native restic calls are not provider counters','blockers':blockers,'completed_at':now()}
-            runtime.atomic_json(self.root/'receipt.json',receipt);runtime.atomic_json(w.root/'receipts/retention-audit.json',receipt);return receipt
+            receipt.update(evidence_type='audit',source=w.source,started_at=started,
+                           checked_repositories=repository_ids,check_mode='read-data',binlog_check_mode='native-checksum',
+                           readback_snapshots={r['id']:r['manifest_sha256'] for r in before['snapshots']},
+                           verified_binlog_count=len(plan['logs']),verified_binlogs=plan['logs'])
+            runtime.atomic_json(self.root/'receipt.json',receipt)
+            from retention_native import publish_evidence
+            publish_evidence(w,'audit',receipt,before,started)
+            return receipt
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',required=True);args=parser.parse_args()

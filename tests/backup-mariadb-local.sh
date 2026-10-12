@@ -92,6 +92,15 @@ INSERT INTO orders VALUES (2,'after-base');
 INSERT INTO operations VALUES (2,2,'after-base');
 COMMIT;
 FLUSH BINARY LOGS;
+SQL
+# A real later base starts in log2. This becomes the retained pre-window anchor
+# in the isolated prefix-forget scenario below; no fake dates/history are used.
+mariadb-dump --no-defaults --socket=/control/source.sock -uroot --single-transaction \
+    --master-data=2 --databases suhoput2_stage > /control/anchor.sql
+read -r anchor_file anchor_pos < <(sed -n "s/.*MASTER_LOG_FILE='\([^']*\)', MASTER_LOG_POS=\([0-9]*\).*/\1 \2/p" /control/anchor.sql)
+[ "$anchor_file" = binlog.000002 ]
+sql source <<'SQL'
+USE suhoput2_stage;
 START TRANSACTION;
 UPDATE orders SET state='target' WHERE id=2;
 UPDATE operations SET state='target' WHERE id=2;
@@ -155,6 +164,39 @@ sql restore < /control/replay.sql
 [ "$(printf 'SELECT id,order_id,state FROM suhoput2_stage.operations ORDER BY id;\n' | sql restore)" = $'1\t1\tbase\n2\t2\ttarget' ]
 [ "$(printf 'SELECT COUNT(*) FROM suhoput2_stage.orders WHERE id=99;\n' | sql restore)" = 0 ]
 printf '%s\n' 'PASS base import and ROW replay across two closed logs to committed target; later transaction excluded'
+# Snapshot A has the original prefix; B independently has anchor DB + log2.
+# Forget only A, then restore B and replay suffix into the isolated target.
+old_snapshot=$(/control/restic snapshots --json | sed -n 's/.*"id":"\([a-f0-9]\{64\}\)".*/\1/p')
+[[ "$old_snapshot" =~ ^[a-f0-9]{64}$ ]]
+mkdir -p /control/retained/binlogs
+cp /control/anchor.sql /control/retained/base.sql
+cp "$restored/binlogs/$target_file" /control/retained/binlogs/
+cp -a "$restored/uploads" /control/retained/uploads
+printf '%s %s\n%s %s\n' "$anchor_file" "$anchor_pos" "$target_file" "$target_pos" > /control/retained/coordinates
+(cd /control/retained; find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+/control/restic backup /control/retained --tag synthetic-retained-suffix > /control/suffix-backup.log 2>&1
+new_snapshot=$(/control/restic snapshots --tag synthetic-retained-suffix --json | sed -n 's/.*"id":"\([a-f0-9]\{64\}\)".*/\1/p')
+[[ "$new_snapshot" =~ ^[a-f0-9]{64}$ ]] && [ "$new_snapshot" != "$old_snapshot" ]
+/control/restic forget "$old_snapshot" > /control/forget.log 2>&1
+[ "$(/control/restic snapshots --json | grep -o '"id":' | wc -l)" = 1 ]
+/control/restic check --read-data > /control/post-forget-check.log 2>&1
+/control/restic restore "$new_snapshot" --target /control/suffix-restored --verify > /control/suffix-restore.log 2>&1
+suffix=/control/suffix-restored/control/retained
+(cd "$suffix"; sha256sum -c SHA256SUMS)
+[ ! -e "$suffix/binlogs/binlog.000001" ]
+mariadb-binlog --no-defaults --verify-binlog-checksum "$suffix/binlogs/binlog.000002" > /control/suffix-crc.sql
+grep -q 'BINLOG' /control/suffix-crc.sql
+# This target is synthetic tmpfs only; prior restored archive stays preserved.
+printf 'DROP DATABASE suhoput2_stage;\n' | sql restore
+sql restore < "$suffix/base.sql"
+[ "$(printf 'SELECT state FROM suhoput2_stage.orders WHERE id=2;\n' | sql restore)" = after-base ]
+mariadb-binlog --no-defaults --verify-binlog-checksum --start-position="$anchor_pos" --stop-position="$target_pos" \
+    "$suffix/binlogs/binlog.000002" > /control/suffix-replay.sql
+sql restore < /control/suffix-replay.sql
+[ "$(printf 'SELECT state FROM suhoput2_stage.orders WHERE id=2;\n' | sql restore)" = target ]
+[ "$(printf 'SELECT state FROM suhoput2_stage.operations WHERE id=2;\n' | sql restore)" = target ]
+[ "$(printf 'SELECT COUNT(*) FROM suhoput2_stage.orders WHERE id=99;\n' | sql restore)" = 0 ]
+printf '%s\n' 'PASS exact native prefix forget, remaining read-data, independent anchor DB/CRC/ROW suffix replay to committed target'
 # Enumerate ALL references in the restored synthetic DB, including thumbnail.
 printf 'SELECT path,bytes,sha256 FROM suhoput2_stage.media_refs ORDER BY path;\n' | sql restore > /control/references.tsv
 [ "$(wc -l < /control/references.tsv)" = 2 ]
