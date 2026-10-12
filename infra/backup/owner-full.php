@@ -160,7 +160,7 @@ function prepareOwnerFull(array $input): array {
  $logs=validateOwnerFullSelection($base,$full,$chains,$input['closedchain_tip']);$archived=[];
  foreach($chains as $proof)foreach($proof['manifest']['logs'] as $row){$file=$proof['path'].'/logs/'.$row['file'];$head=file_get_contents($file,false,null,0,4);fullNeed(filesize($file)===$row['size']&&hash_file('sha256',$file)===$row['sha256']&&$head==="\xfebin",'binlog-file-sha');$archived[$row['file']]=$file;}
  foreach($logs as $row){$dest=$work.'/logs/'.$row['file'];fullNeed(isset($archived[$row['file']])&&copy($archived[$row['file']],$dest));chmod($dest,0600);fullPrivate($dest);}
- $media=fullJson(file_get_contents($base['path'].'/media.json'));fullNeed(isset($media['inventory'])&&is_array($media['inventory']));verifyMedia($base['path'].'/uploads',$media['inventory']);
+ $media=fullJson(file_get_contents($base['path'].'/media.json'));fullNeed(isset($media['inventory'])&&is_array($media['inventory']));verifyMedia($base['path'].'/uploads',normalizeOwnerMediaRows($media['inventory']));
  $artifacts=['db.sql'=>$base['path'].'/db.sql','media.json'=>$base['path'].'/media.json'];$hashes=[];foreach($artifacts as $name=>$path){fullPrivate($path);$hashes[$name]=hash_file('sha256',$path);}
  $result=['format'=>1,'generation'=>$generation,'token'=>$token,'source'=>$source,'stage_app_sha'=>$app,'base_id'=>$baseId,'full_id'=>$fullId,
  'base_manifest_sha256'=>$base['manifest_sha256'],'full_manifest_sha256'=>$full['manifest_sha256'],'application_sha256'=>$identity['application_sha256'],'configuration_sha256'=>$identity['configuration_sha256'],
@@ -169,8 +169,24 @@ function prepareOwnerFull(array $input): array {
  'full_files'=>count($full['manifest']['files']),'base_files'=>count($base['manifest']['files']),'archive_reads'=>'authenticated-restic-check-restore-sha','sql_import'=>'not_run','source_reads'=>0,'s3_writes'=>0];
  file_put_contents($work.'/prepared.json',json_encode($result,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR));fullPrivate($work.'/prepared.json');return $result;
 }
+/** Authenticated Python JSON sorts object keys. Reconstruct the native PHP
+ * media shape only after strict field/type/path validation; no unknown fields,
+ * duplicate references or changed byte/hash values disappear in normalization. */
+function normalizeOwnerMediaRows(array $inventory): array {
+ fullNeed(array_is_list($inventory),'media-list');$rows=[];$seen=[];
+ foreach($inventory as $row){fullNeed(is_array($row),'media-row');$keys=array_keys($row);sort($keys,SORT_STRING);
+  $path=$row['path']??null;fullNeed(is_string($path)&&!isset($seen[$path]),'media-path-duplicate');$seen[$path]=true;
+  if(array_key_exists('kind',$row)){
+   fullNeed($keys===['kind','path']&&$row['kind']==='directory'&&str_ends_with($path,'/'),'media-directory-fields');fullRelative(substr($path,0,-1));
+   $rows[]=['path'=>$path,'kind'=>'directory'];
+  }else{
+   fullNeed($keys===['bytes','path','sha256']&&is_int($row['bytes'])&&$row['bytes']>=0,'media-file-fields');fullRelative($path);fullHex($row['sha256'],64);
+   $rows[]=['path'=>$path,'bytes'=>$row['bytes'],'sha256'=>$row['sha256']];
+  }
+ }usort($rows,static fn(array $a,array $b):int=>strcmp($a['path'],$b['path']));return $rows;
+}
 function verifyOwnerFullMedia(callable $query,string $uploads,array $expected): array {
- $result=databaseMedia($query,'suhoput2_stage','wp_',$uploads);fullNeed($result['inventory']===$expected,'complete-db-media-mismatch');return $result;
+ $normalized=normalizeOwnerMediaRows($expected);$result=databaseMedia($query,'suhoput2_stage','wp_',$uploads);fullNeed(normalizeOwnerMediaRows($result['inventory'])===$normalized,'complete-db-media-mismatch');return $result;
 }
 /** Socket-only read-only DB/media proof after the external guarded import/replay.
  * The imported original schema is intentionally retained: ROW events bind it. */

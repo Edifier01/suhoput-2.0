@@ -99,6 +99,25 @@ $query=static function(string $sql)use($tables,$columns):array{
 };
 $inventory=[];foreach(['a.jpg','custom.pdf','thumb.jpg'] as $name)$inventory[]=['path'=>$name,'bytes'=>strlen('synthetic '.$name),'sha256'=>hash('sha256','synthetic '.$name)];
 $verified=SuhoputBackup\verifyOwnerFullMedia($query,$root.'/uploads',$inventory);must($verified['coverage']['tables']===4);
+mkdir($root.'/uploads/woocommerce_uploads',0700);
+$directoryQuery=static function(string $sql)use($query):array {
+ if(str_contains($sql,'AS `value`')&&str_contains($sql,'`wp_custom`'))return [['value'=>'wp-content/uploads/custom.pdf wp-content/uploads/woocommerce_uploads/']];
+ return $query($sql);
+};
+// Literal Python json.dumps(...,sort_keys=True) object field order, including
+// directories. Row order remains the independently established reference list.
+$pythonRows=[];foreach($inventory as $row)$pythonRows[]=['bytes'=>$row['bytes'],'path'=>$row['path'],'sha256'=>$row['sha256']];
+$pythonRows[]=['kind'=>'directory','path'=>'woocommerce_uploads/'];
+$pythonRows=json_decode(json_encode($pythonRows,JSON_THROW_ON_ERROR),true,32,JSON_THROW_ON_ERROR);
+$directoryResult=SuhoputBackup\verifyOwnerFullMedia($directoryQuery,$root.'/uploads',$pythonRows);
+must($directoryResult['coverage']['references']===4&&$directoryResult['inventory'][3]===['path'=>'woocommerce_uploads/','kind'=>'directory']);
+$normalized=SuhoputBackup\normalizeOwnerMediaRows($pythonRows);SuhoputBackup\verifyMedia($root.'/uploads',$normalized);
+$extra=$pythonRows;$extra[0]['extra']='unknown';denied(fn()=>SuhoputBackup\normalizeOwnerMediaRows($extra));
+$missing=$pythonRows;unset($missing[0]['bytes']);denied(fn()=>SuhoputBackup\normalizeOwnerMediaRows($missing));
+$duplicate=$pythonRows;$duplicate[]=$duplicate[0];denied(fn()=>SuhoputBackup\normalizeOwnerMediaRows($duplicate));
+$wrongType=$pythonRows;$wrongType[0]['bytes']=(string)$wrongType[0]['bytes'];denied(fn()=>SuhoputBackup\normalizeOwnerMediaRows($wrongType));
+$wrongHash=$pythonRows;$wrongHash[0]['sha256']=str_repeat('0',64);denied(fn()=>SuhoputBackup\verifyMedia($root.'/uploads',SuhoputBackup\normalizeOwnerMediaRows($wrongHash)));
+echo "PASS authenticated Python-sorted media objects normalized; extra/missing/duplicate/type/hash negatives rejected\n";
 $partial=$inventory;array_pop($partial);denied(fn()=>SuhoputBackup\verifyOwnerFullMedia($query,$root.'/uploads',$partial));
 unlink($root.'/uploads/custom.pdf');denied(fn()=>SuhoputBackup\verifyOwnerFullMedia($query,$root.'/uploads',$inventory));
 echo "PASS complete DB attachment/thumb/custom-column media proof and missing/partial rejection\n";
