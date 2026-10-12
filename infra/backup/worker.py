@@ -332,7 +332,10 @@ class Worker:
             fresh=guards.new_logs(known,available);guards.require(fresh,'No new closed binlog');payload=self.prepare_payload('binlog');(payload/'logs').mkdir(mode=0o700)
             for item in fresh:
                 path=payload/'logs'/item['file'];shutil.copyfile(self.db_volume/item['file'],path);os.chmod(path,0o600);guards.require(path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Binlog copy changed')
-                self.native.run(['docker','exec',self.source['db_container'],'mariadb-binlog','--verify-binlog-checksum','/var/lib/mysql/'+item['file']],timeout=20)
+                self.native.run(['docker','run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--cpus','0.5','--memory','384m','--pids-limit','128','--mount','type=bind,source='+str(payload/'logs')+',target=/logs,readonly','--entrypoint','mariadb-binlog',DB_IMAGE,'--no-defaults','--verify-binlog-checksum','/logs/'+item['file']],timeout=20)
+                guards.require(not path.is_symlink() and path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Captured binlog changed during checksum')
+                origin=self.db_volume/item['file'];metadata=origin.stat()
+                guards.require(not origin.is_symlink() and metadata.st_size==item['size'] and [metadata.st_ino,metadata.st_mtime_ns,metadata.st_ctime_ns]==source_stats[item['file']] and sha(origin)==item['sha256'],'Closed source changed during captured checksum')
             manifest={'format':1,'generation':self.c['generation'],'code_sha':self.c['code_sha'],'source':self.source,'kind':'binlog','captured_at':stamp,'logs':fresh,'source_stats':{x['file']:source_stats[x['file']] for x in fresh},'previous_count':len(known),'first_log':guards.log_number(fresh[0]['file']),'last_log':guards.log_number(fresh[-1]['file']),'active_file':active,'files':tree_inventory(payload)}
             runtime.atomic_json(payload/'manifest.json',manifest);sid=self.upload('binlog',payload);self.finalize('binlog',payload,sid);lag=binlog_watermark(stamp)
             return {'snapshot_id':sid,'closed_files':len(fresh),'lag_seconds':lag,'result':'PASS'}

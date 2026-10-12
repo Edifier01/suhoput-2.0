@@ -98,7 +98,7 @@ class Recovery:
         self.password=secrets.token_hex(32)
         with open(self.root/'control.password','x') as stream:stream.write(self.password+'\n');stream.flush();os.fsync(stream.fileno())
         (self.root/'socket').mkdir(mode=0o700);objects_absent(w.native);w.native.run(['docker','volume','create','--label','task047.generation='+w.c['generation'],'--label','task047.restore-token='+self.plan['token'],VOLUME])
-        volume=json.loads(w.native.run(['docker','volume','inspect',VOLUME]))[0];guards.require(any(m.get('Source')==str(self.root/'socket') and m.get('Destination')=='/run/mysqld' and m.get('Type')=='bind' for m in row['Mounts']),'Existing control socket binding mismatch')
+        volume=json.loads(w.native.run(['docker','volume','inspect',VOLUME]))[0]
         guards.require(volume['Name']==VOLUME and volume['Labels'].get('task047.generation')==w.c['generation'] and volume['Labels'].get('task047.restore-token')==self.plan['token'],'Unknown control volume identity')
         w.native.run(['docker','run','-d','--name',CONTROL,'--label','com.docker.compose.project='+PROJECT,'--label','com.docker.compose.service=db','--label','task047.generation='+w.c['generation'],'--network','none','--memory','1g','--cpus','0.5','--pids-limit','256','--cap-drop','NET_RAW','--security-opt','no-new-privileges','--env','MARIADB_ROOT_PASSWORD','--mount','type=volume,source='+VOLUME+',target=/var/lib/mysql','--mount','type=bind,source='+str(self.root/'socket')+',target=/run/mysqld',DB_IMAGE,'--skip-networking','--event-scheduler=OFF'],environment={'MARIADB_ROOT_PASSWORD':self.password})
         for attempt in range(100):
@@ -107,7 +107,7 @@ class Recovery:
             except NativeError:pass
             time.sleep(0.2)
         else:raise guards.GuardError('Control DB did not start; retained')
-        row=json.loads(w.native.run(['docker','inspect',CONTROL]))[0];guards.require(row['Config']['Image']==DB_IMAGE and row['HostConfig']['NetworkMode']=='none' and all(not x for x in row['NetworkSettings']['Ports'].values()),'Control DB isolation mismatch');guards.require(any(m.get('Name')==VOLUME and m['Destination']=='/var/lib/mysql' for m in row['Mounts']),'Control volume mismatch')
+        row=json.loads(w.native.run(['docker','inspect',CONTROL]))[0];guards.require(any(m.get('Source')==str(self.root/'socket') and m.get('Destination')=='/run/mysqld' and m.get('Type')=='bind' for m in row['Mounts']),'Existing control socket binding mismatch');guards.require(row['Config']['Image']==DB_IMAGE and row['HostConfig']['NetworkMode']=='none' and all(not x for x in row['NetworkSettings']['Ports'].values()),'Control DB isolation mismatch');guards.require(any(m.get('Name')==VOLUME and m['Destination']=='/var/lib/mysql' for m in row['Mounts']),'Control volume mismatch')
         guards.require(w.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;',container=CONTROL).strip()==b'OFF\t1\t0','Unsafe control DB runtime')
         guards.require(w.sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='suhoput2_stage';",container=CONTROL).strip()==b'0','Control schema not empty')
         w.native.run(['docker','exec','-i',CONTROL,'sh','-c','MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot'],data=(bpath/'db.sql').read_bytes())

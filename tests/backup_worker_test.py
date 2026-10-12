@@ -120,6 +120,48 @@ class SnapshotCoherenceTests(unittest.TestCase):
             w.dump=timed_dump
             with patch('worker.now',side_effect=['2026-10-12T10:00:00Z','2026-10-12T10:00:20Z','2026-10-12T10:00:30Z','2026-10-12T10:00:40Z']):
                 r=w.base('full');self.assertEqual(r['captured_at'],'2026-10-12T10:00:00Z')
+class CapturedBinlogTests(unittest.TestCase):
+    def test_invalid_capture_cannot_pass_using_changed_valid_source(self):
+        from types import SimpleNamespace
+        m=module('worker')
+        with tempfile.TemporaryDirectory() as d:
+            w=SnapshotCoherenceTests().fake(d);w.db_volume=w.stage/'db';w.db_volume.mkdir()
+            name='suhoput2-binlog.000001';source=w.db_volume/name;source.write_bytes(b'invalid capture')
+            def sql(query):
+                if query.startswith('SHOW VARIABLES'):return b'binlog_format\tROW\ninnodb_flush_log_at_trx_commit\t1\nlog_bin\tON\nsync_binlog\t1\n'
+                if query.startswith('SHOW MASTER'):return b'suhoput2-binlog.000002\t512'
+                if query.startswith('SHOW BINARY'):return (name+'\t15\nsuhoput2-binlog.000002\t512\n').encode()
+                return b''
+            w.sql=sql;puts=[];real=w.upload
+            def upload(*args):puts.append(args);return real(*args)
+            w.upload=upload
+            def decode(args,**kwargs):
+                source.write_bytes(b'valid source!!!')
+                # A decoder receiving the captured bytes must reject the corrupt
+                # version, even though a concurrent source version is valid.
+                if args[-1].startswith('/logs/'):
+                    self.assertEqual((w.root/'spool/binlog-payload/logs'/name).read_bytes(),b'invalid capture')
+                    raise m.NativeError('invalid captured checksum','synthetic')
+                return b''
+            w.native=SimpleNamespace(run=decode)
+            with self.assertRaises(m.NativeError):w.binlog()
+            self.assertEqual(puts,[])
+    def test_source_change_during_captured_checksum_stops_before_upload(self):
+        from types import SimpleNamespace
+        m=module('worker')
+        with tempfile.TemporaryDirectory() as d:
+            w=SnapshotCoherenceTests().fake(d);w.db_volume=w.stage/'db';w.db_volume.mkdir()
+            name='suhoput2-binlog.000001';source=w.db_volume/name;source.write_bytes(b'valid capture!!')
+            def sql(query):
+                if query.startswith('SHOW VARIABLES'):return b'binlog_format\tROW\ninnodb_flush_log_at_trx_commit\t1\nlog_bin\tON\nsync_binlog\t1\n'
+                if query.startswith('SHOW MASTER'):return b'suhoput2-binlog.000002\t512'
+                if query.startswith('SHOW BINARY'):return (name+'\t15\nsuhoput2-binlog.000002\t512\n').encode()
+                return b''
+            w.sql=sql;puts=[];w.upload=lambda *args:puts.append(args) or 'a'*64
+            def decode(args,**kwargs):source.write_bytes(b'changed source!');return b''
+            w.native=SimpleNamespace(run=decode)
+            with self.assertRaises(guards.GuardError):w.binlog()
+            self.assertEqual(puts,[])
 class FinalizationCrashTests(unittest.TestCase):
     def prepared(self,d,lane,kind):
         m=module('worker',('finalize',));w=SnapshotCoherenceTests().fake(d);p=w.root/'spool'/(lane+'-payload');p.mkdir();(p/'data').write_bytes(b'actual capture');manifest={'generation':GEN,'captured_at':'2026-10-12T10:00:00Z','kind':kind,'previous_count':0,'first_log':1,'last_log':1,'coordinates':{'file':'suhoput2-binlog.000001','position':512},'files':m.tree_inventory(p)}
