@@ -375,7 +375,7 @@ or prune savings. No manual test count is used as a scheduled monthly cadence.
              'egress_gib': number_text(Decimal(sum(samples[job]['egress_bytes'] * counts[job] for job in JOBS)) / GIB)}
     for operation in ('put', 'get', 'delete'):
         usage[operation + '_requests'] = sum(samples[job]['provider_http'][operation] * counts[job] for job in JOBS)
-    cost = local_decimal(usage['storage_gib']) * measured_rates['storage_rub_gib_month']
+    cost = local_decimal(usage['storage_gib']) * measured_rates['storage_rub_gib_month'] * (projection_days*24) / 730
     cost += local_decimal(usage['egress_gib']) * measured_rates['egress_rub_gib']
     cost += sum(Decimal(usage[operation + '_requests']) * measured_rates[operation + '_rub_1000'] / 1000
                 for operation in ('put', 'get', 'delete'))

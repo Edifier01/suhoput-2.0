@@ -314,7 +314,6 @@ class Executor:
             after = self.read_inventory()
             comparison = compatible_inventory(intent['before_inventory'], after, at, intent['candidate_ids'])
             protected_dependencies(after, intent['candidate_ids'], at)
-            retention.inventory_plan(after,at)
             absent = sorted(set(intent['candidate_ids']) - {row['id'] for row in after['snapshots']})
             return {'forgotten_ids': absent,
                     'present_candidate_ids': sorted(set(intent['candidate_ids']) - set(absent)),
@@ -396,10 +395,16 @@ class Executor:
                 at = self._now(at)
                 guards.require((at - guards.utc(plan['planned_at'])).total_seconds() <= MAX_PLAN_AGE_SECONDS,
                                'Plan expired before lane command')
-                current = self.read_inventory()
-                at = self._now(at)
-                compatible_inventory(before, current, at, removed)
-                protected_dependencies(current, intent['candidate_ids'], at)
+                # The fresh entry observation under protected upload/job
+                # locks already authorized the intent and first lane. Each
+                # later fresh observation both confirms the prior exact
+                # effect and authorizes the next lane; no duplicate full scan.
+                if self.effect_section is not None and calls==0:current=before
+                else:
+                    current = self.read_inventory();at = self._now(at)
+                    comparison=compatible_inventory(before, current, at, removed)
+                    guards.require(comparison['absent_ids']==sorted(removed),'Partial or unexpected prior forget effect')
+                    protected_dependencies(current, intent['candidate_ids'], at)
                 # A slow read (or dependency check) must never turn a fresh
                 # pre-read proof into permission for a later expired effect.
                 at = self._now(at)
@@ -411,9 +416,10 @@ class Executor:
                 guards.require(result is None or isinstance(result, bytes), 'Runner must raise on nonzero/ambiguous exit')
                 removed.update(candidates)
                 at = self._now(at)
-                observed = self._observe(intent, at)
-                guards.require(observed['forgotten_ids'] == sorted(removed),
-                               'Partial or unexpected forget effect')
+                if self.effect_section is None:
+                    observed = self._observe(intent, at)
+                    guards.require(observed['forgotten_ids'] == sorted(removed),
+                                   'Partial or unexpected forget effect')
             except Exception as failure:
                 error = type(failure).__name__
                 break

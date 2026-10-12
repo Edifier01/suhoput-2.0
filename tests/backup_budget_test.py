@@ -168,6 +168,18 @@ class BillingImportTests(unittest.TestCase):
 
 
 class MonthlyProjectionTests(unittest.TestCase):
+    def test_calendar_month_charges_all_744_storage_hours_at_730_hour_unit(self):
+        m=subject();samples,cadence,inventory,rates=inputs();cadence['retention']=178
+        inventory.update(objects=0,buckets=1,storage_bytes=9*m.GIB-m.METADATA_BYTES)
+        rates.update(storage_rub_gib_month='2.57',put_rub_1000='0.71',get_rub_1000='0',delete_rub_1000='0',egress_rub_gib='0')
+        for job,sample in samples.items():
+            sample.update(retained_delta_bytes=0,new_objects=0,egress_bytes=0,provider_http={'put':{'binlog':15,'hourly':1,'full':32}.get(job,0),'get':0,'delete':0})
+        projection=m.monthly_projection(samples,cadence,inventory,rates,projection_days=31)
+        self.assertEqual(projection['storage_upper_bound_bytes'],9*m.GIB)
+        self.assertGreater(Decimal(projection['projected_rub']),Decimal(500))
+        self.assertTrue(projection['over_limit'])
+        self.assertEqual(Decimal(projection['projected_rub']),Decimal('476.64856')+Decimal(9)*Decimal('2.57')*744/730)
+
     def test_calendar_month_bound_rejects_cost_that_only_fits_thirty_days(self):
         m=subject();samples,cadence,inventory,rates=inputs();rates['put_rub_1000']='11'
         thirty=m.monthly_projection(samples,cadence,inventory,rates)

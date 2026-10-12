@@ -10,6 +10,41 @@ from unittest import mock
 import os
 
 class CohortTests(unittest.TestCase):
+    def test_locked_executor_reads_once_per_authority_boundary_within_fifty_five_seconds(self):
+        import contextlib
+        for lanes in (1,2):
+            inv,plan,evidence=fixture(split=lanes==2);original=copy.deepcopy(inv);store=MemoryIntent();active=[False];elapsed=[0.0];critical_reads=[];effects=[]
+            @contextlib.contextmanager
+            def section():
+                active[0]=True
+                try:yield
+                finally:active[0]=False
+            def read():
+                if active[0]:
+                    elapsed[0]+=18;critical_reads.append(tuple(effects))
+                    guards.require(elapsed[0]<55,'Simulated observed native metadata deadline')
+                return copy.deepcopy(inv)
+            def effect(lane,args):
+                self.assertTrue(active[0]);effects.append(lane);elapsed[0]+=.1
+                inv['snapshots']=[r for r in inv['snapshots'] if r['id'] not in args[3:]]
+                for sid in args[3:]:inv['manifests'].pop(sid)
+            result=retention_apply.Executor(read,effect,store,lambda r:None,{'base':'base','binlog':'logs'},effect_section=section).apply(original,plan,evidence,NOW)
+            with self.subTest(lanes=lanes):
+                self.assertEqual(result['result'],'APPLIED')
+                self.assertEqual(len(critical_reads),lanes+1)
+                self.assertEqual(critical_reads[0],());self.assertEqual(len(critical_reads[-1]),lanes)
+                if lanes==2:self.assertEqual(critical_reads[1],('base',))
+                self.assertLess(elapsed[0],55)
+    def test_later_locked_lane_requires_exact_confirmation_of_prior_lane_effect(self):
+        import contextlib
+        inv,plan,evidence=fixture(split=True);store=MemoryIntent();effects=[]
+        @contextlib.contextmanager
+        def section():yield
+        def partial(lane,args):effects.append(lane)  # native success with absent exact effect
+        result=retention_apply.Executor(lambda:copy.deepcopy(inv),partial,store,lambda r:None,{'base':'base','binlog':'logs'},effect_section=section).apply(inv,plan,evidence,NOW)
+        self.assertEqual(effects,['base']);self.assertEqual(result['result'],'RECONCILE_REQUIRED')
+        self.assertEqual(result['forgotten_ids'],[])
+
     def test_executor_scans_and_validates_before_short_effect_section(self):
         inv,plan,evidence=fixture();store=MemoryIntent();active=[False];events=[]
         import contextlib
@@ -312,6 +347,29 @@ class NativeCohortTests(unittest.TestCase):
         for lane in ('base','binlog'):
             self.assertEqual(runtime.UploadJournal(self.root/'receipts'/lane,self.w.c['generation']).state().get('retention',[]),[],
                              'Reconciliation published absences before authenticating the final arrival')
+    def test_native_two_lane_apply_reuses_same_observation_and_fits_eighteen_second_reads(self):
+        import retention_cohort
+        cohort,_=retention_cohort.CohortStore(self.w).capture()
+        for name,item in self.documents(cohort).items():retention_native.publish_evidence(self.w,name,item['document'],cohort,NOW.isoformat())
+        elapsed=[0.0];critical_calls=[];effects=[];original=self.w.restic
+        marker=self.root/'receipts/retention-applies'/cohort['cohort']['sha256']/'journals-committed.json'
+        def read(lane,args,**kwargs):
+            result=original(lane,args,**kwargs)
+            if 'timeout' in kwargs:
+                elapsed[0]+=4.5
+                if not marker.exists():critical_calls.append((lane,args[2]))
+            return result
+        self.w.restic=read;self.w.gate=lambda:None
+        def forget(lane,ids,**kwargs):
+            self.assertGreater(kwargs['timeout'],0);effects.append(lane)
+            for sid in ids:del self.native[sid]
+            return b''
+        self.w.retention_forget=forget;native=retention_native.NativeApply.__new__(retention_native.NativeApply);native.w=self.w
+        with mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=native.run('apply')
+        self.assertEqual(result['result'],'APPLIED');self.assertEqual(effects,['base','binlog'])
+        self.assertEqual(len(critical_calls),12)
+        phases=runtime.load_json(marker.parent/'phase-timing.json')['phase_seconds']
+        self.assertEqual(phases['critical_seconds'],54)
     def test_pending_capture_partial_checkpoint_and_changed_cohort_fail_closed(self):
         import retention_cohort
         for kind in ('pending','capture','checkpoint','cohort'):
