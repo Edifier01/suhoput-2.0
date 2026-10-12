@@ -114,9 +114,9 @@ class Worker:
     def restic(self,lane,args,*,target=None,timeout=900):
         guards.require(lane in ('base','binlog'),'Wrong repository lane');expected=self.c['repositories'][lane]
         guards.require(len(args)>=3 and args[:2]==['--repo',expected],'Native repository mismatch')
-        command=args[2];guards.require(command in ('init','backup','cat','dump','snapshots','check','restore','stats'),'Unsafe restic operation')
+        command=args[2];guards.require(command in ('init','backup','cat','dump','snapshots','check','restore','stats','ls'),'Unsafe restic operation')
         opts=['--password-file',str(self.password),'--cache-dir',str(self.root/'cache'/lane),'-o','s3.bucket-lookup=path','-o','s3.connections=1']
-        if command in ('cat','dump','snapshots','check','restore','stats'):opts.append('--no-lock')
+        if command in ('cat','dump','snapshots','check','restore','stats','ls'):opts.append('--no-lock')
         env={**self.credentials,'AWS_REGION':self.c['region']}
         return self.native.run([str(self.binary),*opts,*args],environment=env,timeout=timeout,target=target)
     def initialize(self,lane):
@@ -218,9 +218,20 @@ class Worker:
         history=runtime.load_json(self.root/'receipts/full.json');guards.hex_id(history['snapshot_id'],64)
         guards.require(history.get('source')==self.source and history.get('generation')==self.c['generation'] and history.get('stage_app_sha')==self.c['stage_app_sha'] and all(history.get(k)==v for k,v in identity.items()),'Full prerequisite application/generation mismatch')
         proofs=runtime.UploadJournal(self.root/'receipts/base',self.c['generation']).state()['confirmed'];guards.require(any(x['id']==history['snapshot_id'] and x['manifest_sha256']==history['manifest_sha256'] for x in proofs),'Full prerequisite confirmation absent');return history['snapshot_id']
+    def verify_archive(self,lane,sid,manifest):
+        # Read back into a new owned root-only directory, including every file;
+        # metadata/manifest presence alone cannot acknowledge partial snapshots.
+        token=uuid.uuid4().hex;temporary=self.root/'cache'/('verify-'+token);temporary.mkdir(mode=0o700)
+        runtime.atomic_json(temporary/'owner.json',{'generation':self.c['generation'],'token':token,'snapshot_id':sid});target=temporary/'archive'
+        self.restic(lane,['--repo',self.c['repositories'][lane],'restore',sid,'--target',str(target),'--verify'],timeout=50 if lane=='binlog' else 900)
+        restored=target/str(self.root/'spool'/(lane+'-payload')).lstrip('/');guards.require(runtime.load_json(restored/'manifest.json')==manifest,'Readback manifest drift');verify_payload(restored,manifest)
+        if lane=='base':
+            inventory=self.media(restored/'uploads',dump_records.records((restored/'db.sql').read_bytes()));guards.require(inventory==runtime.load_json(restored/'media.json')['inventory'],'Restored media references/directories differ')
+        guards.require(temporary.resolve()==temporary and temporary.parent==self.root/'cache' and not temporary.is_symlink(),'Readback cleanup scope changed');tree_inventory(temporary)
+        shutil.rmtree(temporary);runtime.directory_sync(temporary.parent);return True
     def upload(self,lane,payload):
         manifest=runtime.load_json(payload/'manifest.json');verify_payload(payload,manifest)
-        adapter=restic_adapter.ResticAdapter(self.c['repositories'][lane],self.c['generation'],str(payload),runner=lambda args:self.restic(lane,args,timeout=50 if lane=='binlog' else 900))
+        adapter=restic_adapter.ResticAdapter(self.c['repositories'][lane],self.c['generation'],str(payload),runner=lambda args:self.restic(lane,args,timeout=50 if lane=='binlog' else 900),verify_archive=lambda sid,metadata:self.verify_archive(lane,sid,metadata))
         capture=self.capture_intent(lane,payload);runtime.atomic_json(self.root/'receipts'/('capture-'+lane+'.json'),{**capture,'phase':'upload'})
         sid=runtime.UploadJournal(self.root/'receipts'/lane,self.c['generation']).upload(payload,sha(payload/'manifest.json'),adapter)
         return sid
@@ -249,6 +260,9 @@ class Worker:
                 (payload/'configuration').mkdir(mode=0o700)
                 for name in ('.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf'):
                     source=self.stage/name;guards.require(source.is_file() and not source.is_symlink(),'Missing full configuration');dest=payload/'configuration'/name;dest.parent.mkdir(mode=0o700,parents=True,exist_ok=True);shutil.copyfile(source,dest);os.chmod(dest,0o600)
+                public=payload/'configuration/backup-public';public.mkdir(mode=0o700)
+                for name in ('worker.py','restore.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php'):
+                    source=self.bin/name;guards.require(source.is_file() and not source.is_symlink(),'Missing recovery public helper');shutil.copyfile(source,public/name);os.chmod(public/name,0o600)
             guards.require(media_before==tree_inventory(uploads)==tree_inventory(payload/'uploads'),'Uploads changed during capture')
             if kind in ('full','pre-update'):guards.require(identity==self.captured_identity(payload),'Captured application/configuration differs from baseline')
             guards.require(identity==self.application_identity(),'Application/configuration changed during capture')

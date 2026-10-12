@@ -79,8 +79,9 @@ class CaptureRuntimeTests(unittest.TestCase):
         with self.assertRaises(guards.GuardError):m.binlog_watermark('2026-10-12T10:00:00Z',dt.datetime(2026,10,12,10,1,1,tzinfo=dt.timezone.utc))
 class SnapshotCoherenceTests(unittest.TestCase):
     def fake(self,directory,mutate=False):
-        m=module('worker');w=m.Worker.__new__(m.Worker);w.stage=pathlib.Path(directory);w.root=w.stage/'backup';w.c=m.validate_config(config());w.source=w.c['source'];w.wp_volume=w.stage/'wp';w.wp_mounts=[]
+        m=module('worker');w=m.Worker.__new__(m.Worker);w.stage=pathlib.Path(directory);w.root=w.stage/'backup';w.c=m.validate_config(config());w.source=w.c['source'];w.wp_volume=w.stage/'wp';w.wp_mounts=[];w.bin=w.root/'bin';w.bin.mkdir(parents=True)
         for name in ['backup/spool','backup/receipts','wp/wp-content/uploads','infra/staging']:(w.stage/name).mkdir(parents=True,exist_ok=True)
+        for name in ('worker.py','restore.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php'):(w.bin/name).write_bytes(b'synthetic public source')
         (w.wp_volume/'wp-content/uploads/a.jpg').write_bytes(b'before snapshot')
         for name in ['.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf']:(w.stage/name).write_text('synthetic')
         w.source_check=lambda:None;w.gate=lambda:None;w.schema_catalog=lambda:module('dump_records').records(dump())['catalog']

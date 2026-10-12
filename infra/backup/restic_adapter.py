@@ -24,7 +24,7 @@ def repository_scope(value):
 
 
 class ResticAdapter:
-    def __init__(self, repository, generation, payload_root, *, runner):
+    def __init__(self, repository, generation, payload_root, *, runner, verify_archive=None):
         self.repository = repository_scope(repository)
         self.generation = guards.hex_id(generation, 32)
         guards.require(isinstance(payload_root, str) and payload_root.startswith('/')
@@ -35,7 +35,7 @@ class ResticAdapter:
         self.payload_root = payload_root
         guards.require(callable(runner), 'Protected native runner required')
         self.run = lambda args: runner(['--repo', self.repository, *args])
-        self.hints = {}
+        self.hints = {};self.verify_archive=verify_archive
 
     def find(self, token):
         guards.hex_id(token, 32)
@@ -66,6 +66,18 @@ class ResticAdapter:
                 guards.require(isinstance(body, bytes) and len(body) <= 64 * 1024 * 1024,
                                'Manifest bytes required')
                 guards.require(hashlib.sha256(body).hexdigest() == digest, 'Archived manifest mismatch')
+                metadata=json.loads(body);guards.require(metadata.get('generation')==self.generation and isinstance(metadata.get('files'),list),'Unknown archived manifest format')
+                expected={self.payload_root+'/manifest.json':len(body)}
+                for item in metadata['files']:
+                    name=guards.media_path(item['path']);guards.hex_id(item['sha256'],64);guards.require(type(item['bytes']) is int and item['bytes']>=0,'Malformed archive file size');path=self.payload_root+'/'+name;guards.require(path not in expected,'Duplicate archive file');expected[path]=item['bytes']
+                listing=self.run(['ls','--json','--recursive',sid,self.payload_root]);nodes=[json.loads(line) for line in listing.splitlines() if line.strip()]
+                headers=[x for x in nodes if x.get('message_type')=='snapshot'];guards.require(len(headers)==1 and headers[0].get('id')==sid,'Archive tree identity mismatch');actual={}
+                for node in nodes:
+                    if node.get('message_type')=='snapshot':continue
+                    guards.require(node.get('message_type')=='node' and node.get('type') in ('file','dir') and (node['path']==self.payload_root or node['path'].startswith(self.payload_root+'/')),'Unknown archive node')
+                    if node['type']=='file':guards.require(node['path'] not in actual,'Duplicate archive path');actual[node['path']]=node['size']
+                guards.require(actual==expected,'Partial or changed snapshot tree')
+                guards.require(callable(self.verify_archive) and self.verify_archive(sid,metadata) is True,'Actual archived bytes verifier required')
                 matches.append({'id': sid, 'token': token, 'generation': self.generation,
                                 'manifest_sha256': digest})
             return matches

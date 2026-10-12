@@ -237,16 +237,16 @@ class ResticReadProofs(unittest.TestCase):
             calls.append(args)
             return responses[len(calls)-1]
         adapter=restic_adapter.ResticAdapter('s3:https://s3.invalid/stage-test/suhoput2/stage-b/repositories/base',
-                    GEN,'/isolated/payload',runner=runner)
+                    GEN,'/isolated/payload',runner=runner,verify_archive=lambda sid,metadata:True)
         return adapter,calls
     def test_remote_manifest_authenticated_bytes_match_tag_digest(self):
-        body=b'{"synthetic":true}'
+        body=json.dumps({'synthetic':True,'generation':GEN,'files':[]}).encode()
         sha=hashlib.sha256(body).hexdigest();token='a'*32
         row={'id':'d'*64,'tags':['task047','generation:'+GEN,'token:'+token,'manifest-sha:'+sha]}
-        adapter,calls=self.adapter([json.dumps([row]).encode(),body])
+        listing=b'\n'.join(json.dumps(x).encode() for x in [{'message_type':'snapshot','id':'d'*64},{'message_type':'node','type':'file','path':'/isolated/payload/manifest.json','size':len(body)}]);adapter,calls=self.adapter([json.dumps([row]).encode(),body,listing])
         result=adapter.find(token)
         self.assertEqual(result[0]['manifest_sha256'],sha)
-        self.assertEqual(calls[-1],['--repo',adapter.repository,'dump','d'*64,'/isolated/payload/manifest.json'])
+        self.assertEqual(calls[1],['--repo',adapter.repository,'dump','d'*64,'/isolated/payload/manifest.json'])
         self.assertTrue(all(call[:2]==['--repo',adapter.repository] for call in calls))
     def test_remote_tag_digest_does_not_replace_actual_read(self):
         token='a'*32
@@ -259,15 +259,27 @@ class ResticReadProofs(unittest.TestCase):
             adapter,calls=self.adapter([json.dumps([row]).encode()])
             with self.assertRaises(guards.GuardError): adapter.find('a'*32)
             self.assertEqual(len(calls),1)
+    def test_partial_snapshot_with_manifest_but_missing_database_is_rejected(self):
+        body=json.dumps({'generation':GEN,'files':[{'path':'db.sql','bytes':100,'sha256':'c'*64}]}).encode();digest=hashlib.sha256(body).hexdigest();token='a'*32
+        row={'id':'d'*64,'tags':['task047','generation:'+GEN,'token:'+token,'manifest-sha:'+digest]}
+        listing=b'\n'.join(json.dumps(x).encode() for x in [{'message_type':'snapshot','id':'d'*64},{'message_type':'node','type':'file','path':'/isolated/payload/manifest.json','size':len(body)}])
+        adapter,calls=self.adapter([json.dumps([row]).encode(),body,listing])
+        with self.assertRaises(guards.GuardError):adapter.find(token)
+    def test_archive_requires_actual_data_verifier_after_metadata(self):
+        body=json.dumps({'generation':GEN,'files':[]}).encode();digest=hashlib.sha256(body).hexdigest();token='a'*32
+        row={'id':'d'*64,'tags':['task047','generation:'+GEN,'token:'+token,'manifest-sha:'+digest]}
+        listing=b'\n'.join(json.dumps(x).encode() for x in [{'message_type':'snapshot','id':'d'*64},{'message_type':'node','type':'file','path':'/isolated/payload/manifest.json','size':len(body)}])
+        adapter,calls=self.adapter([json.dumps([row]).encode(),body,listing]);adapter.verify_archive=lambda sid,metadata:False
+        with self.assertRaises(guards.GuardError):adapter.find(token)
     def test_wrong_prefix_rejected_before_any_external_call(self):
         with self.assertRaises(guards.GuardError):
             restic_adapter.ResticAdapter('s3:https://s3.invalid/stage-test/old',GEN,'/isolated/payload',runner=lambda args:None)
 
     def test_put_hint_uses_exact_authenticated_snapshot_read_without_inventory_scan(self):
-        body=b'{"synthetic":true}';sha=hashlib.sha256(body).hexdigest();token='a'*32
+        body=json.dumps({'synthetic':True,'generation':GEN,'files':[]}).encode();sha=hashlib.sha256(body).hexdigest();token='a'*32
         row={'tags':['task047','generation:'+GEN,'token:'+token,'manifest-sha:'+sha]}
         summary={'message_type':'summary','snapshot_id':'d'*64}
-        adapter,calls=self.adapter([json.dumps(summary).encode(),json.dumps(row).encode(),body])
+        listing=b'\n'.join(json.dumps(x).encode() for x in [{'message_type':'snapshot','id':'d'*64},{'message_type':'node','type':'file','path':'/isolated/payload/manifest.json','size':len(body)}]);adapter,calls=self.adapter([json.dumps(summary).encode(),json.dumps(row).encode(),body,listing])
         with mock.patch('restic_adapter.pathlib.Path') as path:
             manifest=path.return_value.__truediv__.return_value
             manifest.is_symlink.return_value=False;manifest.is_file.return_value=True;manifest.read_bytes.return_value=body
@@ -278,7 +290,7 @@ class ResticReadProofs(unittest.TestCase):
         self.assertFalse(any('snapshots' in call for call in calls))
 
     def test_invalid_put_summary_never_becomes_read_hint(self):
-        body=b'{"synthetic":true}';sha=hashlib.sha256(body).hexdigest()
+        body=json.dumps({'synthetic':True,'generation':GEN,'files':[]}).encode();sha=hashlib.sha256(body).hexdigest()
         adapter,calls=self.adapter([b'{"message_type":"summary","snapshot_id":"short"}'])
         with mock.patch('restic_adapter.pathlib.Path') as path:
             manifest=path.return_value.__truediv__.return_value
