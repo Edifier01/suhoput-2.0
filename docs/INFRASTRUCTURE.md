@@ -25,6 +25,8 @@
 
 Официальные источники прочитаны11.10.2026: [MariaDB dump](https://mariadb.com/docs/server/clients-and-utilities/backup-restore-and-import-clients/mariadb-dump) допускает single-transaction/master-data для InnoDB; [PITR](https://mariadb.com/docs/server/server-usage/backup-and-restore/mariadb-backup/point-in-time-recovery-pitr-mariadb-backup) требует replay от координат base; [S3 API](https://docs.selectel.ru/api/object-storage-s3/) не поддерживает Bucket Lifecycle/Encryption API, поэтому нужны клиентская защита и свой retention; [policy actions](https://docs.selectel.ru/s3/buckets/bucket-policy/about-bucket-policy/) ограничиваются object prefix; [оплата](https://docs.selectel.ru/s3/about/payment/) учитывает хранение, трафик и запросы. Версии серверов/API и реальные наблюдения — ACCEPTANCE. Источники доказывают выбор подхода, не исполнение пакета.
 
+Native read-only retention audit внутри существующего stage backup каталога установлен12.10.2026; real11snapshots/6logs/current anchor recovery PASS, EXEC-CHK-060. Новых DB/volumes/units, SQL replay, remote retention deletion или timer enable в этом продолжении нет.
+
 <a id="sources"></a>
 ## Проверенные официальные материалы
 

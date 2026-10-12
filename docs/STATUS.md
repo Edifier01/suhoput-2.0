@@ -4,6 +4,8 @@
 
 ## Текущее состояние
 
+12.10.2026: continuation с6afa70f/оба CI25/25 — runtime8a237bb установлен; real read-only retention audit11snapshots/6logs/current anchor DB/media/log SHA binding PASS (EXEC-CHK-060), keep11/candidates0. Runtime/документальный final SHA различать. Текущая работа — final evidence review/Git/PR/оба CI точного нового HEAD. TASK-047 **blocked**: native apply executor/реального30д окна/pre-window anchor/restore до archived tip нет; monthly usage null/account billing не подтверждён; full physical independent owner restore not_run. Следующая независимая подготовка — native apply prerequisites и измерение месячной проекции<=500RUB/10GiB с подтверждением тарифа; после этого постоянные новые timers и full owner restore. SITE-A/старые timers/57config SHA сохранены13:03UTC; новые4timersdisabled.
+
 | Задача | Состояние | Факт и следующий шаг |
 | --- | --- | --- |
 | DOC-001 | done | Исходная документация подготовлена ранее |
