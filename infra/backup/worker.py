@@ -255,6 +255,7 @@ class Worker:
         guards.require(temporary.resolve()==temporary and temporary.parent==self.root/'cache' and not temporary.is_symlink(),'Readback cleanup scope changed');tree_inventory(temporary)
         shutil.rmtree(temporary);runtime.directory_sync(temporary.parent);return True
     def upload(self,lane,payload):
+        backup_catalog.ArchiveCatalog(self).ready()
         manifest=runtime.load_json(payload/'manifest.json');verify_payload(payload,manifest)
         adapter=restic_adapter.ResticAdapter(self.c['repositories'][lane],self.c['generation'],str(payload),runner=lambda args:self.restic(lane,args,timeout=50 if lane=='binlog' else 900),verify_archive=lambda sid,metadata,**proof:self.verify_archive(lane,sid,metadata,**proof))
         capture=self.capture_intent(lane,payload);runtime.atomic_json(self.root/'receipts'/('capture-'+lane+'.json'),{**capture,'phase':'upload'})
