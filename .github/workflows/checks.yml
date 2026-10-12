@@ -44,6 +44,7 @@ jobs:
         run: |
           python3 tests/backup_worker_test.py
           python3 tests/backup_restore_test.py
+          python3 tests/backup_retention_test.py
       - name: Portable owner-kit crypto (synthetic; no S3 or host credentials)
         run: >-
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges

@@ -141,5 +141,5 @@ def retention_candidates(snapshots,generation,now):
 
 def authorize_retention(plan,proof,generation):
     # Boolean input flags do not authenticate inventory or prove a restore.
-    # No deletion path exists until a native, inventory-bound verifier exists.
-    raise GuardError('Native inventory-bound recovery verifier absent; deletion disabled')
+    # The native inventory audit is read-only; it cannot authorize deletion.
+    raise GuardError('Native retention apply prerequisites/executor incomplete; deletion disabled')
