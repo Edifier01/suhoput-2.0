@@ -98,7 +98,8 @@ class Recovery:
         self.password=secrets.token_hex(32)
         with open(self.root/'control.password','x') as stream:stream.write(self.password+'\n');stream.flush();os.fsync(stream.fileno())
         (self.root/'socket').mkdir(mode=0o700);objects_absent(w.native);w.native.run(['docker','volume','create','--label','task047.generation='+w.c['generation'],'--label','task047.restore-token='+self.plan['token'],VOLUME])
-        volume=json.loads(w.native.run(['docker','volume','inspect',VOLUME]))[0];guards.require(volume['Name']==VOLUME and volume['Labels'].get('task047.generation')==w.c['generation'] and volume['Labels'].get('task047.restore-token')==self.plan['token'],'Unknown control volume identity')
+        volume=json.loads(w.native.run(['docker','volume','inspect',VOLUME]))[0];guards.require(any(m.get('Source')==str(self.root/'socket') and m.get('Destination')=='/run/mysqld' and m.get('Type')=='bind' for m in row['Mounts']),'Existing control socket binding mismatch')
+        guards.require(volume['Name']==VOLUME and volume['Labels'].get('task047.generation')==w.c['generation'] and volume['Labels'].get('task047.restore-token')==self.plan['token'],'Unknown control volume identity')
         w.native.run(['docker','run','-d','--name',CONTROL,'--label','com.docker.compose.project='+PROJECT,'--label','com.docker.compose.service=db','--label','task047.generation='+w.c['generation'],'--network','none','--memory','1g','--cpus','0.5','--pids-limit','256','--cap-drop','NET_RAW','--security-opt','no-new-privileges','--env','MARIADB_ROOT_PASSWORD','--mount','type=volume,source='+VOLUME+',target=/var/lib/mysql','--mount','type=bind,source='+str(self.root/'socket')+',target=/run/mysqld',DB_IMAGE,'--skip-networking','--event-scheduler=OFF'],environment={'MARIADB_ROOT_PASSWORD':self.password})
         for attempt in range(100):
             try:
@@ -122,9 +123,10 @@ class Recovery:
         self.password=private_path(self.root/'control.password').read_text().strip();guards.hex_id(self.password,64)
         row=json.loads(w.native.run(['docker','inspect',CONTROL]))[0];volume=json.loads(w.native.run(['docker','volume','inspect',VOLUME]))[0]
         guards.require(row['Config']['Image']==DB_IMAGE and row['Config']['Labels'].get('task047.generation')==w.c['generation'] and row['HostConfig']['NetworkMode']=='none' and all(not x for x in row['NetworkSettings']['Ports'].values()),'Existing control container scope mismatch')
+        guards.require(any(m.get('Source')==str(self.root/'socket') and m.get('Destination')=='/run/mysqld' and m.get('Type')=='bind' for m in row['Mounts']),'Existing control socket binding mismatch')
         guards.require(volume['Name']==VOLUME and volume['Labels'].get('task047.restore-token')==self.plan['token'] and volume['Labels'].get('task047.generation')==w.c['generation'] and any(m.get('Name')==VOLUME and m['Destination']=='/var/lib/mysql' for m in row['Mounts']),'Existing control volume identity mismatch')
         guards.require(w.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;',container=CONTROL).strip()==b'OFF\t1\t0','Existing control isolation changed')
-        base,bpath,bmd=self.snapshot('base',self.plan['base_id'],existing=True);full,fpath,fmd=(base,bpath,bmd) if self.plan['full_id']==self.plan['base_id'] else self.snapshot('base',self.plan['full_id'],existing=True)
+        base,bpath,bmd=self.snapshot('base',self.plan['base_id'],existing=True);guards.require(base['kind'] in ('full','pre-update','hourly') and base['stage_app_sha']==w.c['stage_app_sha'],'Existing base kind/application mismatch');guards.require((base['kind']=='hourly' and base['full_id']==self.plan['full_id']) or (base['kind'] in ('full','pre-update') and self.plan['full_id']==self.plan['base_id']),'Existing full ID linkage mismatch');full,fpath,fmd=(base,bpath,bmd) if self.plan['full_id']==self.plan['base_id'] else self.snapshot('base',self.plan['full_id'],existing=True)
         guards.require(full['kind'] in ('full','pre-update') and all(full[k]==base[k] for k in ('generation','source','stage_app_sha','application_sha256','configuration_sha256')),'Existing full prerequisite changed');guards.require(w.captured_identity(fpath)=={k:full[k] for k in ('application_sha256','configuration_sha256')},'Existing full application changed')
         expected=self.plan['expected_order'];excluded=self.plan['excluded_order'];op=self.plan['expected_operation'];late=self.plan['excluded_operation'];query=f"SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={expected};SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={excluded};SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{op}';SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{late}';"
         guards.require(w.sql(query,container=CONTROL).splitlines()==[b'1',b'0',b'1',b'0'],'Existing PITR control counts differ')
@@ -132,7 +134,7 @@ class Recovery:
         # its PHP mysqli reader after both native count guards; retain its failure.
         # Independently check exact control IDs against authenticated base bytes.
         records=control_records((bpath/'db.sql').read_bytes());guards.require(expected not in records['orders'] and excluded not in records['orders'] and op not in records['operations'] and late not in records['operations'],'After-base evidence absent')
-        chain=runtime.load_json(w.root/'receipts/binlog-chain.json');selected=replay_range(base['coordinates'],self.plan['stop'],chain['logs'])
+        chain=runtime.load_json(w.root/'receipts/binlog-chain.json');guards.require(chain['generation']==w.c['generation'],'Existing binlog chain generation mismatch');selected=replay_range(base['coordinates'],self.plan['stop'],chain['logs'])
         for item in selected:
             path=self.root/'logs'/item['file'];guards.require(path.is_file() and not path.is_symlink() and path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Existing recovery log changed')
         # Decode again only into a NEW verification file; never apply it to DB.
@@ -142,15 +144,15 @@ class Recovery:
     def verify_result(self,base,bpath,bmd,full,fpath,fmd,selected):
         w=self.w;source_inventory=runtime.load_json(bpath/'media.json')['inventory']
         restored=self.verified_media(bpath/'uploads',source_inventory)
-        negatives={};missing=self.root/'missing-media';corrupt=self.root/'corrupt-media';shutil.copytree(bpath/'uploads',missing);shutil.copytree(bpath/'uploads',corrupt)
+        negatives={};case='negative-'+uuid.uuid4().hex;negative=self.root/case;negative.mkdir(mode=0o700);missing=negative/'missing-media';corrupt=negative/'corrupt-media';shutil.copytree(bpath/'uploads',missing);shutil.copytree(bpath/'uploads',corrupt)
         candidates=[x for x in source_inventory if 'bytes' in x];guards.require(candidates,'No referenced media negative fixture');thumb=next((x['path'] for x in candidates if '-150x150.' in x['path']),candidates[0]['path']);(missing/thumb).unlink();(corrupt/thumb).write_bytes(b'corrupt synthetic copy')
         for name,path in [('missing_media',missing),('corrupt_media',corrupt)]:
             try:self.verified_media(path,source_inventory)
             except (NativeError,guards.GuardError):negatives[name]='rejected'
             else:raise guards.GuardError('Invalid media accepted')
-        last=selected[-1];bad={**last,'file':'truncated-control.binlog'};shutil.copyfile(self.root/'logs'/last['file'],self.root/'logs'/bad['file'])
+        last=selected[-1];bad={**last,'file':case+'-truncated.binlog'};shutil.copyfile(self.root/'logs'/last['file'],self.root/'logs'/bad['file'])
         with open(self.root/'logs'/bad['file'],'r+b') as stream:stream.truncate(150)
-        try:self.decoder([bad],self.root/'negative-replay.sql')
+        try:self.decoder([bad],negative/'negative-replay.sql')
         except NativeError:negatives['truncated_binlog']='rejected'
         else:raise guards.GuardError('Truncated binlog accepted')
         # Positive result remains unchanged by negatives (separate copies only).
