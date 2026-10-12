@@ -40,6 +40,8 @@ jobs:
           printf '%s  %s\n' f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c .cache/packages/restic.bz2 | sha256sum --check
           bzip2 -dc .cache/packages/restic.bz2 > .cache/packages/restic
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 1 --pids-limit 256 --tmpfs /control:rw,exec,nosuid,nodev,size=805306368,mode=0700 --tmpfs /tmp:rw,nosuid,nodev,size=16777216 --mount "type=bind,source=$PWD/.cache/packages/restic,target=/input/restic,readonly" --mount "type=bind,source=$PWD/tests/backup-mariadb-local.sh,target=/input/test.sh,readonly" --entrypoint bash mariadb:10.11@sha256:7db29378d4fdab73f8123bbc2b48905c90d1a4b00cf848b028f1e81e623257f2 /input/test.sh
+      - name: Protected backup worker capture and crash recovery (synthetic)
+        run: python3 tests/backup_worker_test.py
       - name: Portable owner-kit crypto (synthetic; no S3 or host credentials)
         run: >-
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges
