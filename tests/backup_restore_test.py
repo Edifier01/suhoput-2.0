@@ -7,6 +7,13 @@ class ReplayPlanTests(unittest.TestCase):
     def logs(self):return [{'file':f'suhoput2-binlog.{i:06d}','size':1000,'sha256':'a'*64} for i in range(1,4)]
     def test_committed_stop_uses_base_first_and_target_last_not_later_file(self):
         m=self.module();selected=m.replay_range({'file':'suhoput2-binlog.000001','position':600},{'file':'suhoput2-binlog.000002','position':700},self.logs());self.assertEqual([x['file'] for x in selected],['suhoput2-binlog.000001','suhoput2-binlog.000002'])
+    def test_before_base_ids_use_exact_native_columns_not_free_text(self):
+        m=self.module();from backup_worker_test import dump
+        ddl=b"\nCREATE TABLE `wp_wc_orders` (\n  `id` bigint,\n  `note` longtext\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\nCREATE TABLE `wp_suhoput_operations` (\n  `operation_id` varchar(36),\n  `note` longtext\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"
+        rows=b"INSERT INTO `wp_wc_orders` (`id`, `note`) VALUES (1,'12');\nINSERT INTO `wp_suhoput_operations` (`operation_id`, `note`) VALUES ('base','target');\n"
+        self.assertEqual(m.control_records(dump()+ddl+rows),{'orders':[1],'operations':['base']})
+        with self.assertRaises(guards.GuardError):m.control_records(dump())
+        with self.assertRaises(guards.GuardError):m.control_records(dump()+ddl+rows+rows)
     def test_unknown_docker_inventory_is_not_evidence_of_absence(self):
         m=self.module();self.assertTrue(hasattr(m,'objects_absent'),'Missing verified absence guard')
         class Unavailable:
