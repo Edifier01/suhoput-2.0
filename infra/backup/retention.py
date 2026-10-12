@@ -96,7 +96,11 @@ def bind_recovery(inventory,plan,proof):
         guards.require(proof['source']==base['source'] and proof['stage_app_sha']==base['stage_app_sha'] and proof['coordinates']==base['coordinates'],'Native recovery source or coordinates mismatch')
         selected=replay_range(base['coordinates'],proof['stop'],plan['logs'])
         guards.require(type(proof['replayed_logs']) is int and proof['replayed_logs']==len(selected) and proof['verified_binlogs']==selected and isinstance(proof['media']['inventory'],list),'Native recovery binlog bytes or media receipt mismatch')
-        guards.require(all(proof[k] is True for k in ('synthetic_order_after_base','synthetic_operation_after_base','later_order_operation_excluded')),'Native after-base control absent')
+        guards.require(all(proof[k] is True for k in ('synthetic_order_after_base','synthetic_operation_after_base')),'Native after-base control absent')
+        profile=proof.get('profile','point');guards.require(profile in ('point','tip'),'Unknown recovery profile')
+        if profile=='tip':
+            guards.require(proof['later_order_operation_excluded'] is False and proof['additional_order_operation_present'] is True and proof['stop']=={'file':plan['chain_last_file'],'position':plan['chain_last_position']},'Exact-tip presence proof absent')
+        else:guards.require(proof['later_order_operation_excluded'] is True,'Point exclusion proof absent')
         return {'base_id':sid,'manifest_sha256':row['manifest_sha256'],'stop':proof['stop'],'replayed_logs':len(selected),'media_references':len(proof['media']['inventory']),'SQL_reimport_or_replay':False}
     except (KeyError,TypeError,StopIteration) as error:
         raise guards.GuardError('Incomplete native recovery binding') from error

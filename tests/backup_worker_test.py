@@ -81,7 +81,7 @@ class SnapshotCoherenceTests(unittest.TestCase):
     def fake(self,directory,mutate=False):
         m=module('worker');w=m.Worker.__new__(m.Worker);w.stage=pathlib.Path(directory);w.root=w.stage/'backup';w.c=m.validate_config(config());w.source=w.c['source'];w.wp_volume=w.stage/'wp';w.wp_mounts=[];w.bin=w.root/'bin';w.bin.mkdir(parents=True)
         for name in ['backup/spool','backup/receipts','wp/wp-content/uploads','infra/staging']:(w.stage/name).mkdir(parents=True,exist_ok=True)
-        for name in ('worker.py','restore.py','retention.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php'):(w.bin/name).write_bytes(b'synthetic public source')
+        for name in ('worker.py','restore.py','retention.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):(w.bin/name).write_bytes(b'synthetic public source')
         (w.wp_volume/'wp-content/uploads/a.jpg').write_bytes(b'before snapshot')
         for name in ['.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf']:(w.stage/name).write_text('synthetic')
         w.source_check=lambda:None;w.gate=lambda:None;w.schema_catalog=lambda:module('dump_records').records(dump())['catalog']
@@ -117,6 +117,12 @@ class SnapshotCoherenceTests(unittest.TestCase):
             w=self.fake(d);w.base('full');captured=w.root/'spool/base-payload/configuration/backup-public/retention.py'
             self.assertTrue(captured.is_file(),'Full recovery kit lacks installed retention auditor')
             self.assertEqual(captured.read_bytes(),(w.bin/'retention.py').read_bytes())
+    def test_full_contains_owner_budget_apply_and_row_guards(self):
+        with tempfile.TemporaryDirectory() as d:
+            w=self.fake(d);w.base('full');public=w.root/'spool/base-payload/configuration/backup-public'
+            for name in ('owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
+                self.assertTrue((public/name).is_file(),'Full recovery archive missing '+name)
+                self.assertEqual((public/name).read_bytes(),(w.bin/name).read_bytes())
     def test_snapshot_watermark_precedes_dump_not_its_completion(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as d:

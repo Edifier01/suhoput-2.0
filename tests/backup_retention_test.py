@@ -51,6 +51,11 @@ class InventoryBoundTests(unittest.TestCase):
         for key,bad in [('base_id','9'*64),('base_manifest_sha256','9'*64),('source',{'generation':'9'*32}),('coordinates',{'file':'suhoput2-binlog.000001','position':5}),('replayed_logs',1),('full_manifest_sha256','9'*64)]:
             proof=self.proof();proof[key]=bad
             with self.subTest(key=key),self.assertRaises(guards.GuardError):m.bind_recovery(a,p,proof)
+    def test_exact_tip_presence_receipt_requires_actual_tip_without_false_exclusion(self):
+        m=subject();a=fixture();p=m.inventory_plan(a,NOW);proof={**self.proof(),'profile':'tip','stop':{'file':'suhoput2-binlog.000002','position':500},'later_order_operation_excluded':False,'additional_order_operation_present':True}
+        m.bind_recovery(a,p,proof)
+        for changed in ({'additional_order_operation_present':False},{'later_order_operation_excluded':True},{'stop':{'file':'suhoput2-binlog.000002','position':499}},{'profile':'arbitrary'}):
+            with self.subTest(change=changed),self.assertRaises(guards.GuardError):m.bind_recovery(a,p,{**proof,**changed})
     def test_boolean_attestation_never_substitutes_native_receipt(self):
         m=subject();a=fixture();p=m.inventory_plan(a,NOW)
         with self.assertRaises(guards.GuardError):m.bind_recovery(a,p,{'restored':True,'integrity':True,'anchor_id':'1'*64})

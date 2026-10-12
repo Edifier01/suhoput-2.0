@@ -6,8 +6,26 @@ import guards,runtime,dump_records
 from worker import Worker,DB_IMAGE,WP_IMAGE,private_path,verify_payload,tree_inventory,sha,now,NativeError
 CONTROL='suhoput2-stage-restore-047-db-1';VOLUME='suhoput2-stage-restore-047_db';PROJECT='suhoput2-stage-restore-047'
 
-def objects_absent(native):
-    for kind,name in [('container',CONTROL),('volume',VOLUME)]:
+def control_profile(profile):
+    guards.require(profile in ('point','tip'),'Unknown restore profile')
+    if profile=='point':return {'control':CONTROL,'volume':VOLUME,'project':PROJECT,'plan':'restore-plan.json','intent':'restore-intent.json','prefix':'restore','receipt':'restored.json'}
+    return {'control':'suhoput2-stage-restore-tip-047-db-1','volume':'suhoput2-stage-restore-tip-047_db','project':'suhoput2-stage-restore-tip-047','plan':'restore-tip-plan.json','intent':'restore-tip-intent.json','prefix':'restore-tip','receipt':'restored-tip.json'}
+
+def validate_tip_end(stop,logs):
+    guards.new_logs([],logs);guards.require(logs and stop=={'file':logs[-1]['file'],'position':logs[-1]['size']},'Target differs from exact archived chain tip');return stop
+
+def validate_tip_plan(plan,generation):
+    guards.require(type(plan.get('format')) is int and plan['format']==1 and plan.get('generation')==generation,'Tip generation mismatch')
+    for key in ('base_id','full_id'):guards.hex_id(plan[key],64)
+    guards.hex_id(plan['token'],32)
+    for key in ('first_order','second_order'):guards.require(type(plan[key]) is int and plan[key]>0,'Invalid tip order control')
+    guards.require(plan['first_order']!=plan['second_order'],'Duplicate tip order control')
+    for key in ('first_operation','second_operation'):guards.require(isinstance(plan[key],str) and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',plan[key]),'Invalid tip operation control')
+    guards.require(plan['first_operation']!=plan['second_operation'],'Duplicate tip operation control');return plan
+
+def objects_absent(native,*,profile='point'):
+    target=control_profile(profile)
+    for kind,name in [('container',target['control']),('volume',target['volume'])]:
         args=['docker',kind,'ls']+(['--all'] if kind=='container' else [])+['--format','{{json .Names}}' if kind=='container' else '{{json .Name}}']
         names=[json.loads(x) for x in native.run(args).splitlines() if x.strip()];guards.require(all(isinstance(x,str) for x in names) and name not in names,'Existing control object; preserve')
     return True
@@ -41,9 +59,43 @@ def control_records(data):
     guards.require(len(out['orders'])==len(set(out['orders'])) and len(out['operations'])==len(set(out['operations'])),'Duplicate base control ID');return out
 
 class Recovery:
-    def __init__(self,config,plan):
-        self.w=Worker(config);self.plan=validate_plan(runtime.load_json(private_path(plan)),self.w.c['generation']);guards.require(str(plan)==str(self.w.root/'config/restore-plan.json'),'Wrong protected restore plan')
-        self.root=self.w.root/'control-restore'/('restore-'+self.plan['token']);self.intent=self.w.root/'receipts/restore-intent.json'
+    profile='point';control=CONTROL;volume=VOLUME;project=PROJECT;receipt_name='restored.json'
+    def __init__(self,config,plan,*,profile='point'):
+        target=control_profile(profile);self.profile=profile;self.control=target['control'];self.volume=target['volume'];self.project=target['project'];self.receipt_name=target['receipt']
+        self.w=Worker(config);self.plan=(validate_plan if profile=='point' else validate_tip_plan)(runtime.load_json(private_path(plan)),self.w.c['generation']);guards.require(str(plan)==str(self.w.root/'config'/target['plan']),'Wrong protected restore plan')
+        self.root=self.w.root/'control-restore'/(target['prefix']+'-'+self.plan['token']);self.intent=self.w.root/'receipts'/target['intent']
+    def controls(self):
+        keys=('expected_order','excluded_order','expected_operation','excluded_operation') if self.profile=='point' else ('first_order','second_order','first_operation','second_operation')
+        return tuple(self.plan[key] for key in keys)
+    def expected_counts(self):return [1,0,1,0] if self.profile=='point' else [1,1,1,1]
+    def verify_native_progress(self,base_digest,control_id):
+        """Bind before/import/replay observations to this exact isolated run.
+
+        Only the previous point control may lack BOTH journals. A partial pair
+        is never legacy evidence; every tip resume needs the complete pair.
+        """
+        before_path=self.root/'base-imported.json';after_path=self.root/'replay-applied.json'
+        present=[path.exists() or path.is_symlink() for path in (before_path,after_path)]
+        if not any(present):
+            guards.require(self.profile=='point','Native tip replay journals required');return False
+        guards.require(all(present),'Incomplete native replay journals');guards.hex_id(control_id,64);guards.hex_id(base_digest,64)
+        before=runtime.load_json(before_path);after=runtime.load_json(after_path)
+        for journal in (before,after):
+            expected={'token':self.plan['token'],'generation':self.w.c['generation'],'control_id':control_id,'base_id':self.plan['base_id'],'base_manifest_sha256':base_digest}
+            guards.require(all(journal.get(key)==value for key,value in expected.items()),'Native replay journal binding mismatch')
+        for journal,key,counts in ((before,'before_counts',[0]*4),(after,'after_counts',self.expected_counts())):
+            observed=journal.get(key)
+            guards.require(isinstance(observed,list) and len(observed)==4 and all(type(value) is int for value in observed) and observed==counts,'Native replay journal count mismatch')
+        guards.require(after.get('stop')==self.plan['stop'],'Native replay journal stop mismatch')
+        digest=guards.hex_id(after.get('replay_sha256'),64);replay=self.root/'replay.sql'
+        guards.require(replay.is_file() and not replay.is_symlink() and replay.stat().st_nlink==1 and sha(replay)==digest,'Native applied replay bytes mismatch');return True
+    def control_query(self):
+        first,second,op1,op2=self.controls()
+        return f"SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={first};SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={second};SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{op1}';SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{op2}';"
+    def selected_logs(self,base,chain):
+        guards.require(chain['generation']==self.w.c['generation'],'Chain generation mismatch')
+        if self.profile=='tip':validate_tip_end(self.plan['stop'],chain['logs'])
+        return replay_range(base['coordinates'],self.plan['stop'],chain['logs'])
     def snapshot(self,lane,sid,*,existing=False):
         w=self.w;repo=w.c['repositories'][lane];scope=str(w.root/'spool'/(lane+'-payload'));metadata=json.loads(w.restic(lane,['--repo',repo,'cat','snapshot',sid]));tags=metadata['tags']
         guards.require(metadata['paths']==[scope] and isinstance(tags,list) and len(tags)==len(set(tags)) and 'task047' in tags,'Snapshot source path/tags mismatch')
@@ -73,8 +125,8 @@ class Recovery:
         args.extend('/logs/'+x['file'] for x in logs);self.w.native.run(args,target=target)
     def run(self):
         w=self.w;w.gate();guards.require(not self.intent.exists() and not self.root.exists(),'Existing restore attempt; preserve/investigate, no automatic repeat')
-        objects_absent(w.native)
-        runtime.atomic_json(self.intent,{'generation':w.c['generation'],'token':self.plan['token'],'started_at':now(),'objects':[CONTROL,VOLUME],'source_mutations':0});self.root.mkdir(mode=0o700);(self.root/'snapshots').mkdir(mode=0o700)
+        objects_absent(w.native,profile=self.profile)
+        runtime.atomic_json(self.intent,{'generation':w.c['generation'],'token':self.plan['token'],'started_at':now(),'objects':[self.control,self.volume],'source_mutations':0});self.root.mkdir(mode=0o700);(self.root/'snapshots').mkdir(mode=0o700)
         for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
         base,bpath,bmd=self.snapshot('base',self.plan['base_id']);guards.require(base['kind'] in ('full','pre-update','hourly'),'Wrong base snapshot kind')
         if base['kind']=='hourly':
@@ -83,7 +135,7 @@ class Recovery:
         guards.require(full['kind'] in ('full','pre-update') and all(full[k]==base[k] for k in ('generation','source','stage_app_sha','application_sha256','configuration_sha256')),'Full app/config/generation binding mismatch')
         guards.require(w.c['stage_app_sha']==base['stage_app_sha'] and w.c['generation']==base['generation'],'Expected stage application generation mismatch')
         guards.require(w.captured_identity(fpath)=={k:full[k] for k in ('application_sha256','configuration_sha256')},'Full captured application/config bytes differ')
-        chain=runtime.load_json(w.root/'receipts/binlog-chain.json');guards.require(chain['generation']==w.c['generation'],'Chain generation mismatch');selected=replay_range(base['coordinates'],self.plan['stop'],chain['logs']);files={};needed={x['file'] for x in selected};(self.root/'logs').mkdir(mode=0o700)
+        chain=runtime.load_json(w.root/'receipts/binlog-chain.json');guards.require(chain['generation']==w.c['generation'],'Chain generation mismatch');selected=self.selected_logs(base,chain);files={};needed={x['file'] for x in selected};(self.root/'logs').mkdir(mode=0o700)
         for row in chain['snapshots']:
             if not any(row['first_log']<=guards.log_number(name)<=row['last_log'] for name in needed):continue
             manifest,path,digest=self.snapshot('binlog',row['id']);guards.require(manifest['kind']=='binlog','Wrong binlog snapshot kind');guards.checked_logs(manifest['logs']);guards.require(digest==row['manifest_sha256'],'Chain snapshot digest mismatch')
@@ -97,49 +149,53 @@ class Recovery:
         # archives, schemas, chain, decoder and media have been verified first.
         self.password=secrets.token_hex(32)
         with open(self.root/'control.password','x') as stream:stream.write(self.password+'\n');stream.flush();os.fsync(stream.fileno())
-        (self.root/'socket').mkdir(mode=0o700);objects_absent(w.native);w.native.run(['docker','volume','create','--label','task047.generation='+w.c['generation'],'--label','task047.restore-token='+self.plan['token'],VOLUME])
-        volume=json.loads(w.native.run(['docker','volume','inspect',VOLUME]))[0]
-        guards.require(volume['Name']==VOLUME and volume['Labels'].get('task047.generation')==w.c['generation'] and volume['Labels'].get('task047.restore-token')==self.plan['token'],'Unknown control volume identity')
-        w.native.run(['docker','run','-d','--name',CONTROL,'--label','com.docker.compose.project='+PROJECT,'--label','com.docker.compose.service=db','--label','task047.generation='+w.c['generation'],'--network','none','--memory','1g','--cpus','0.5','--pids-limit','256','--cap-drop','NET_RAW','--security-opt','no-new-privileges','--env','MARIADB_ROOT_PASSWORD','--mount','type=volume,source='+VOLUME+',target=/var/lib/mysql','--mount','type=bind,source='+str(self.root/'socket')+',target=/run/mysqld',DB_IMAGE,'--skip-networking','--event-scheduler=OFF'],environment={'MARIADB_ROOT_PASSWORD':self.password})
+        (self.root/'socket').mkdir(mode=0o700);objects_absent(w.native,profile=self.profile);w.native.run(['docker','volume','create','--label','task047.generation='+w.c['generation'],'--label','task047.restore-token='+self.plan['token'],self.volume])
+        volume=json.loads(w.native.run(['docker','volume','inspect',self.volume]))[0]
+        guards.require(volume['Name']==self.volume and volume['Labels'].get('task047.generation')==w.c['generation'] and volume['Labels'].get('task047.restore-token')==self.plan['token'],'Unknown control volume identity')
+        w.native.run(['docker','run','-d','--name',self.control,'--label','com.docker.compose.project='+self.project,'--label','com.docker.compose.service=db','--label','task047.generation='+w.c['generation'],'--network','none','--memory','1g','--cpus','0.5','--pids-limit','256','--cap-drop','NET_RAW','--security-opt','no-new-privileges','--env','MARIADB_ROOT_PASSWORD','--mount','type=volume,source='+self.volume+',target=/var/lib/mysql','--mount','type=bind,source='+str(self.root/'socket')+',target=/run/mysqld',DB_IMAGE,'--skip-networking','--event-scheduler=OFF'],environment={'MARIADB_ROOT_PASSWORD':self.password})
         for attempt in range(100):
             try:
-                if w.sql('SELECT 1;',container=CONTROL).strip()==b'1':break
+                if w.sql('SELECT 1;',container=self.control).strip()==b'1':break
             except NativeError:pass
             time.sleep(0.2)
         else:raise guards.GuardError('Control DB did not start; retained')
-        row=json.loads(w.native.run(['docker','inspect',CONTROL]))[0];guards.require(any(m.get('Source')==str(self.root/'socket') and m.get('Destination')=='/run/mysqld' and m.get('Type')=='bind' for m in row['Mounts']),'Existing control socket binding mismatch');guards.require(row['Config']['Image']==DB_IMAGE and row['HostConfig']['NetworkMode']=='none' and all(not x for x in row['NetworkSettings']['Ports'].values()),'Control DB isolation mismatch');guards.require(any(m.get('Name')==VOLUME and m['Destination']=='/var/lib/mysql' for m in row['Mounts']),'Control volume mismatch')
-        guards.require(w.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;',container=CONTROL).strip()==b'OFF\t1\t0','Unsafe control DB runtime')
-        guards.require(w.sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='suhoput2_stage';",container=CONTROL).strip()==b'0','Control schema not empty')
-        w.native.run(['docker','exec','-i',CONTROL,'sh','-c','MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot'],data=(bpath/'db.sql').read_bytes())
-        expected=self.plan['expected_order'];excluded=self.plan['excluded_order'];operation=self.plan['expected_operation'];excludedop=self.plan['excluded_operation']
-        query=f"SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={expected};SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={excluded};SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{operation}';SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{excludedop}';"
-        before_counts=w.sql(query,container=CONTROL).splitlines();guards.require(before_counts==[b'0']*4,'Control records already exist in base; after-base replay not proved');runtime.atomic_json(self.root/'base-imported.json',{'token':self.plan['token'],'generation':w.c['generation'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'before_counts':[int(x) for x in before_counts],'control_id':row['Id']})
-        w.native.run(['docker','exec','-i',CONTROL,'sh','-c','MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot'],data=replay.read_bytes())
-        counts=w.sql(query,container=CONTROL).splitlines();guards.require(counts==[b'1',b'0',b'1',b'0'],'PITR target/exclusion mismatch');runtime.atomic_json(self.root/'replay-applied.json',{'token':self.plan['token'],'generation':w.c['generation'],'base_id':self.plan['base_id'],'stop':self.plan['stop'],'control_id':row['Id'],'after_counts':[int(x) for x in counts],'replay_sha256':sha(replay)})
-        self.before_proof='native imported base counts fourzero before replay'
+        row=json.loads(w.native.run(['docker','inspect',self.control]))[0];guards.require(any(m.get('Source')==str(self.root/'socket') and m.get('Destination')=='/run/mysqld' and m.get('Type')=='bind' for m in row['Mounts']),'Existing control socket binding mismatch');guards.require(row['Config']['Image']==DB_IMAGE and row['HostConfig']['NetworkMode']=='none' and all(not x for x in row['NetworkSettings']['Ports'].values()),'Control DB isolation mismatch');guards.require(any(m.get('Name')==self.volume and m['Destination']=='/var/lib/mysql' for m in row['Mounts']),'Control volume mismatch')
+        guards.require(w.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;',container=self.control).strip()==b'OFF\t1\t0','Unsafe control DB runtime')
+        guards.require(w.sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='suhoput2_stage';",container=self.control).strip()==b'0','Control schema not empty')
+        w.native.run(['docker','exec','-i',self.control,'sh','-c','MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot'],data=(bpath/'db.sql').read_bytes())
+        query=self.control_query()
+        before_counts=w.sql(query,container=self.control).splitlines();guards.require(before_counts==[b'0']*4,'Control records already exist in base; after-base replay not proved');runtime.atomic_json(self.root/'base-imported.json',{'token':self.plan['token'],'generation':w.c['generation'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'before_counts':[int(x) for x in before_counts],'control_id':row['Id']})
+        w.native.run(['docker','exec','-i',self.control,'sh','-c','MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot'],data=replay.read_bytes())
+        counts=w.sql(query,container=self.control).splitlines();guards.require(counts==[str(x).encode() for x in self.expected_counts()],'PITR target/exclusion mismatch');runtime.atomic_json(self.root/'replay-applied.json',{'token':self.plan['token'],'generation':w.c['generation'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'stop':self.plan['stop'],'control_id':row['Id'],'after_counts':[int(x) for x in counts],'replay_sha256':sha(replay)})
+        guards.require(self.verify_native_progress(bmd,row['Id']),'Fresh native replay journals required');self.before_proof_kind='native-journals'
+        self.before_proof='native imported base counts 0/0/0/0 before replay; '+self.profile+' after counts '+ '/'.join(map(str,self.expected_counts()))
         return self.verify_result(base,bpath,bmd,full,fpath,fmd,selected)
     def verify_existing(self):
         w=self.w;intent=runtime.load_json(self.intent);guards.require(intent['generation']==w.c['generation'] and intent['token']==self.plan['token'] and self.root.resolve()==self.root and self.root.is_dir(),'Existing recovery scope changed')
         self.password=private_path(self.root/'control.password').read_text().strip();guards.hex_id(self.password,64)
-        row=json.loads(w.native.run(['docker','inspect',CONTROL]))[0];volume=json.loads(w.native.run(['docker','volume','inspect',VOLUME]))[0]
+        row=json.loads(w.native.run(['docker','inspect',self.control]))[0];volume=json.loads(w.native.run(['docker','volume','inspect',self.volume]))[0]
         guards.require(row['Config']['Image']==DB_IMAGE and row['Config']['Labels'].get('task047.generation')==w.c['generation'] and row['HostConfig']['NetworkMode']=='none' and all(not x for x in row['NetworkSettings']['Ports'].values()),'Existing control container scope mismatch')
         guards.require(any(m.get('Source')==str(self.root/'socket') and m.get('Destination')=='/run/mysqld' and m.get('Type')=='bind' for m in row['Mounts']),'Existing control socket binding mismatch')
-        guards.require(volume['Name']==VOLUME and volume['Labels'].get('task047.restore-token')==self.plan['token'] and volume['Labels'].get('task047.generation')==w.c['generation'] and any(m.get('Name')==VOLUME and m['Destination']=='/var/lib/mysql' for m in row['Mounts']),'Existing control volume identity mismatch')
-        guards.require(w.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;',container=CONTROL).strip()==b'OFF\t1\t0','Existing control isolation changed')
+        guards.require(volume['Name']==self.volume and volume['Labels'].get('task047.restore-token')==self.plan['token'] and volume['Labels'].get('task047.generation')==w.c['generation'] and any(m.get('Name')==self.volume and m['Destination']=='/var/lib/mysql' for m in row['Mounts']),'Existing control volume identity mismatch')
+        guards.require(w.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;',container=self.control).strip()==b'OFF\t1\t0','Existing control isolation changed')
         base,bpath,bmd=self.snapshot('base',self.plan['base_id'],existing=True);guards.require(base['kind'] in ('full','pre-update','hourly') and base['stage_app_sha']==w.c['stage_app_sha'],'Existing base kind/application mismatch');guards.require((base['kind']=='hourly' and base['full_id']==self.plan['full_id']) or (base['kind'] in ('full','pre-update') and self.plan['full_id']==self.plan['base_id']),'Existing full ID linkage mismatch');full,fpath,fmd=(base,bpath,bmd) if self.plan['full_id']==self.plan['base_id'] else self.snapshot('base',self.plan['full_id'],existing=True)
         guards.require(full['kind'] in ('full','pre-update') and all(full[k]==base[k] for k in ('generation','source','stage_app_sha','application_sha256','configuration_sha256')),'Existing full prerequisite changed');guards.require(w.captured_identity(fpath)=={k:full[k] for k in ('application_sha256','configuration_sha256')},'Existing full application changed')
-        expected=self.plan['expected_order'];excluded=self.plan['excluded_order'];op=self.plan['expected_operation'];late=self.plan['excluded_operation'];query=f"SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={expected};SELECT COUNT(*) FROM suhoput2_stage.wp_wc_orders WHERE id={excluded};SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{op}';SELECT COUNT(*) FROM suhoput2_stage.wp_suhoput_operations WHERE operation_id='{late}';"
-        guards.require(w.sql(query,container=CONTROL).splitlines()==[b'1',b'0',b'1',b'0'],'Existing PITR control counts differ')
-        # This path never imports or replays SQL. The original native run reached
-        # its PHP mysqli reader after both native count guards; retain its failure.
-        # Independently check exact control IDs against authenticated base bytes.
+        expected,excluded,op,late=self.controls();query=self.control_query()
+        guards.require(w.sql(query,container=self.control).splitlines()==[str(x).encode() for x in self.expected_counts()],'Existing PITR control counts differ')
+        # This path never imports or replays SQL. Independently check exact
+        # control IDs against authenticated base bytes for both profiles.
         records=control_records((bpath/'db.sql').read_bytes());guards.require(expected not in records['orders'] and excluded not in records['orders'] and op not in records['operations'] and late not in records['operations'],'After-base evidence absent')
-        chain=runtime.load_json(w.root/'receipts/binlog-chain.json');guards.require(chain['generation']==w.c['generation'],'Existing binlog chain generation mismatch');selected=replay_range(base['coordinates'],self.plan['stop'],chain['logs'])
+        chain=runtime.load_json(w.root/'receipts/binlog-chain.json');guards.require(chain['generation']==w.c['generation'],'Existing binlog chain generation mismatch');selected=self.selected_logs(base,chain)
         for item in selected:
             path=self.root/'logs'/item['file'];guards.require(path.is_file() and not path.is_symlink() and path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Existing recovery log changed')
+        native_journals=self.verify_native_progress(bmd,row['Id'])
         # Decode again only into a NEW verification file; never apply it to DB.
-        self.decoder(selected,self.root/('replay-verified-'+uuid.uuid4().hex+'.sql'),start=base['coordinates']['position'],stop=self.plan['stop']['position'])
-        self.before_proof='original native fourzero-before-replay guard passed before PHP socket failure; authenticated base dump control IDs independently absent; existing DB counts1/0/1/0; validation-only resume, SQL writes0'
+        verified_replay=self.root/('replay-verified-'+uuid.uuid4().hex+'.sql');self.decoder(selected,verified_replay,start=base['coordinates']['position'],stop=self.plan['stop']['position'])
+        if native_journals:
+            guards.require(sha(verified_replay)==sha(self.root/'replay.sql'),'Regenerated authenticated replay differs from applied bytes')
+            self.before_proof_kind='native-journals';self.before_proof='native journals bind generation/token/control/base/stop/replay; before counts 0/0/0/0; '+self.profile+' after counts '+ '/'.join(map(str,self.expected_counts()))+'; validation-only resume, SQL writes0'
+        else:
+            self.before_proof_kind='legacy-point-authenticated-base-absence';self.before_proof='legacy point resume: authenticated base exact control IDs absent; existing DB counts1/0/1/0; original native replay journals unavailable; validation-only resume, SQL writes0'
         return self.verify_result(base,bpath,bmd,full,fpath,fmd,selected)
     def verify_result(self,base,bpath,bmd,full,fpath,fmd,selected):
         w=self.w;source_inventory=runtime.load_json(bpath/'media.json')['inventory']
@@ -157,12 +213,12 @@ class Recovery:
         else:raise guards.GuardError('Truncated binlog accepted')
         # Positive result remains unchanged by negatives (separate copies only).
         guards.require(self.media(bpath/'uploads')==restored,'Positive restore drift after negatives')
-        receipt={'before_replay_control_records_absent':True,'before_replay_proof':getattr(self,'before_proof','native imported base counts fourzero before replay'),'result':'PASS','started_from':'private encrypted S3-B base+binlogs; original source reads=0','source':w.source,'code_sha':w.c['code_sha'],'stage_app_sha':base['stage_app_sha'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'full_id':self.plan['full_id'],'full_manifest_sha256':fmd,'coordinates':base['coordinates'],'stop':self.plan['stop'],'replayed_logs':len(selected),'verified_binlogs':selected,'synthetic_order_after_base':True,'synthetic_operation_after_base':True,'later_order_operation_excluded':True,'media':restored,'negatives':negatives,'control_objects':[CONTROL,VOLUME],'owner_independent_machine':'not_run','timers':'disabled;usage/account tariff prerequisite','completed_at':now()};runtime.atomic_json(w.root/'receipts/restored.json',receipt);print(json.dumps(receipt));return receipt
+        receipt={'before_replay_control_records_absent':True,'before_replay_proof':self.before_proof,'before_replay_proof_kind':self.before_proof_kind,'result':'PASS','started_from':'private encrypted S3-B base+binlogs; original source reads=0','source':w.source,'code_sha':w.c['code_sha'],'stage_app_sha':base['stage_app_sha'],'base_id':self.plan['base_id'],'base_manifest_sha256':bmd,'full_id':self.plan['full_id'],'full_manifest_sha256':fmd,'coordinates':base['coordinates'],'stop':self.plan['stop'],'replayed_logs':len(selected),'verified_binlogs':selected,'synthetic_order_after_base':True,'synthetic_operation_after_base':True,'later_order_operation_excluded':self.profile=='point','additional_order_operation_present':self.profile=='tip','profile':self.profile,'media':restored,'negatives':negatives,'control_objects':[self.control,self.volume],'owner_independent_machine':'not_run','timers':'disabled;usage/account tariff prerequisite','completed_at':now()};runtime.atomic_json(w.root/'receipts'/self.receipt_name,receipt);print(json.dumps(receipt));return receipt
 
 def main():
     import argparse
-    parser=argparse.ArgumentParser();parser.add_argument('--config',required=True);parser.add_argument('--plan',required=True);parser.add_argument('--verify-existing',action='store_true');args=parser.parse_args();os.umask(0o077)
+    parser=argparse.ArgumentParser();parser.add_argument('--config',required=True);parser.add_argument('--plan',required=True);parser.add_argument('--verify-existing',action='store_true');parser.add_argument('--profile',choices=['point','tip'],default='point');args=parser.parse_args();os.umask(0o077)
     try:
-        os.nice(10);recovery=Recovery(args.config,args.plan);recovery.verify_existing() if args.verify_existing else recovery.run();return 0
+        os.nice(10);recovery=Recovery(args.config,args.plan,profile=args.profile);recovery.verify_existing() if args.verify_existing else recovery.run();return 0
     except Exception as error:print(json.dumps({'result':'FAIL','error_type':type(error).__name__,'completed_at':now()}));return 1
 if __name__=='__main__':sys.exit(main())

@@ -261,7 +261,7 @@ class Worker:
                 for name in ('.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf'):
                     source=self.stage/name;guards.require(source.is_file() and not source.is_symlink(),'Missing full configuration');dest=payload/'configuration'/name;dest.parent.mkdir(mode=0o700,parents=True,exist_ok=True);shutil.copyfile(source,dest);os.chmod(dest,0o600)
                 public=payload/'configuration/backup-public';public.mkdir(mode=0o700)
-                for name in ('worker.py','restore.py','retention.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php'):
+                for name in ('worker.py','restore.py','retention.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
                     source=self.bin/name;guards.require(source.is_file() and not source.is_symlink(),'Missing recovery public helper');shutil.copyfile(source,public/name);os.chmod(public/name,0o600)
             guards.require(media_before==tree_inventory(uploads)==tree_inventory(payload/'uploads'),'Uploads changed during capture')
             if kind in ('full','pre-update'):guards.require(identity==self.captured_identity(payload),'Captured application/configuration differs from baseline')
