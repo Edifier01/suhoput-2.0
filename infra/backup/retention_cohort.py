@@ -275,11 +275,14 @@ def confirm_observation(worker,inventory,reader,*,journals=None,tombstones=None)
 def minute_job(worker,deadline):
     """Reserve the next job turn while an existing retention group finishes.
 
-    Both acquisitions spend the original minute deadline. The OS releases
-    the reservation on process death; it carries no durable authority.
+    Both acquisitions and the completed body spend the original minute
+    deadline. The OS releases the reservation on process death; it carries
+    no durable authority. An original body exception propagates unchanged.
     """
     with backup_catalog._catalog_lock(worker.root/'receipts/job-binlog-wait.lock',MAX_CRITICAL_SECONDS,deadline,'minute turn'):
-        with backup_catalog._catalog_lock(worker.root/'receipts/job-binlog.lock',MAX_CRITICAL_SECONDS,deadline,'minute job'):yield
+        with backup_catalog._catalog_lock(worker.root/'receipts/job-binlog.lock',MAX_CRITICAL_SECONDS,deadline,'minute job'):
+            yield
+            guards.require(time.monotonic()<deadline,'Minute job original deadline exceeded')
 
 @contextlib.contextmanager
 def upload_section(worker,*,deadline=None,extra_locks=()):

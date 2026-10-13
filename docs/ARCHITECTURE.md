@@ -6,6 +6,8 @@
 
 Внутри reservation до native read достаточно exact owner и общих snapshots/manifests container identities плюс top-level scalar equality. Полный digest прежнего actual observation обязательно сверяется после final LIST вместе с raw/projection/tail seals до эффекта; это сохраняет field drift rejection и исключает две дублирующие предварительные canonicalization. Paired old/full native digest разрешён лишь при byte-exact прежней canonical algebra и измеренном ускорении.
 
+Minute job расходует один исходный55s deadline на acquisition, upload/readback/admission и финализацию. После тела до release обеих исходных locks проверяется тот же monotonic deadline; своевременный ACK не означает своевременного завершения. Body exception сохраняется, повтор upload не добавляется. Масштабное испытание Native/минутного backup должно использовать независимые процессы/cgroups как systemd deployment: EACH0.5CPU/768MiB, два backup actors вместе1CPU/up to1.5GiB, отдельный прежний SQL producer0.5CPU/768MiB. Эти суммы явно отличаются от прежнего combined-stress768MiB; shared namespace/filelocks/catalog/real60s arrivals/proxy на Native actor и прежние45/55/60/900 guards сохраняются. IPC передаёт только наблюдения, не native authority. Parent capacity и per-actor measurements — отдельные доказательства.
+
 Назначение: краткая карта утверждённого устройства, ответственности и ещё не доказанных возможностей. Полные требования и таблицы переходов — в [SPEC](SPEC.md#архитектура-и-границы-компонентов), реализация и оперативная готовность — в [STATUS](STATUS.md).
 
 ## Статус решений и реализации

@@ -7,6 +7,77 @@ import backup_cohort_test
 
 
 class CohortBoundaryTests(unittest.TestCase):
+    def minute_context(self,clock,events,held,*,acquisition_error=None):
+        @contextlib.contextmanager
+        def lock(path,maximum,deadline,label):
+            events.append(('acquire',label,maximum,deadline))
+            if acquisition_error is not None and acquisition_error[0]==label:raise acquisition_error[1]
+            held.append(label)
+            try:yield
+            finally:
+                self.assertEqual(held.pop(),label);events.append(('release',label))
+        worker=types.SimpleNamespace(root=pathlib.Path('/synthetic-minute-worker'))
+        stack=contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(backup_catalog,'_catalog_lock',lock))
+        stack.enter_context(mock.patch.object(retention_cohort.time,'monotonic',side_effect=lambda:clock[0]))
+        return worker,stack
+
+    def test_original_minute_deadline_includes_finalization_after_a_timely_ack(self):
+        clock=[19.628855];events=[];held=[];operations=[]
+        worker,patches=self.minute_context(clock,events,held);require=guards.require
+        def checked(condition,message='Invalid backup evidence'):
+            if message=='Minute job original deadline exceeded':events.append(('deadline-check',tuple(held)))
+            return require(condition,message)
+        with patches,mock.patch.object(guards,'require',checked),self.assertRaisesRegex(guards.GuardError,'Minute job original deadline exceeded'):
+            with retention_cohort.minute_job(worker,55):
+                operations.append('one actual upload operation')
+                clock[0]=52.547895;events.append(('ACK',clock[0]))
+                clock[0]=59.710128;events.append(('finalized',clock[0]))
+        self.assertEqual(operations,['one actual upload operation']);self.assertEqual(held,[])
+        self.assertEqual(events[-3:],[('deadline-check',('minute turn','minute job')),('release','minute job'),('release','minute turn')])
+        self.assertEqual([event[3] for event in events if event[0]=='acquire'],[55,55])
+
+    def test_minute_job_exact_original_deadline_is_expired_before_lock_release(self):
+        clock=[0];events=[];held=[];worker,patches=self.minute_context(clock,events,held)
+        with patches,self.assertRaisesRegex(guards.GuardError,'Minute job original deadline exceeded'):
+            with retention_cohort.minute_job(worker,55):clock[0]=55
+        self.assertEqual(held,[]);self.assertEqual(events[-2:],[('release','minute job'),('release','minute turn')])
+
+    def test_late_minute_finalization_releases_real_OS_reservation_and_job_locks(self):
+        case=self.case();clock=[0];operations=[]
+        with mock.patch.object(retention_cohort.time,'monotonic',side_effect=lambda:clock[0]):
+            with self.assertRaisesRegex(guards.GuardError,'Minute job original deadline exceeded'):
+                with retention_cohort.minute_job(case.w,55):operations.append('one completed body');clock[0]=59.71
+        self.assertEqual(operations,['one completed body'])
+        # The expired body cannot retain either OS lock or silently retry it.
+        with runtime.lane_lock(case.root/'receipts/job-binlog-wait.lock'),runtime.lane_lock(case.root/'receipts/job-binlog.lock'):pass
+
+    def test_minute_job_returns_once_when_finalization_finishes_before_original_deadline(self):
+        clock=[0];events=[];held=[];operations=[];worker,patches=self.minute_context(clock,events,held)
+        with patches:
+            with retention_cohort.minute_job(worker,55):operations.append('once');clock[0]=54.999
+        self.assertEqual(operations,['once']);self.assertEqual(held,[])
+        self.assertEqual(events[-2:],[('release','minute job'),('release','minute turn')])
+
+    def test_expired_minute_body_exceptions_propagate_unchanged_and_release_both_locks(self):
+        for error in (ValueError('bad configuration'),guards.GuardError('original body proof'),KeyboardInterrupt('original interruption')):
+            with self.subTest(error=type(error).__name__):
+                clock=[0];events=[];held=[];operations=[];worker,patches=self.minute_context(clock,events,held)
+                with patches,self.assertRaises(type(error)) as result:
+                    with retention_cohort.minute_job(worker,55):operations.append('once');clock[0]=59.71;raise error
+                self.assertIs(result.exception,error);self.assertEqual(operations,['once']);self.assertEqual(held,[])
+                self.assertEqual(events[-2:],[('release','minute job'),('release','minute turn')])
+
+    def test_original_minute_acquisition_failure_never_runs_or_retries_body(self):
+        for label in ('minute turn','minute job'):
+            with self.subTest(label=label):
+                error=guards.GuardError('original acquisition deadline');clock=[55];events=[];held=[];operations=[]
+                worker,patches=self.minute_context(clock,events,held,acquisition_error=(label,error))
+                with patches,self.assertRaises(guards.GuardError) as result:
+                    with retention_cohort.minute_job(worker,55):operations.append('unexpected body')
+                self.assertIs(result.exception,error);self.assertEqual(operations,[]);self.assertEqual(held,[])
+                self.assertEqual(sum(event[0]=='acquire' and event[1]==label for event in events),1)
+
     def test_used_observation_never_waits_for_a_later_unlisted_pending_upload(self):
         case=self.case();_,_,_,current=self.loaded(case);before=copy.deepcopy(dict(current));flight=current['snapshots']._observation.flight
         retention_cohort._FLIGHT_USED.add(flight);sid,lock,waits=self.flight(case,listed=False)
