@@ -9,6 +9,52 @@ class NativeTailClosureTests(unittest.TestCase):
     def case(self):return prepared.PreparedNativePhaseTests.case(self)
     def append(self,case,arrivals):
         prepared.PreparedNativePhaseTests.append_next_minute(self,case,arrivals)
+    def test_reserved_group_hashes_the_borrowed_observation_only_after_the_final_list(self):
+        case,_,executor,_,effects,evidence=self.case();original=retention_cohort.upload_section;active=[False];events=[]
+        digest=retention_cohort._observation_digest;native=case.w.restic
+        @contextlib.contextmanager
+        def section(worker,**kwargs):
+            with original(worker,**kwargs) as acquired:
+                active[0]=True;events.append('group')
+                try:yield acquired
+                finally:active[0]=False
+        def hashed(value):
+            if active[0]:events.append('full-observation-hash')
+            return digest(value)
+        def read(lane,args,**kwargs):
+            value=native(lane,args,**kwargs)
+            if active[0] and lane=='binlog' and args[2:]==['snapshots','--json']:events.append('final-native-list')
+            return value
+        case.w.restic=read
+        with mock.patch.object(readiness_v2,'load_evidence',return_value=evidence),mock.patch.object(readiness_v2,'revalidate_budget',return_value=True),mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',return_value={}),mock.patch.object(retention_cohort,'upload_section',section),mock.patch.object(retention_cohort,'_observation_digest',hashed):
+            self.assertEqual(executor.run('apply')['result'],'APPLIED')
+        self.assertEqual(len(effects),2)
+        self.assertEqual(events,['group','final-native-list','full-observation-hash']*3)
+    def test_final_native_old_and_full_seals_canonicalize_each_actual_row_once(self):
+        case,_,executor,_,effects,evidence=self.case();original=retention_cohort.upload_section;group=[None];calls={};canonical=retention.canonical
+        @contextlib.contextmanager
+        def section(worker,**kwargs):
+            with original(worker,**kwargs) as acquired:
+                group[0]=len(calls);calls[group[0]]={}
+                try:yield acquired
+                finally:group[0]=None
+        def encoded(value):
+            if group[0] is not None and isinstance(value,dict) and {'id','paths','tags'}<=set(value):
+                rows=calls[group[0]];rows[value['id']]=rows.get(value['id'],0)+1
+            return canonical(value)
+        with mock.patch.object(readiness_v2,'load_evidence',return_value=evidence),mock.patch.object(readiness_v2,'revalidate_budget',return_value=True),mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',return_value={}),mock.patch.object(retention_cohort,'upload_section',section),mock.patch.object(retention,'canonical',encoded):
+            self.assertEqual(executor.run('apply')['result'],'APPLIED')
+        self.assertEqual(len(effects),2);self.assertEqual(len(calls),3)
+        self.assertTrue(all(rows and set(rows.values())=={1} for rows in calls.values()),calls)
+    def test_paired_native_seals_equal_legacy_for_unicode_unknown_fields_and_configs(self):
+        rows=[{'id':'a'*64,'paths':['/путь/🙂'],'tags':['z','a'],'unknown':{'nested':['雪',7,None,{'quoted':'a"b'}]}},
+              {'id':'b'*64,'unknown':['new',{'key':'значение'}]}]
+        config={'version':2,'id':'c'*64,'unknown':{'escaped':'\\\n','unicode':'é'}}
+        for selected in (set(),{'b'*64},{'a'*64,'b'*64}):
+            pair=retention.native_view_pair(config,list(reversed(rows)),selected)
+            self.assertEqual(pair,(retention.native_view_digest(config,rows),retention.native_view_digest(config,[r for r in rows if r['id'] not in selected])))
+        for value in (rows+[copy.deepcopy(rows[0])],rows+[{'id':'short'}]):
+            with self.assertRaises(guards.GuardError):retention.native_view_pair(config,value,set())
     def test_ack_after_each_outside_response_closes_without_an_extra_native_read(self):
         case,_,executor,store,effects,evidence=self.case();native=case.w.restic;arrivals=[];reads=[];observations=[]
         inventory=retention.native_inventory

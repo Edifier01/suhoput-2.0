@@ -35,6 +35,16 @@ def native_view_digest(config,listed):
         digest.update(canonical(row));digest.update(b'\n')
     return digest.hexdigest()
 
+def native_view_pair(config,listed,excluded):
+    """Exact old/full native digests with one canonical encoding per row."""
+    guards.require(isinstance(config,dict) and isinstance(listed,list),'Complete native view required')
+    seen=set();full=hashlib.sha256();full.update(canonical(config));full.update(b'\n');old=full.copy()
+    for row in sorted(listed,key=lambda value:guards.hex_id(value['id'],64)):
+        sid=row['id'];guards.require(sid not in seen,'Duplicate native snapshot identity');seen.add(sid)
+        raw=canonical(row);full.update(raw);full.update(b'\n')
+        if sid not in excluded:old.update(raw);old.update(b'\n')
+    return full.hexdigest(),old.hexdigest()
+
 def verify_native_views(worker,expected,deadline,*,current=None,derived=None,reader=None):
     """Re-read unfiltered config and snapshots under the reserved group.
 
@@ -60,7 +70,8 @@ def verify_native_views(worker,expected,deadline,*,current=None,derived=None,rea
             guards.require(not present-wanted,'Final unfiltered native contains an unknown or cross-lane arrival')
             guards.require(len(listed)==len(wanted) and present==wanted,
                            'Final unfiltered native differs: Prepared old complete native fields or authenticated tail missing')
-            guards.require(native_view_digest(config,[row for row in listed if row['id'] not in fresh])==expected[lane],
+            full_digest,old_digest=native_view_pair(config,listed,fresh)
+            guards.require(old_digest==expected[lane],
                            'Final unfiltered native old fields or configuration changed')
             for metadata in listed:
                 sid=metadata['id']
@@ -70,7 +81,7 @@ def verify_native_views(worker,expected,deadline,*,current=None,derived=None,rea
                 guards.require(record['native']==native and token==fresh[sid]['token'] and md==fresh[sid]['manifest_sha256'] and
                                record['repository_id']==config['id'] and fresh[sid]['lane']==lane,
                                'Final native tail differs from exact catalog admission')
-            closed[lane]=native_view_digest(config,listed)
+            closed[lane]=full_digest
             observed=__import__('retention_cohort').clock()
         del config,listed
         guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')

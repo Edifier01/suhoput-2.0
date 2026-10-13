@@ -496,6 +496,15 @@
 
 ## Доказательства исполнения
 
+<a id="exec-chk-075"></a>
+### EXEC-CHK-075 — TASK-047: critical hashing и actual V6 timing
+
+13.10.2026 21:35–22:44UTC, основа b4aacc2e0e211f383628277eceac5d46e4d5255b, рабочая копия отличается. NEW NativeV6 на собственном томе213549 завершился FAIL: первая base forget27 началась с≈1.1s остатком45work и TimeoutExpired; critical45.011s, следующий minute43271 потерял исходный55s admission deadline. Native inventory27.222s/readiness+durability15.770s/effect2.019s; reader125s и предыдущие10 admissions/maxlag50.178s не закрывают весь сценарий. Readonly сравнение с исходным corpus подтвердило base752→752/bin43260→43271/no removed/11new; observed deletion0 не снимает ambiguous intent. Failed volume/raw/RECONCILE_REQUIRED сохраняются, apply/forget на нём не повторяется. Raw `task047-final-native-fresh-diagnostic-v6-20261013-213549.local.json` и `task047-v6-readonly-id-cpu-profile-20261013-215947.local.json` — реальные isolated Docker measurements, не S3/STAGE-B.
+
+Узкая поправка убирает две предварительные полные canonicalization observation; exact owner/shared containers/top-level scalars проверяются до native read, полный observation digest вместе с прежними raw/projection/live-tail seals — после final LIST до reseal/intent/effect. Paired native old/full digests кодируют каждую row один раз, сохраняя exact legacy canonical/config/unknown-field/Unicode/duplicate rejection. Frozen raw SHA: retention3db6842af04c6829b5cc04299be5a9a64c0f5fa793e8a192b5ac8f1d5c8efc50; native331b1b9f9b3e6a5242f2c293fff6e3d5f79fb44723b023ea8f4221fe190577c2; tail-tests925dee59440172f674a16bf1f3f2b04b57412fd61bf44dda312b9231f8da1d1b. Полный611Linux/no skips PASS47.402s: команда `.cache/infrastructure/task047-run-all-backup-linux.local.py`, raw `task047-all-backup-linux-20261013-224346.local.json`, Python3.12.14/root/networknone/768MiB/1CPU. Independent63Linux/no skips PASS17.780s, review `task047-native-critical-hashing-independent-review-2217.local.json` SHAaf41f1c6e123a6e66ade5de778e81edf3cb2164b2960860589ef36f9f8a36594; существенных source замечаний нет. Same44k corpus CPU saving≈4.12s не является доказательством whole-phase55s. Дополнительные .211/.011/.489s варианты отвергнуты; fork-COW/OOM и ошибочный depth probe исключены из доказательств (`task047-native-further-performance-review-2237.local.json` SHAae0f471bec402b6f8adf9b36389d4f97f82cc818cdf173c7225dd3c7cad5357d).
+
+Installedb4 actual13STAGE phases/14inner0, anchor/tip source-off SQL и current30SIDs/67packs сохранены отдельно; cohort21:49:12 истёк22:04:12 и не продлевается. Calibration transfer prospective23helper geometry без31-й manual archive ещё требует исправления ACK/finalized P2 и actual current control. Native/replay, защищённый budget report, четыре calendar triggers и оба CI final head ещё не завершены; TASK-047 in_progress. Future full template23:15UTC/Persistentfalse/daily86400 ещё не установлен, действующий full22:15/all4off; никакие прежние FAIL не названы PASS.
+
 <a id="exec-chk-074"></a>
 ### EXEC-CHK-074 — TASK-047: actual native closure и final MariaDB readiness
 

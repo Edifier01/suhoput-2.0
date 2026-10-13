@@ -723,8 +723,9 @@ class NativeApply:
                 frame=native_frame[0];deadline=critical_deadline[0]
                 guards.require(frame is not None and expected is frame['owner'] and expected is prepared_current[0],
                                'Prepared tail owner changed or copied')
-                guards.require(retention_cohort._observation_digest(frame['actual'])==frame['digest'] and
-                               retention_cohort._observation_digest(expected)==frame['digest'],'Prepared outside projection changed')
+                guards.require(expected['snapshots'] is frame['actual']['snapshots'] and expected['manifests'] is frame['actual']['manifests'] and
+                               all(expected[key]==frame['actual'][key] for key in ('generation','repositories','observed_at')),
+                               'Prepared outside projection changed')
                 before=prepared_inputs[0];inputs=_phase_input_bytes(catalog,deadline)
                 journals=_phase_journals(catalog,inputs)
                 intent=getattr(store,'staged_intent',None) or store.load()

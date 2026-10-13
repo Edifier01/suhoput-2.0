@@ -4,6 +4,8 @@
 
 После финального native read отдельно перечитываются live catalog bytes не более32 новых tail admissions: raw record, manifest, exact log membership/body и chain/ordinal/token. Их прежний raw-prefix seal не покрывает; in-memory projected digest недостаточен. Несовпадение блокирует до reseal, intent и первого effect, в той же исходной критической секции без новых native/S3 reads.
 
+Внутри reservation до native read достаточно exact owner и общих snapshots/manifests container identities плюс top-level scalar equality. Полный digest прежнего actual observation обязательно сверяется после final LIST вместе с raw/projection/tail seals до эффекта; это сохраняет field drift rejection и исключает две дублирующие предварительные canonicalization. Paired old/full native digest разрешён лишь при byte-exact прежней canonical algebra и измеренном ускорении.
+
 Назначение: краткая карта утверждённого устройства, ответственности и ещё не доказанных возможностей. Полные требования и таблицы переходов — в [SPEC](SPEC.md#архитектура-и-границы-компонентов), реализация и оперативная готовность — в [STATUS](STATUS.md).
 
 ## Статус решений и реализации
