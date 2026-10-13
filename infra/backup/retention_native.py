@@ -280,10 +280,11 @@ def _recorded_retirements(worker,intent):
 
 def _verify_recorded(intent,recorded,documents):
     for lane,values in recorded.items():guards.require(all(row['lane']==lane for row in values),'Retirement recorded in the wrong lane journal')
-    rows=[row for values in recorded.values() for row in values];derived={}
+    rows=[row for values in recorded.values() for row in values];derived={};proofs={}
     for row in rows:
-        item=documents.get(row['receipt_sha256']);guards.require(item is not None,'Original retirement receipt missing')
-        proof={r['id']:r for r in retention_apply.retention_tombstones(intent,item['document'])}
+        key=row['receipt_sha256'];item=documents.get(key);guards.require(item is not None,'Original retirement receipt missing')
+        if key not in proofs:proofs[key]={r['id']:r for r in retention_apply.retention_tombstones(intent,item['document'])}
+        proof=proofs[key]
         guards.require(proof.get(row['id'])==row,'Journal retirement provenance differs')
         guards.require(row['id'] not in derived,'Duplicate retirement identity');derived[row['id']]=row
     return rows

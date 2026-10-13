@@ -2,6 +2,7 @@
 import copy, importlib.util, json, pathlib, sys, tempfile, unittest
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'infra/backup'))
 import guards, retention_apply, runtime
+from unittest import mock
 from backup_retention_apply_test import fixture, NOW
 
 def subject():
@@ -10,6 +11,44 @@ def subject():
     return retention_native
 
 class NativeBoundaryTests(unittest.TestCase):
+    def recorded_fixture(self,receipt_count=1):
+        inv,plan,_=fixture();template=inv['snapshots'][0];manifest=inv['manifests'][template['id']]
+        for index in range(255):
+            sid=format(index+4096,'064x');inv['snapshots'].append({**template,'id':sid,'token':sid[-32:],'manifest_sha256':sid});inv['manifests'][sid]=manifest
+        candidates=sorted(row['id'] for row in inv['snapshots'] if row['lane']=='base' and row['time']==template['time'])
+        self.assertEqual(len(candidates),256)
+        body={'operation':'native-retention-forget','token':'a'*32,'generation':inv['generation'],'repositories':inv['repositories'],
+              'source':manifest['source'],'inventory_sha256':__import__('retention').inventory_digest(inv),'before_inventory':retention_apply.compact_authenticated_inventory(inv,NOW),
+              'candidate_ids':candidates,'keep_ids':sorted(set(inv['manifests'])-set(candidates)),'anchor_id':plan['anchor_id'],
+              'proof_sha256':{},'prepared_at':NOW.isoformat()}
+        intent={**body,'intent_sha256':retention_apply.document_digest(body)};recorded={'base':[],'binlog':[]};documents={}
+        for index in range(receipt_count):
+            absent=candidates[:len(candidates)*(index+1)//receipt_count]
+            receipt={k:copy.deepcopy(intent[k]) for k in ('operation','token','generation','repositories','source','inventory_sha256','candidate_ids','keep_ids','anchor_id','proof_sha256','intent_sha256')}
+            receipt.update(result='APPLIED' if index==receipt_count-1 else 'RECONCILED',observation_error=None,forgotten_ids=absent,
+                           present_candidate_ids=sorted(set(candidates)-set(absent)),post_inventory_sha256=str(index+1)*64,completed_at=NOW.isoformat())
+            documents[retention_apply.document_digest(receipt)]={'document':receipt}
+            existing={row['id'] for row in recorded['base']}
+            recorded['base']+=[row for row in retention_apply.retention_tombstones(intent,receipt) if row['id'] not in existing]
+        return intent,recorded,documents
+    def test_256_recorded_rows_derive_full_intent_once_per_unique_original_receipt(self):
+        for count in (1,2):
+            intent,recorded,documents=self.recorded_fixture(count)
+            with mock.patch.object(retention_apply,'retention_tombstones',wraps=retention_apply.retention_tombstones) as derive:
+                result=subject()._verify_recorded(intent,recorded,documents)
+            with self.subTest(receipts=count):
+                self.assertEqual(result,recorded['base']);self.assertEqual(len(result),256)
+                self.assertEqual(derive.call_count,count,'Whole intent hashing/indexing must grow with unique receipts, not journal rows')
+    def test_cached_original_receipt_proofs_still_reject_row_receipt_lane_and_duplicate_tampering(self):
+        intent,recorded,documents=self.recorded_fixture(2)
+        for mutation in ('row','receipt','missing','lane','duplicate'):
+            values=copy.deepcopy(recorded);proofs=copy.deepcopy(documents)
+            if mutation=='row':values['base'][-1]['post_inventory_sha256']='0'*64
+            elif mutation=='receipt':proofs[values['base'][-1]['receipt_sha256']]['document']['post_inventory_sha256']='0'*64
+            elif mutation=='missing':del proofs[values['base'][-1]['receipt_sha256']]
+            elif mutation=='lane':values['binlog'].append(values['base'].pop())
+            else:values['base'].append(copy.deepcopy(values['base'][0]))
+            with self.subTest(mutation=mutation),self.assertRaises(guards.GuardError):subject()._verify_recorded(intent,values,proofs)
     def test_thirty_day_intent_keeps_all_43200_ids_without_payload_duplication(self):
         inv,_,_=fixture();template=inv['snapshots'][-1];manifest=inv['manifests'][template['id']]
         for i in range(43200):
