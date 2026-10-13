@@ -58,7 +58,13 @@ def verify_restored_tree(target,payload_root,metadata,raw_manifest,inventory):
         key=prefix+'/'+name;guards.require(key not in expected,'Duplicate restored manifest file')
         expected[key]={'bytes':item['bytes'],'sha256':item['sha256']}
     actual=inventory(target)
-    guards.require(actual==[{'path':key,**expected[key]} for key in sorted(expected)],'Partial, changed or foreign restored tree')
+    guards.require(isinstance(actual,list) and all(isinstance(row,dict) and set(row)=={'path','bytes','sha256'} and
+                   isinstance(row['path'],str) for row in actual),'Malformed restored inventory')
+    # Worker inventories retain Path component order in historical manifests;
+    # e.g. widgets/file.js precedes widgets.js. Compare the same path order on
+    # both sides without changing manifest order or collapsing duplicate rows.
+    guards.require(sorted(actual,key=lambda row:row['path'])==[{'path':key,**expected[key]} for key in sorted(expected)],
+                   'Partial, changed or foreign restored tree')
     # Native absolute-path restore legitimately creates the scope's ancestors;
     # unrelated empty directories outside the payload are still unexpected.
     for path in target.rglob('*'):

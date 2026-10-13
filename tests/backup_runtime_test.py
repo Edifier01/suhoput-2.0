@@ -343,4 +343,48 @@ class ResticReadProofs(unittest.TestCase):
             listing=self.tree({**row,key:value},[{'message_type':'node','type':'file','path':'/isolated/payload/manifest.json','size':len(body)}])
             with self.subTest(key=key),self.assertRaises(guards.GuardError):restic_adapter.verify_tree_listing(listing,'d'*64,'/isolated/payload',row,body)
 
+class RestoredTreeOrderingTests(unittest.TestCase):
+    def fixture(self, directory):
+        import worker
+        target=pathlib.Path(directory);scope=pathlib.Path(target.anchor)/'isolated/payload'
+        payload=target/scope.relative_to(scope.anchor);js=payload/'wordpress/wp-admin/js'
+        (js/'widgets').mkdir(parents=True)
+        (js/'widgets.js').write_bytes(b'actual top-level widget source')
+        (js/'widgets/custom-html-widgets.js').write_bytes(b'actual nested widget source')
+        manifest={'files':worker.tree_inventory(payload)};raw=json.dumps(manifest).encode()
+        (payload/'manifest.json').write_bytes(raw)
+        worker.verify_payload(payload,manifest)
+        return target,scope,payload,manifest,raw
+
+    def test_worker_path_component_order_accepts_complete_wordpress_widgets_tree(self):
+        import worker
+        with tempfile.TemporaryDirectory() as directory:
+            target,scope,payload,manifest,raw=self.fixture(directory)
+            actual=worker.tree_inventory(target)
+            self.assertNotEqual(actual,sorted(actual,key=lambda row:row['path']))
+            self.assertEqual(restic_adapter.verify_restored_tree(target,str(scope),manifest,raw,worker.tree_inventory),payload)
+            worker.verify_payload(payload,manifest)  # Original manifest order is unchanged.
+
+    def test_canonical_order_still_rejects_missing_extra_corrupt_and_duplicate_files(self):
+        import worker
+        for mutation in ('missing','extra','corrupt','duplicate','malformed'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as directory:
+                target,scope,payload,manifest,raw=self.fixture(directory);inventory=worker.tree_inventory
+                path=payload/'wordpress/wp-admin/js/widgets.js'
+                if mutation=='missing':path.unlink()
+                elif mutation=='extra':(target/'outside-payload').write_bytes(b'foreign')
+                elif mutation=='corrupt':path.write_bytes(b'changed')
+                elif mutation=='duplicate':inventory=lambda root:worker.tree_inventory(root)+[worker.tree_inventory(root)[0]]
+                else:inventory=lambda root:[{'path':None,'bytes':1,'sha256':'a'*64}]
+                with self.assertRaises(guards.GuardError):restic_adapter.verify_restored_tree(target,str(scope),manifest,raw,inventory)
+
+    @unittest.skipUnless(__import__('os').name=='posix','Native symlink creation requires POSIX')
+    def test_canonical_order_still_rejects_symlink(self):
+        import worker
+        with tempfile.TemporaryDirectory() as directory:
+            target,scope,payload,manifest,raw=self.fixture(directory)
+            path=payload/'wordpress/wp-admin/js/widgets.js';original=path.read_bytes();path.unlink()
+            other=target/'other';other.write_bytes(original);path.symlink_to(other)
+            with self.assertRaises(guards.GuardError):restic_adapter.verify_restored_tree(target,str(scope),manifest,raw,worker.tree_inventory)
+
 if __name__=='__main__': unittest.main()
