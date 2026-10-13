@@ -366,11 +366,17 @@ class RetentionRecovery(Recovery):
     def ready(self):
         for attempt in range(100):
             try:
-                if self.sql('SELECT 1;').strip() == b'1': break
+                # The pinned entrypoint runs bootstrap SQL before exec'ing
+                # mariadbd as PID1. Its temporary server cannot qualify.
+                pid = self.w.native.run(['docker', 'exec', self.control, 'cat', '/proc/1/comm'])
+                if pid.strip() == b'mariadbd' and self.sql('SELECT 1;').strip() == b'1':
+                    # The image's temporary bootstrap server can disappear
+                    # between these reads. Only a complete safe pair is ready.
+                    guards.require(self.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;').strip() == b'OFF\t1\t0', 'Unsafe operational DB runtime')
+                    break
             except NativeError: pass
             time.sleep(.2)
         else: raise guards.GuardError('Operational DB did not start; preserved')
-        guards.require(self.sql('SELECT @@event_scheduler,@@skip_networking,@@log_bin;').strip() == b'OFF\t1\t0', 'Unsafe operational DB runtime')
 
     def state(self):
         body = self.sql("SELECT TABLE_NAME,ENGINE,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA='suhoput2_stage' ORDER BY TABLE_NAME; SELECT 'COLUMN',TABLE_NAME,COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='suhoput2_stage' ORDER BY TABLE_NAME,ORDINAL_POSITION;")

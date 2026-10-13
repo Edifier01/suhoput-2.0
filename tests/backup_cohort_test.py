@@ -589,9 +589,14 @@ class NativeCohortTests(unittest.TestCase):
         body=json.dumps(manifest).encode();(directory/'manifest.json').write_bytes(body);os.chmod(directory/'manifest.json',0o600)
         meta={'id':sid,'tree':'a'*64,'time':NOW.isoformat(),'paths':[str(self.root/'spool/binlog-payload')],
               'tags':['task047','generation:'+self.w.c['generation'],'token:'+'9'*32,'manifest-sha:'+hashlib.sha256(body).hexdigest()]}
-        self.catalog().admit('binlog',sid,meta,body,directory);self.native[sid]=('binlog',meta)
+        with mock.patch.object(catalog_tests.subject(),'dt',wraps=catalog_tests.subject().dt) as clock:
+            clock.datetime.now.return_value=NOW
+            self.catalog().admit('binlog',sid,meta,body,directory)
+        self.native[sid]=('binlog',meta)
         state=runtime.UploadJournal(self.root/'receipts/binlog',self.w.c['generation']).state()
-        state['confirmed'].append({'id':sid,'token':'9'*32,'manifest_sha256':hashlib.sha256(body).hexdigest()});runtime.atomic_json(self.root/'receipts/binlog/state.json',state)
+        state['confirmed'].append({'id':sid,'token':'9'*32,'manifest_sha256':hashlib.sha256(body).hexdigest(),
+                                  'captured_at':NOW.isoformat(),'prepared_at':NOW.isoformat(),'confirmed_at':NOW.isoformat()})
+        state.update(last_success_at=NOW.isoformat(),last_confirmation_at=NOW.isoformat());runtime.atomic_json(self.root/'receipts/binlog/state.json',state)
         return sid
     def append_base(self,filename):
         sid='a'*64;directory=self.root/'cache/new-base';directory.mkdir(mode=0o700)
@@ -601,9 +606,14 @@ class NativeCohortTests(unittest.TestCase):
         body=json.dumps(manifest).encode();(directory/'manifest.json').write_bytes(body);os.chmod(directory/'manifest.json',0o600)
         meta={'id':sid,'tree':'b'*64,'time':NOW.isoformat(),'paths':[str(self.root/'spool/base-payload')],
               'tags':['task047','generation:'+self.w.c['generation'],'token:'+'a'*32,'manifest-sha:'+hashlib.sha256(body).hexdigest()]}
-        self.catalog().admit('base',sid,meta,body,directory);self.native[sid]=('base',meta)
+        with mock.patch.object(catalog_tests.subject(),'dt',wraps=catalog_tests.subject().dt) as clock:
+            clock.datetime.now.return_value=NOW
+            self.catalog().admit('base',sid,meta,body,directory)
+        self.native[sid]=('base',meta)
         state=runtime.UploadJournal(self.root/'receipts/base',self.w.c['generation']).state()
-        state['confirmed'].append({'id':sid,'token':'a'*32,'manifest_sha256':hashlib.sha256(body).hexdigest()});runtime.atomic_json(self.root/'receipts/base/state.json',state)
+        state['confirmed'].append({'id':sid,'token':'a'*32,'manifest_sha256':hashlib.sha256(body).hexdigest(),
+                                  'captured_at':NOW.isoformat(),'prepared_at':NOW.isoformat(),'confirmed_at':NOW.isoformat()})
+        state.update(last_success_at=NOW.isoformat(),last_confirmation_at=NOW.isoformat());runtime.atomic_json(self.root/'receipts/base/state.json',state)
         return sid
     def test_load_accepts_admitted_arrival_returned_by_the_same_unfiltered_listing(self):
         import retention_cohort

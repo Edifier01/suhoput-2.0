@@ -106,7 +106,7 @@ class PreparedNativePhaseTests(unittest.TestCase):
              mock.patch.object(retention_cohort,'upload_section',section),mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',return_value={}):
             result=executor.run('apply')
         self.assertEqual(result['result'],'APPLIED');self.assertEqual(len(effects),2)
-        self.assertEqual(len(groups),4,'The changed preparation must release its group before refreshing')
+        self.assertEqual(len(groups),3,'Authenticated tail closes in the existing reserved group without an extra native preparation')
         self.assertEqual(result['protected_arrival_ids'],arrivals);self.assertIn(arrivals[0],case.native)
         self.assertEqual(len(store.phase_documents()),2)
 
@@ -196,9 +196,14 @@ class PreparedNativePhaseTests(unittest.TestCase):
         raw=json.dumps(manifest).encode();(target/'manifest.json').write_bytes(raw);(target/'manifest.json').chmod(0o600)
         meta={'id':sid,'tree':sid,'time':NOW.isoformat(),'paths':[str(case.root/'spool/binlog-payload')],
               'tags':['task047','generation:'+case.w.c['generation'],'token:'+token,'manifest-sha:'+hashlib.sha256(raw).hexdigest()]}
-        case.catalog().admit('binlog',sid,meta,raw,target);case.native[sid]=('binlog',meta)
+        with mock.patch.object(backup_catalog,'dt',wraps=backup_catalog.dt) as clock:
+            clock.datetime.now.return_value=NOW
+            case.catalog().admit('binlog',sid,meta,raw,target)
+        case.native[sid]=('binlog',meta)
         journal=case.root/'receipts/binlog/state.json';state=runtime.load_json(journal)
-        state['confirmed'].append({'id':sid,'token':token,'manifest_sha256':hashlib.sha256(raw).hexdigest()});runtime.atomic_json(journal,state);arrivals.append(sid)
+        state['confirmed'].append({'id':sid,'token':token,'manifest_sha256':hashlib.sha256(raw).hexdigest(),
+                                  'captured_at':NOW.isoformat(),'prepared_at':NOW.isoformat(),'confirmed_at':NOW.isoformat()})
+        state.update(last_success_at=NOW.isoformat(),last_confirmation_at=NOW.isoformat());runtime.atomic_json(journal,state);arrivals.append(sid)
 
     def test_authenticated_append_in_every_preparation_converges_and_keeps_every_arrival(self):
         case,_,executor,store,effects,evidence=self.case();audit=backup_catalog.ArchiveCatalog._checkpoint_inputs;arrivals=[]

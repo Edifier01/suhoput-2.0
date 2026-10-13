@@ -35,7 +35,7 @@ def native_view_digest(config,listed):
         digest.update(canonical(row));digest.update(b'\n')
     return digest.hexdigest()
 
-def verify_native_views(worker,expected,deadline):
+def verify_native_views(worker,expected,deadline,*,current=None,derived=None,reader=None):
     """Re-read unfiltered config and snapshots under the reserved group.
 
     The complete manifest/dependency audit and its exact protected authority
@@ -43,15 +43,104 @@ def verify_native_views(worker,expected,deadline):
     is projected away, and unknown or duplicate snapshots cannot inherit it.
     """
     guards.require(set(expected)=={'base','binlog'},'Prepared native views missing')
+    closed={};observed=None
+    indexed={row['id']:row for row in current['snapshots']} if current is not None else {}
+    fresh={row['id']:row for row in derived['snapshots'] if row['id'] not in indexed} if derived is not None else {}
     for lane in ('base','binlog'):
         def read(args):
             remaining=deadline-time.monotonic();guards.require(remaining>0,'Native critical inventory deadline exceeded')
             raw=worker.restic(lane,['--repo',worker.c['repositories'][lane],*args],timeout=remaining)
             guards.require(time.monotonic()<deadline,'Native critical inventory deadline exceeded');return decode(raw)
         config=read(['cat','config']);listed=read(['snapshots','--json'])
-        guards.require(native_view_digest(config,listed)==expected[lane],'Final unfiltered native inventory differs from prepared proof')
+        if derived is None:
+            guards.require(native_view_digest(config,listed)==expected[lane],'Final unfiltered native inventory differs from prepared proof')
+        else:
+            wanted={row['id'] for row in derived['snapshots'] if row['lane']==lane}
+            present={row['id'] for row in listed}
+            guards.require(not present-wanted,'Final unfiltered native contains an unknown or cross-lane arrival')
+            guards.require(len(listed)==len(wanted) and present==wanted,
+                           'Final unfiltered native differs: Prepared old complete native fields or authenticated tail missing')
+            guards.require(native_view_digest(config,[row for row in listed if row['id'] not in fresh])==expected[lane],
+                           'Final unfiltered native old fields or configuration changed')
+            for metadata in listed:
+                sid=metadata['id']
+                if sid not in fresh:continue
+                record=reader._record(sid)
+                native,token,md=backup_catalog.native_identity(metadata,sid,str(worker.root/'spool'/(lane+'-payload')),worker.c['generation'])
+                guards.require(record['native']==native and token==fresh[sid]['token'] and md==fresh[sid]['manifest_sha256'] and
+                               record['repository_id']==config['id'] and fresh[sid]['lane']==lane,
+                               'Final native tail differs from exact catalog admission')
+            closed[lane]=native_view_digest(config,listed)
+            observed=__import__('retention_cohort').clock()
         del config,listed
         guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')
+    if derived is not None:
+        guards.require(observed>=guards.utc(current['observed_at']),'Final native closure clock rollback')
+        return {**derived,'observed_at':observed.isoformat()},closed
+
+def authenticated_tail_inventory(worker,current,reader,journals,candidates,excluded=(),*,deadline=None):
+    """Local expected membership, never an observed native inventory.
+
+    At most 32 new ACKs may transfer a preparation. The frozen 900s proof and
+    existing work deadline remain stricter bounds. Larger tails require a new
+    outside preparation; they never enlarge the reserved native group.
+    """
+    import binlog,retention_cohort
+    def check():
+        if deadline is not None:guards.require(time.monotonic()<deadline,'Authenticated tail deadline exceeded')
+    indexed={row['id']:row for row in current['snapshots']};excluded=set(excluded);acks=[]
+    for lane,state in journals.items():
+        for ack in state['confirmed']:
+            if ack['id'] not in indexed and ack['id'] not in excluded:acks.append((lane,ack))
+    guards.require(len(acks)<=32 and len({ack['id'] for _,ack in acks})==len(acks),'Authenticated tail exceeds 32 unique admissions')
+    at=retention_cohort.clock();guards.require(0<=(at-guards.utc(current['observed_at'])).total_seconds()<=900,'Plan expired immediately: prepared native observation expired or clock rolled back')
+    fresh=[];manifests=dict(current['manifests'])
+    for lane,ack in acks:
+        check();sid=guards.hex_id(ack['id'],64);record=reader._record(sid)
+        native,token,md=backup_catalog.native_identity(record['native'],sid,str(worker.root/'spool'/(lane+'-payload')),worker.c['generation'])
+        raw=reader.raw_manifest(sid,deadline=deadline);m=decode(raw)
+        guards.require(record['id']==sid and record['lane']==lane and record['repository']==worker.c['repositories'][lane] and record['repository_id']==current['repositories'][lane] and
+                       token==record['token'] and md==record['manifest_sha256'] and {k:v for k,v in m.items() if k!='files'}==record['projection'] and
+                       m['source']==worker.source and m['generation']==worker.c['generation'] and m['format']==1,'Authenticated tail manifest/native admission differs')
+        guards.require(set(ack)=={'id','token','manifest_sha256','captured_at','prepared_at','confirmed_at'} and
+                       ack['token']==token and ack['manifest_sha256']==md,'Authenticated tail requires exact six-field ACK')
+        captured=guards.utc(m['captured_at']);uploaded=guards.utc(native['time']);verified=guards.utc(record['verified']['verified_at'])
+        guards.require(ack['captured_at']==m['captured_at'] and captured<=guards.utc(ack['prepared_at'])<=uploaded<=verified<=guards.utc(ack['confirmed_at'])<=at,
+                       'Authenticated tail causal ACK clock differs')
+        guards.hex_id(m['code_sha'],40);guards.require(m['kind'] in (('full','pre-update','hourly') if lane=='base' else ('binlog',)),'Authenticated tail lane/kind differs')
+        if lane=='base':guards.require(m['stage_app_sha']==worker.c['stage_app_sha'],'Authenticated tail application differs')
+        files=m['files'];full=sorted([*files,{'path':'manifest.json','bytes':len(raw),'sha256':md}],key=lambda item:item['path'])
+        guards.require(len(full)==record['verified']['file_count'] and sum(item['bytes'] for item in files)==record['verified']['payload_bytes'] and
+                       backup_catalog.digest(backup_catalog.canonical(full))==record['verified']['all_files_sha256'],'Authenticated tail actual all-file proof differs')
+        if lane=='binlog':
+            for item in m['logs']:
+                check();body=reader.binlog_bytes(sid,item['file'],deadline=deadline)
+                binlog.validate_chain({item['file']:body},[item],{'file':item['file'],'position':4},{'file':item['file'],'position':item['size']})
+                del body
+        fresh.append({'id':sid,'lane':lane,'token':token,'manifest_sha256':md,'kind':m['kind'],'generation':worker.c['generation'],
+                      'time':m['captured_at'],'snapshot_time':native['time'],'tree':native['tree']});manifests[sid]=record['projection']
+        del raw,m,files,full
+    guards.require(not set(candidates)&{row['id'] for row in fresh},'Authenticated tail overlaps frozen candidate')
+    rows=[*current['snapshots'],*fresh];all_rows={row['id']:row for row in rows}
+    guards.require(len({row['token'] for row in rows})==len(rows),'Authenticated tail duplicate token')
+    last=max((m['last_log'] for sid,m in current['manifests'].items() if indexed[sid]['lane']=='binlog'),default=0)
+    for row in sorted((row for row in fresh if row['lane']=='binlog'),key=lambda row:manifests[row['id']]['first_log']):
+        m=manifests[row['id']];guards.checked_logs(m['logs'])
+        guards.require(m['previous_count']==last and m['first_log']==last+1 and m['last_log']==guards.log_number(m['logs'][-1]['file']),
+                       'Authenticated tail appended chain differs');last=m['last_log']
+    last_deleted=max((manifests[sid]['last_log'] for sid in candidates if sid in all_rows and all_rows[sid]['lane']=='binlog'),default=0)
+    for row in fresh:
+        if row['lane']!='base':continue
+        m=manifests[row['id']];start=m['coordinates'];number=guards.log_number(start['file'])
+        descriptor=next((item for sid,manifest in manifests.items() if all_rows[sid]['lane']=='binlog' for item in manifest['logs'] if item['file']==start['file']),None)
+        guards.require(descriptor is not None and type(start['position']) is int and 4<=start['position']<=descriptor['size'] and last_deleted<number,
+                       'Authenticated tail base requires a frozen binlog candidate')
+        if row['kind']=='hourly':
+            full_id=guards.hex_id(m['full_id'],64);full=all_rows.get(full_id)
+            guards.require(full is not None and full_id not in candidates and full['kind'] in ('full','pre-update') and guards.utc(full['time'])<=guards.utc(row['time']) and
+                           all(m[key]==manifests[full_id][key] for key in ('source','stage_app_sha','application_sha256','configuration_sha256')),
+                           'Authenticated tail hourly dependency differs')
+    check();return {**current,'snapshots':rows,'manifests':manifests}
 
 def verify_reader_prefix(reader):
     """Recheck every cached old row/blob byte in short independent read batches."""
@@ -160,6 +249,49 @@ def reader_raw_prefix_seal(reader,*,head=None,verify=False,deadline=None):
         guards.require(db.execute('SELECT 1 FROM logs l LEFT JOIN archives a ON a.sid=l.sid WHERE a.sid IS NULL LIMIT 1').fetchone() is None,'Catalog foreign cached row')
     for item in ('end',boundary,logs):add(item)
     check();return value.hexdigest()
+
+def reader_projection_seal(reader,*,deadline=None):
+    """Bind borrowed mutable records and their dictionary keys without a copy."""
+    def records():
+        for sid,record in reader._records.items():
+            if deadline is not None:guards.require(time.monotonic()<deadline,'Catalog projection deadline exceeded')
+            guards.require(sid==record['id'],'Prepared catalog projection key changed')
+            yield record
+    return backup_catalog.ArchiveCatalog._records_digest(records(),deadline=deadline)
+
+def verify_reader_tail(reader,original_head,authenticated_ids,*,deadline):
+    """Conserve every live appended SQL row/blob through the closing LIST.
+
+    The old full raw seal covers the original prefix. Only this bounded
+    suffix is compared to the already authenticated borrowed tail records;
+    exact cached-log membership is checked as well as every compressed byte.
+    """
+    c=reader.catalog;head=reader.head;first=original_head['sequence'];last=head['sequence']
+    guards.require(head.get('checkpoint')==original_head.get('checkpoint') and 0<=last-first<=32,
+                   'Prepared live catalog tail exceeds 32 admissions or changed epoch')
+    allowed=set(authenticated_ids);previous=original_head['chain'];sequence=first
+    def check():guards.require(time.monotonic()<deadline,'Prepared live catalog tail deadline exceeded')
+    with reader._read_lock(deadline),c._db() as db:
+        check();guards.require(not c._incomplete() and c._head()==head,'Prepared live tail head or publication changed');c._tail(db,head)
+        for seq,sid,token,raw,body,chain in db.execute('SELECT sequence,sid,token,record,body,chain FROM archives WHERE sequence>? ORDER BY sequence',(first,)):
+            check();sequence+=1;record=reader._record(sid)
+            guards.require(seq==sequence and sid in allowed and record['id']==sid and token==record['token'] and
+                           isinstance(raw,bytes) and raw==backup_catalog.canonical(record) and isinstance(body,bytes) and
+                           len(body)<=backup_catalog.MAX_RAW_BYTES and hashlib.sha256(body).hexdigest()==record['raw_compressed_sha256'],
+                           'Prepared live tail row, ordinal or raw manifest bytes changed')
+            previous=hashlib.sha256(bytes.fromhex(previous)+raw).hexdigest()
+            guards.require(chain==previous,'Prepared live tail ordinal chain changed')
+            expected={item['file']:item for item in record['cached_logs']}
+            guards.require(len(expected)==len(record['cached_logs']),'Prepared live tail duplicate log descriptor')
+            for rowid,name,size,kind in db.execute('SELECT rowid,name,length(body),typeof(body) FROM logs WHERE sid=? ORDER BY name',(sid,)):
+                check();item=expected.pop(name,None)
+                guards.require(item is not None and kind=='blob' and
+                               c._cached_blob_seal(db,rowid,size,deadline=deadline)==item['compressed_sha256'],
+                               'Prepared live tail cached log membership or bytes changed')
+            guards.require(not expected,'Prepared live tail cached log missing')
+            del raw,body,record,expected
+        guards.require(sequence==last and previous==head['chain'],'Prepared live tail membership or head chain changed')
+        check();guards.require(c._head()==head and not c._incomplete(),'Prepared live tail changed during closing byte check');c._tail(db,head)
 
 def refresh_prepared_inventory(worker,current,views,reader,candidates,at):
     """Transfer the old complete audit; validate only authenticated appended IDs.

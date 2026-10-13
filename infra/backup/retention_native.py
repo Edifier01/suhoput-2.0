@@ -434,20 +434,22 @@ def verified_tombstones(worker):
     """Only complete global publication authorizes ordinary reader absences."""
     rows,_=_retirements(worker);return rows
 
-def _confirmed_active(worker,current,intent,absent,store):
+def _confirmed_active(worker,current,intent,absent,store,*,_tail=None):
     """Pending absence is internal to this exact protected live attempt only."""
     committed,partial=_retirements(worker,store)
     original={row['id']:row for row in intent['before_inventory']['snapshots']};absent=set(absent)
     guards.require(absent<=set(intent['candidate_ids']) and absent<=set(original),'Unknown active absence')
     guards.require(all(row['id'] in absent for row in partial),'Partial journal does not match actual active absence')
+    journals={lane:runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state() for lane in ('base','binlog')}
+    expected=current if _tail is None else _tail(current,journals,{row['id'] for row in committed}|absent)
     for lane in ('base','binlog'):
-        state=runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state()
+        state=journals[lane]
         confirmed={row['id']:(row['token'],row['manifest_sha256']) for row in state['confirmed']}
         guards.require(len(confirmed)==len(state['confirmed']),'Duplicate active confirmation')
         retired={row['id']:(row['token'],row['manifest_sha256']) for row in committed if row['lane']==lane}
         active={sid:(original[sid]['token'],original[sid]['manifest_sha256']) for sid in absent if original[sid]['lane']==lane}
         guards.require(not set(retired)&set(active) and all(confirmed.get(sid)==value for sid,value in {**retired,**active}.items()),'Active original confirmation differs')
-        actual={row['id']:(row['token'],row['manifest_sha256']) for row in current['snapshots'] if row['lane']==lane}
+        actual={row['id']:(row['token'],row['manifest_sha256']) for row in expected['snapshots'] if row['lane']==lane}
         guards.require({sid:value for sid,value in confirmed.items() if sid not in retired and sid not in active}==actual,'Unknown active confirmation/native arrival')
 
 class StagedPublication:
@@ -463,12 +465,13 @@ class StagedPublication:
         finally:
             if self.timing is not None:self.timing['staging_seconds']+=time.monotonic()-started
     def _stage(self,value):
-        w=self.w;store=self.store;intent=store.load();staging=StagedFiles(w.root)
+        w=self.w;store=self.store;store.ensure_work();intent=store.load();staging=StagedFiles(w.root)
         name='receipt-'+uuid.uuid4().hex+'.json';receipt_path=staging.json(name,value)
         documents=_receipt_documents(store);key=retention_apply.document_digest(value)
         documents[key]={'document':value,'file':name,'sha256':sha(receipt_path)}
         sources={};states={};row_hashes={};refs=set()
         for lane in ('base','binlog'):
+            store.ensure_work()
             source=private_path(w.root/'receipts'/lane/'state.json');raw=source.read_bytes();sources[lane]=hashlib.sha256(raw).hexdigest()
             target=staging.root/lane;target.mkdir(mode=0o700);state_path=target/'state.json'
             with open(state_path,'xb') as output:output.write(raw);output.flush();os.fsync(output.fileno())
@@ -478,6 +481,7 @@ class StagedPublication:
             state=journal.state();own=[row for row in state.get('retention',[]) if row['intent_sha256']==intent['intent_sha256']]
             row_hashes[lane]=retention_apply.document_digest(own);refs.update(row['receipt_sha256'] for row in own)
             del state,own,raw
+            store.ensure_work()
             guards.require(sha(source)==sources[lane],'Journal changed during outside-lock staging');states[lane]=state_path
         refs.add(key)
         marker={'no_deletion':True} if value['result']=='NOOP' else {
@@ -485,6 +489,7 @@ class StagedPublication:
             'receipt_ref':{field:documents[key][field] for field in ('file','sha256')},'retirement_sha256':row_hashes,
             'receipt_refs':{ref:{field:documents[ref][field] for field in ('file','sha256')} for ref in refs}}
         latest=staging.json('latest.json',{'file':name,'sha256':sha(receipt_path)});commit=staging.json('journals-committed.json',marker)
+        store.ensure_work()
         self.prepared={'value':value,'staging':staging,'name':name,'receipt':receipt_path,'states':states,'sources':sources,'latest':latest,'commit':commit}
     def __call__(self,value):
         if value['result']=='RECONCILE_REQUIRED':self.store.receipt(value);return
@@ -636,7 +641,7 @@ class NativeApply:
         return receipt
     def _attempt(self,catalog,directory,mode,timing,scan_started):
         """End the lifetime of all heavy attempt views before checkpoint starts."""
-        import retention,retention_cohort,time
+        import retention,retention_cohort,backup_catalog,time
         w=self.w
         with catalog.open_reader() as reader:
             ids=retention_cohort.repository_ids(w)
@@ -644,15 +649,15 @@ class NativeApply:
             critical_deadline=[None]
             active_phase=[None]
             prepared_inputs=[None];phase_budget=[None];prepared_native={};prepared_current=[None];journal_prefix=[None];fixed_authorities=[None]
+            # This closure-owned frame cannot be granted by a copied inventory
+            # or a JSON field. The actual outside view remains untouched.
+            native_frame=[None]
             ordinal=[0];outside_reads={}
             def charge_native_read():
                 if w.c.get('retention_readiness_policy')!='native-v2':return
                 used=outside_reads.get(ordinal[0],0)
                 guards.require(used<4,'Four outside native observations exhausted for durable phase')
                 outside_reads[ordinal[0]]=used+1
-            def refresh_tail(current,intent):
-                charge_native_read()
-                return retention.refresh_prepared_inventory(w,current,prepared_native,current_reader[0],intent['candidate_ids'],retention_cohort.clock())
             def read():
                 started=time.monotonic()
                 try:
@@ -660,7 +665,15 @@ class NativeApply:
                     current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
                     prepared_native.clear()
                     result=retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0],reader_out=current_reader,native_views=prepared_native)
-                    prepared_current[0]=result;return result
+                    working=dict(result) if w.c.get('retention_readiness_policy')=='native-v2' else result
+                    if w.c.get('retention_readiness_policy')=='native-v2':
+                        sealed_reader=current_reader[0]
+                        native_frame[0]={'owner':working,'actual':result,'digest':retention_cohort._observation_digest(result),
+                            'reader':sealed_reader,'head':copy.deepcopy(sealed_reader.head),
+                            'raw':retention.reader_raw_prefix_seal(sealed_reader,verify=True),
+                            'records':retention.reader_projection_seal(sealed_reader),
+                            'expected':working,'excluded':set()}
+                    prepared_current[0]=working;return working
                 finally:
                     if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
             from contextlib import contextmanager
@@ -695,53 +708,81 @@ class NativeApply:
                 after=_phase_input_bytes(catalog)
                 if before!=after:
                     journals=_phase_journals(catalog,after)
-                    transferred=prepared_current[0] is not None and _prepared_append(catalog,before,after,prior,journals,prepared_current[0],current_reader[0])
-                    unchanged=set(before)==set(after) and all(before[key]==after[key] for key in before if key not in mutable)
-                    appended=any(len(journals[lane]['confirmed'])>prior[lane]['count'] for lane in ('base','binlog'))
-                    if not transferred and unchanged and appended and prepared_current[0] is not None:
-                        intent=getattr(store,'staged_intent',None) or store.load();current=prepared_current[0]
-                        refreshed,views,fresh_reader=refresh_tail(current,intent)
-                        current.clear();current.update(refreshed);prepared_native.clear();prepared_native.update(views);current_reader[0]=fresh_reader
-                        if hasattr(store,'prepared_authority'):
-                            _,phases,files=store.prepared_authority;key=next(reversed(phases));filename='phase-'+key+'.json'
-                            if not (store.root/filename).exists():
-                                phase=phases[key];baseline={row['id'] for row in intent['before_inventory']['snapshots']}
-                                phase.update(native_inventory_sha256=retention.inventory_digest(current),authorized_at=retention_cohort.clock().isoformat(),
-                                             arrival_rows=[row for row in current['snapshots'] if row['id'] not in baseline],catalog_head=copy.deepcopy(fresh_reader.head))
-                                phase['phase_sha256']=retention_apply.document_digest({key:value for key,value in phase.items() if key!='phase_sha256'})
-                                raw=(json.dumps(phase,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
-                                guards.require(len(raw)<=1024**2,'Refreshed phase witness too large');files[filename]=hashlib.sha256(raw).hexdigest()
-                        if publication.prepared is not None:
-                            value=publication.prepared['value'];baseline={row['id'] for row in intent['before_inventory']['snapshots']}
-                            value.update(post_inventory_sha256=retention.inventory_digest(current),completed_at=retention_cohort.clock().isoformat(),
-                                         protected_arrival_ids=sorted(set(value['protected_arrival_ids'])|{row['id'] for row in current['snapshots'] if row['id'] not in baseline}))
-                            publication.stage(value)
-                        after=_phase_input_bytes(catalog);journals=_phase_journals(catalog,after)
-                        transferred=_prepared_append(catalog,before,after,prior,journals,current,fresh_reader)
-                    if transferred and publication.prepared is not None:
+                    frame=native_frame[0]
+                    if frame is not None and prepared_current[0] is frame['owner']:
+                        current_reader[0]=current_reader[0].refresh()
                         intent=getattr(store,'staged_intent',None) or store.load()
-                        current=prepared_current[0];value=publication.prepared['value'];current_sha=retention.inventory_digest(current)
-                        if value['post_inventory_sha256']!=current_sha:
-                            # Confirmation can refresh after observation but
-                            # before stage(); retain that exact final view in
-                            # the receipt and both staged journals as well.
-                            baseline={row['id'] for row in intent['before_inventory']['snapshots']}
-                            value.update(post_inventory_sha256=current_sha,completed_at=retention_cohort.clock().isoformat(),
-                                         protected_arrival_ids=sorted(set(value['protected_arrival_ids'])|{row['id'] for row in current['snapshots'] if row['id'] not in baseline}))
-                            publication.stage(value);after=_phase_input_bytes(catalog);journals=_phase_journals(catalog,after)
-                            transferred=_prepared_append(catalog,before,after,prior,journals,current,current_reader[0])
+                        frame['expected']=retention.authenticated_tail_inventory(w,frame['actual'],current_reader[0],journals,intent['candidate_ids'],frame['excluded'])
+                    transferred=prepared_current[0] is not None and _prepared_append(catalog,before,after,prior,journals,frame['expected'] if frame else prepared_current[0],current_reader[0])
                     if not transferred:
                         raise retention_apply.PhasePreparationChanged('Read-only phase authority advanced')
                 prepared_inputs[0]=after
+                if native_frame[0] is not None:
+                    native_frame[0]['journals']={lane:_journal_prefix_seal(state) for lane,state in _phase_journals(catalog,after).items()}
             def verify_prepared(expected):
-                if _phase_input_bytes(catalog,critical_deadline[0])!=prepared_inputs[0]:
+                frame=native_frame[0];deadline=critical_deadline[0]
+                guards.require(frame is not None and expected is frame['owner'] and expected is prepared_current[0],
+                               'Prepared tail owner changed or copied')
+                guards.require(retention_cohort._observation_digest(frame['actual'])==frame['digest'] and
+                               retention_cohort._observation_digest(expected)==frame['digest'],'Prepared outside projection changed')
+                before=prepared_inputs[0];inputs=_phase_input_bytes(catalog,deadline)
+                journals=_phase_journals(catalog,inputs)
+                intent=getattr(store,'staged_intent',None) or store.load()
+                current_reader[0]=current_reader[0].refresh(deadline=deadline)
+                derived=retention.authenticated_tail_inventory(w,frame['actual'],current_reader[0],journals,intent['candidate_ids'],frame['excluded'],deadline=deadline)
+                if inputs!=before and not _prepared_append(catalog,before,inputs,frame['journals'],journals,derived,current_reader[0]):
                     raise retention_apply.PhasePreparationChanged('Phase authority advanced before reservation')
+                original_ids={row['id'] for row in frame['actual']['snapshots']}
+                tail_seals={row['id']:(row,retention_apply.document_digest(row),retention_apply.document_digest(current_reader[0]._record(row['id'])))
+                            for row in derived['snapshots'] if row['id'] not in original_ids}
                 started=time.monotonic()
-                try:retention.verify_native_views(w,prepared_native,critical_deadline[0])
+                try:closed,views=retention.verify_native_views(w,prepared_native,deadline,current=frame['actual'],derived=derived,reader=current_reader[0])
                 finally:
                     if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
-                guards.require(_phase_input_bytes(catalog,critical_deadline[0])==prepared_inputs[0],'Phase authority changed inside reserved group')
+                guards.require(retention.reader_raw_prefix_seal(current_reader[0],head=frame['head'],deadline=deadline)==frame['raw'] and
+                               retention.reader_projection_seal(frame['reader'],deadline=deadline)==frame['records'] and
+                               retention_cohort._observation_digest(frame['actual'])==frame['digest'],'Prepared old raw/body or projection authority changed')
+                guards.require(all(retention_apply.document_digest(row)==row_seal and retention_apply.document_digest(current_reader[0]._record(sid))==record_seal
+                                   for sid,(row,row_seal,record_seal) in tail_seals.items()),'Authenticated tail memory changed during final native observation')
+                retention.verify_reader_tail(current_reader[0],frame['head'],tail_seals,deadline=deadline)
+                guards.require(_phase_input_bytes(catalog,deadline)==inputs,'Phase authority changed inside reserved group')
+                baseline={row['id'] for row in intent['before_inventory']['snapshots']}
+                if hasattr(store,'prepared_authority'):
+                    _,phases,files=store.prepared_authority;key=next(reversed(phases));filename='phase-'+key+'.json'
+                    if not (store.root/filename).exists():
+                        phase=phases[key]
+                        guards.require(retention_apply.document_digest({k:v for k,v in phase.items() if k!='phase_sha256'})==phase['phase_sha256'],
+                                       'Unpublished phase witness changed before closure')
+                        pending_raw=(json.dumps(phase,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+                        guards.require(hashlib.sha256(pending_raw).hexdigest()==files[filename],
+                                       'Unpublished phase memory differs from original staged seal')
+                        phase.update(native_inventory_sha256=retention.inventory_digest(closed),authorized_at=closed['observed_at'],
+                                     arrival_rows=[row for row in closed['snapshots'] if row['id'] not in baseline],catalog_head=copy.deepcopy(current_reader[0].head))
+                        phase['phase_sha256']=retention_apply.document_digest({k:v for k,v in phase.items() if k!='phase_sha256'})
+                        raw=(json.dumps(phase,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+                        guards.require(len(raw)<=1024**2,'Closed phase witness too large');files[filename]=hashlib.sha256(raw).hexdigest()
+                if publication.prepared is not None:
+                    value=publication.prepared['value'];current_sha=retention.inventory_digest(closed)
+                    pending_raw=(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+                    guards.require(sha(private_path(publication.prepared['receipt']))==hashlib.sha256(pending_raw).hexdigest(),
+                                   'Unpublished receipt memory differs from staged bytes')
+                    if value['post_inventory_sha256']!=current_sha:
+                        value.update(post_inventory_sha256=current_sha,completed_at=closed['observed_at'],
+                                     protected_arrival_ids=sorted(set(value['protected_arrival_ids'])|{row['id'] for row in closed['snapshots'] if row['id'] not in baseline}))
+                        publication.stage(value)
+                expected.clear();expected.update(closed);prepared_native.clear();prepared_native.update(views)
+                prepared_inputs[0]=inputs;store.ensure_work()
+                guards.require(_phase_input_bytes(catalog,deadline)==inputs,'Phase authority changed during closure durability staging')
                 if phase_budget[0] is not None:phase_budget[0]()
+            def pre_phase(current,intent,absent):
+                def tail(actual,journals,excluded):
+                    frame=native_frame[0]
+                    guards.require(frame is not None and actual is frame['owner'],'Prepared tail owner changed or copied')
+                    current_reader[0]=current_reader[0].refresh()
+                    frame['excluded']=excluded
+                    frame['expected']=retention.authenticated_tail_inventory(w,frame['actual'],current_reader[0],journals,intent['candidate_ids'],excluded)
+                    return frame['expected']
+                _confirmed_active(w,current,intent,absent,store,**({'_tail':tail} if w.c.get('retention_readiness_policy')=='native-v2' else {}))
             @contextmanager
             def section(name):
                 # Native work ends before the reserved durability and
@@ -783,7 +824,7 @@ class NativeApply:
                 store.work_deadline=lambda:critical_deadline[0]
                 publication=StagedPublication(w,store,timing)
                 ex=retention_apply.Executor(read,ExactRunner(w,store.load),store,publication,w.c['repositories'],clock=retention_cohort.clock,
-                     phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store),
+                     phase_section=section,pre_phase=pre_phase,
                      **({'phase_preparation':preparation,'phase_verify':verify_prepared} if w.c.get('retention_readiness_policy')=='native-v2' else {}))
                 try:receipt=ex.reconcile(retention_cohort.clock())
                 finally:
@@ -816,15 +857,6 @@ class NativeApply:
                     effect_started=time.monotonic()
                     try:return runner(lane,argv)
                     finally:timing['effect_seconds']+=time.monotonic()-effect_started
-                def pre_phase(current,intent,absent):
-                    try:_confirmed_active(w,current,intent,absent,store)
-                    except guards.GuardError as error:
-                        if policy!='native-v2' or str(error)!='Unknown active confirmation/native arrival':raise
-                        refreshed,views,fresh_reader=refresh_tail(current,intent)
-                        current.clear();current.update(refreshed);prepared_native.clear();prepared_native.update(views);current_reader[0]=fresh_reader
-                        # Refresh is not confirmation authority: the actual full
-                        # protected retirement/journal validator must pass again.
-                        _confirmed_active(w,current,intent,absent,store)
                 if policy=='native-v2' and plan['candidates']:
                     phase_budget[0]=lambda:readiness_v2.revalidate_budget(w,evidence,at=retention_cohort.clock())
                 ex=retention_apply.Executor(read,effect,store,publication,w.c['repositories'],clock=retention_cohort.clock,

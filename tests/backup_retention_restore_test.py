@@ -26,6 +26,65 @@ def fixture():
     return inv,plan,logs,reader,raw
 
 class OperationalRestoreTests(unittest.TestCase):
+    def test_readiness_rechecks_pair_after_bootstrap_server_restarts(self):
+        m=subject();recovery=object.__new__(m.RetentionRecovery);recovery.control='isolated-control'
+        sql=mock.Mock(side_effect=[b'1\n',m.NativeError('command'),m.NativeError('command'),b'1\n',b'OFF\t1\t0\n'])
+        recovery.w=types.SimpleNamespace(sql=sql,native=types.SimpleNamespace(run=mock.Mock(return_value=b'mariadbd\n')))
+        with mock.patch.object(m.time,'sleep') as sleep:recovery.ready()
+        self.assertEqual([call.args[0] for call in sql.call_args_list],[
+            'SELECT 1;','SELECT @@event_scheduler,@@skip_networking,@@log_bin;',
+            'SELECT 1;','SELECT 1;','SELECT @@event_scheduler,@@skip_networking,@@log_bin;'])
+        self.assertTrue(all(call.kwargs=={'container':recovery.control} for call in sql.call_args_list))
+        self.assertEqual(sleep.call_args_list,[mock.call(.2),mock.call(.2)])
+
+    def test_readiness_safety_connection_loss_keeps_original_attempt_limit(self):
+        m=subject();recovery=object.__new__(m.RetentionRecovery);queries=[]
+        def sql(query):
+            queries.append(query)
+            if query=='SELECT 1;':return b'1'
+            raise m.NativeError('command')
+        recovery.sql=sql
+        recovery.control='isolated-control';recovery.w=types.SimpleNamespace(native=types.SimpleNamespace(run=mock.Mock(return_value=b'mariadbd\n')))
+        with mock.patch.object(m.time,'sleep') as sleep,self.assertRaisesRegex(guards.GuardError,'Operational DB did not start; preserved'):
+            recovery.ready()
+        self.assertEqual(queries.count('SELECT 1;'),100)
+        self.assertEqual(queries.count('SELECT @@event_scheduler,@@skip_networking,@@log_bin;'),100)
+        self.assertEqual(sleep.call_args_list,[mock.call(.2)]*100)
+
+    def test_readiness_unsafe_flags_refuse_without_retry(self):
+        m=subject()
+        for unsafe in (b'ON\t1\t0',b'OFF\t0\t0',b'OFF\t1\t1'):
+            recovery=object.__new__(m.RetentionRecovery);recovery.sql=mock.Mock(side_effect=[b'1',unsafe])
+            recovery.control='isolated-control';recovery.w=types.SimpleNamespace(native=types.SimpleNamespace(run=mock.Mock(return_value=b'mariadbd\n')))
+            with self.subTest(flags=unsafe),mock.patch.object(m.time,'sleep') as sleep,self.assertRaisesRegex(guards.GuardError,'Unsafe operational DB runtime'):
+                recovery.ready()
+            self.assertEqual(recovery.sql.call_count,2);sleep.assert_not_called()
+
+    def test_readiness_does_not_accept_safe_queries_on_temporary_bootstrap_pid(self):
+        m=subject();recovery=object.__new__(m.RetentionRecovery);recovery.control='isolated-control'
+        native=mock.Mock(side_effect=[b'bash\n',b'mariadbd\n']);sql=mock.Mock(side_effect=[b'1',b'OFF\t1\t0'])
+        recovery.w=types.SimpleNamespace(sql=sql,native=types.SimpleNamespace(run=native))
+        with mock.patch.object(m.time,'sleep') as sleep:recovery.ready()
+        self.assertEqual(native.call_args_list,[mock.call(['docker','exec',recovery.control,'cat','/proc/1/comm'])]*2)
+        self.assertEqual(sql.call_count,2);sleep.assert_called_once_with(.2)
+
+    def test_readiness_retries_transient_pid_read_before_sql(self):
+        m=subject();recovery=object.__new__(m.RetentionRecovery);recovery.control='isolated-control'
+        native=mock.Mock(side_effect=[m.NativeError('command'),b'mariadbd\n']);sql=mock.Mock(side_effect=[b'1',b'OFF\t1\t0'])
+        recovery.w=types.SimpleNamespace(sql=sql,native=types.SimpleNamespace(run=native))
+        with mock.patch.object(m.time,'sleep') as sleep:recovery.ready()
+        self.assertEqual(native.call_count,2);self.assertEqual(sql.call_count,2);sleep.assert_called_once_with(.2)
+
+    def test_readiness_unknown_or_unavailable_pid_never_queries_sql_and_stays_bounded(self):
+        m=subject()
+        for pid in (b'bash\n',b'unknown\n',b'mysqld\n',b'mariadbd-extra\n',m.NativeError('timeout')):
+            recovery=object.__new__(m.RetentionRecovery);recovery.control='isolated-control'
+            native=mock.Mock(side_effect=pid) if isinstance(pid,Exception) else mock.Mock(return_value=pid)
+            sql=mock.Mock();recovery.w=types.SimpleNamespace(sql=sql,native=types.SimpleNamespace(run=native))
+            with self.subTest(pid=pid),mock.patch.object(m.time,'sleep') as sleep,self.assertRaisesRegex(guards.GuardError,'Operational DB did not start; preserved'):
+                recovery.ready()
+            self.assertEqual(native.call_count,100);sql.assert_not_called();self.assertEqual(sleep.call_args_list,[mock.call(.2)]*100)
+
     def test_plan_uses_fixed_profile_token_targets_and_rejects_arbitrary_paths(self):
         m=subject();inv,plan,_,_,_=fixture();m.validate_plan(plan,inv,'tip')
         target=m.targets(plan)

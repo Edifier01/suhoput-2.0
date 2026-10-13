@@ -496,6 +496,15 @@
 
 ## Доказательства исполнения
 
+<a id="exec-chk-074"></a>
+### EXEC-CHK-074 — TASK-047: actual native closure и final MariaDB readiness
+
+13.10.2026 21:06–21:34UTC, основа d91d24353f6e94bd36d80a8b239a31d8980bfba9, рабочая копия отличается. Actual V5 FAIL20:42:38 до native forget сохранён без повторных effects: native LIST фиксировал членство раньше ответа, а genuine ACK/catalog admission уже завершился. Native-v2 теперь сохраняет actual observation отдельно от derived authenticated tail и закрывает exact expected set полным actual native read под исходными locks. Reseal касается только unpublished witnesses/journals/receipt; durable intent, candidates, прошлые phases и900s сохраняются. Независимое ревью дополнительно воспроизвело P1: изменение новых live manifest/log bytes во время LIST раньше пропускало первый forget. После LIST добавлен bounded≤32 live-tail raw/ordinal/token/chain/manifest/exact-log-membership/body контроль до первого effect. Independent direct-SQLite RED212508 → GREEN213358,2tests/0.494s/no effects. Старый FAIL и raw сохраняются, не переименованы в PASS.
+
+Final frozen source: retention f49dd00d22dbe0793552a9b0c8ebeb0e7e44329946c488e2ed26707c0afc5ce1; native f9ad13ec4e970ebd70f5c79f0993f0814ad05b447b52bb77d0619b3edefc5ac6; tail-tests747d6c2a5cd182a69025b57a5f13eda30ca98fd6e962da677078e5c3e5e40c94. Шесть committed corruption cases RED213032 →118 scoped tests/no skips PASS28.142s213153. Ранние raw-body probes ошибочно отклоняли read-only UPDATE, их доказательственная роль отозвана; новые probes явно commit. Полный608Linux/no skips PASS47.063s213356, Python3.12.14/root/networknone/768MiB/1CPU; raw `task047-all-backup-linux-20261013-213356.local.json` SHA1e82353506f1e823d7518de0830d6dfd0d00945e654a65941b5e3bbecb28d8b7, все50 raw source hashes повторно совпали. Независимое cross-read не оставило существенных замечаний; actual44k timing/lag/resource ещё требует NEW trial. Дополнительных native views/per-SID S3 reads и увеличения45work/55physical/4outside/256/900 нет.
+
+Actual d91 anchor restore FAIL20:41:54 произошёл до import/replay: временный MariaDB bootstrap-server успел ответить SELECT1 и завершился перед safety query. Target/intent сохранены без повтора. Теперь готовность требует PID1 `mariadbd` перед обеими SELECT1/safety-OFF checks; transient failures расходуют исходные100attempts/.2s, unsafe flags немедленно блокируют, import/replay не повторяются. Путь доказан исходником pinned MariaDB10.11.19 entrypoint SHAe0ddaa7901a30c051487c5e8a31ff40edcf5c47bffe8f355c5227c9a4e8fcd9a: temporary child до финального exec. Restore source7c4195ef3e87b034343bebbdfc8529d1fc719539a8415b262b3f111e168dfd3c;35Linux GREEN205821 и independent34/no skips GREEN210000. 180s относится к metadata-preflight, не wall-time readiness. Свежий actual anchor после rollout ещё обязателен. Full template22:15UTC/Persistentfalse/daily86400/separation≥15min; installedd91 пока21:15/all4off. Native/replay, protected budget, четыре calendar triggers и оба exact-final-head CI пока не завершены; TASK-047 остаётся in_progress.
+
 <a id="exec-chk-073"></a>
 ### EXEC-CHK-073 — TASK-047: повторное подтверждение native observation
 

@@ -1,5 +1,9 @@
 # Архитектура
 
+Для native-v2 retention фаз actual observed native set и derived expected ACK tail имеют разные роли. Первый сохраняет настоящий состав, время и complete metadata/config digests; второй разрешает только authenticated append к прежнему raw catalog/journal prefix. Перед эффектом полный native read под исходной группой locks проверяет exact union, прежние full fields и новые admitted identities/dependencies. Unpublished witnesses/journals закрываются на этот actual результат, durable прошлые phases не меняются. Лимиты и доказательства — [DEC-029](DECISIONS.md#dec-029), текущее выполнение — [STATUS](STATUS.md).
+
+После финального native read отдельно перечитываются live catalog bytes не более32 новых tail admissions: raw record, manifest, exact log membership/body и chain/ordinal/token. Их прежний raw-prefix seal не покрывает; in-memory projected digest недостаточен. Несовпадение блокирует до reseal, intent и первого effect, в той же исходной критической секции без новых native/S3 reads.
+
 Назначение: краткая карта утверждённого устройства, ответственности и ещё не доказанных возможностей. Полные требования и таблицы переходов — в [SPEC](SPEC.md#архитектура-и-границы-компонентов), реализация и оперативная готовность — в [STATUS](STATUS.md).
 
 ## Статус решений и реализации
