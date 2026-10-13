@@ -51,8 +51,54 @@ class CohortBoundaryTests(unittest.TestCase):
         def cleanup():
             finish.set()
             if busy:thread.join(5);self.assertFalse(thread.is_alive());self.assertEqual(errors,[])
+        lock.complete=cleanup
         self.addCleanup(cleanup)
         return sid,lock,waits
+
+    def test_producer_completion_between_pending_exists_read_or_job_probe_is_authenticated(self):
+        for transition in ('pending-read','free-job','already-completed'):
+            with self.subTest(transition=transition):
+                case=self.case();_,_,_,current=self.loaded(case);sid,lock,waits=self.flight(case)
+                original=retention_cohort.private_path;completed=[]
+                def path(p,*args,**kwargs):
+                    selected=case.root/('receipts/binlog/pending.json' if transition=='pending-read' else 'receipts/job-binlog.lock')
+                    if pathlib.Path(p)==selected and not completed:lock.complete();completed.append(True)
+                    return original(p,*args,**kwargs)
+                metadata=copy.deepcopy(case.native[sid][1])
+                with case.catalog().open_reader() as reader,mock.patch.object(retention_cohort,'private_path',path):
+                    if transition=='already-completed':lock.complete();completed.append(True)
+                    updated=retention_cohort._settle_producer(case.w,reader,current['snapshots']._observation.flight,unknown=[('binlog',metadata)])
+                    self.assertIn(sid,updated._records)
+                self.assertTrue(completed);self.assertFalse(waits)
+
+    def test_disappeared_pending_without_admission_and_ack_remains_unknown(self):
+        case=self.case();_,_,_,current=self.loaded(case);sid,lock,_=self.flight(case,failed=True);metadata=copy.deepcopy(case.native[sid][1]);original=retention_cohort.private_path
+        def path(p,*args,**kwargs):
+            if pathlib.Path(p)==case.root/'receipts/binlog/pending.json':
+                lock.complete();pathlib.Path(p).unlink(missing_ok=True)
+            return original(p,*args,**kwargs)
+        with case.catalog().open_reader() as reader,mock.patch.object(retention_cohort,'private_path',path),self.assertRaises(guards.GuardError):
+            retention_cohort._settle_producer(case.w,reader,current['snapshots']._observation.flight,unknown=[('binlog',metadata)])
+
+    def test_no_unknown_completed_ack_before_pending_unlink_is_bound_to_owned_capture(self):
+        for mutation in ('valid','ownership','payload','ack-clock'):
+            with self.subTest(mutation=mutation):
+                case=self.case();_,_,_,current=self.loaded(case);sid,lock,_=self.flight(case)
+                path=case.root/'receipts/binlog/pending.json';pending=runtime.load_json(path);lock.complete();runtime.atomic_json(path,pending)
+                original=retention_cohort.private_path
+                def read(p,*args,**kwargs):
+                    if pathlib.Path(p)==path:path.unlink(missing_ok=True)
+                    return original(p,*args,**kwargs)
+                if mutation=='ownership':runtime.atomic_json(case.root/'spool/binlog-payload/.capture.json',{'foreign':True})
+                if mutation=='payload':(case.root/'spool/binlog-payload/logs/suhoput2-binlog.000003').write_bytes(b'changed')
+                if mutation=='ack-clock':
+                    state=runtime.load_json(case.root/'receipts/binlog/state.json');state['confirmed'][-1]['prepared_at']=(backup_cohort_test.NOW+dt.timedelta(seconds=1)).isoformat()
+                    runtime.atomic_json(case.root/'receipts/binlog/state.json',state)
+                with case.catalog().open_reader() as reader,mock.patch.object(retention_cohort,'private_path',read),contextlib.ExitStack() as stack:
+                    self.assertIn(sid,reader._records)
+                    if mutation!='valid':stack.enter_context(self.assertRaises(guards.GuardError))
+                    updated=retention_cohort._settle_producer(case.w,reader,current['snapshots']._observation.flight)
+                    if mutation=='valid':self.assertEqual(updated.head,reader.head)
 
     def test_producer_wait_rejects_abandoned_foreign_failed_or_second_flight(self):
         for mutation in ('free-job','token','capture','payload','failed','second','old-body','timeout'):

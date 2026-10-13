@@ -20,29 +20,95 @@ class _FlightWait:
     """One bounded producer turn for an actual read-only observation."""
     __slots__=('__weakref__',)
 
+def _completed_transition(worker,reader,lanes,saved,unknown,original_head,prefix,native_seals,end):
+    """A vanished pending file grants nothing; actual fresh ACK/body does."""
+    original_ids=frozenset(reader._records);reader=reader.refresh(deadline=end);completed=dict(saved)
+    for lane in lanes:
+        if lane in completed:continue
+        state=runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state()
+        selected={row['id'] for row_lane,row in unknown if row_lane==lane}
+        if not selected:selected={sid for sid,record in reader._records.items() if sid not in original_ids and record['lane']==lane}
+        if not selected and not any(row_lane==lane for row_lane,_ in unknown):
+            # Admission and ACK may both precede the final pending unlink.
+            # Bind that exact completed capture rather than guessing last ACK.
+            payload=worker.root/'spool'/(lane+'-payload')
+            capture=runtime.load_json(private_path(worker.root/'receipts'/('capture-'+lane+'.json')))
+            marker=runtime.load_json(private_path(payload/'.capture.json'))
+            guards.require(isinstance(capture,dict) and set(capture)=={'generation','lane','token','phase'} and capture['generation']==worker.c['generation'] and
+                           capture['lane']==lane and capture['phase']=='upload' and marker=={key:capture[key] for key in ('generation','lane','token')},
+                           'Completed producer capture ownership differs')
+            guards.hex_id(capture['token'],32);manifest_path=private_path(payload/'manifest.json')
+            verify_payload(payload,runtime.load_json(manifest_path));md=sha(manifest_path)
+            selected={ack['id'] for ack in state['confirmed'] if ack['manifest_sha256']==md}
+        matches=[ack for ack in state['confirmed'] if ack['id'] in selected]
+        guards.require(len(matches)==1 and selected=={matches[0]['id']},'Uncatalogued current arrival lacks one fresh admitted acknowledgement')
+        completed[lane]=matches[0]
+    guards.require(all(lane in completed for lane,_ in unknown),'Unknown native row has no completed producer')
+    # Authenticate before waiting for the producer's remaining finalization.
+    _finished_admissions(worker,reader,completed,unknown)
+    with upload_section(worker,deadline=end):
+        ready(worker,deadline=end);_finished_admissions(worker,reader,completed,unknown)
+        guards.require(retention.reader_raw_prefix_seal(reader,head=original_head,deadline=end)==prefix,'Original producer observation catalog prefix changed')
+        guards.require(all(backup_catalog.digest(backup_catalog.canonical(row))==seal for row,seal in native_seals),'Original complete producer native fields changed')
+    guards.require(time.monotonic()<end,'Protected producer wait deadline exceeded');return reader
+
+def _finished_admissions(worker,reader,saved,unknown):
+    for lane,value in saved.items():
+        state=runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state()
+        matches=[row for row in state['confirmed'] if row['token']==value['token']]
+        guards.require(len(matches)==1,'Finished producer lacks one exact acknowledgement');ack=matches[0]
+        guards.require(set(ack)=={'id','token','manifest_sha256','captured_at','prepared_at','confirmed_at'} and
+                       all(ack[key]==value[key] for key in ('token','manifest_sha256','captured_at','prepared_at')),
+                       'Finished producer acknowledgement differs')
+        record=reader._record(ack['id']);raw=reader.raw_manifest(ack['id']);manifest=retention.decode(raw)
+        native,token,md=backup_catalog.native_identity(record['native'],ack['id'],str(worker.root/'spool'/(lane+'-payload')),worker.c['generation'])
+        guards.require(record['lane']==lane and record['repository']==worker.c['repositories'][lane] and record['repository_id']==repository_ids(worker)[lane] and
+                       token==value['token'] and md==value['manifest_sha256'] and {key:item for key,item in manifest.items() if key!='files'}==record['projection'] and
+                       manifest['format']==1 and manifest['generation']==worker.c['generation'] and manifest['source']==worker.source and manifest['captured_at']==ack['captured_at'] and
+                       manifest['kind'] in (('full','pre-update','hourly') if lane=='base' else ('binlog',)),
+                       'Finished producer native admission differs')
+        guards.hex_id(manifest['code_sha'],40)
+        if lane=='base':guards.require(manifest['stage_app_sha']==worker.c['stage_app_sha'],'Finished producer application differs')
+        for row_lane,row in unknown:
+            if row_lane==lane:guards.require(row['id']==ack['id'] and backup_catalog.native_identity(row,row['id'],str(worker.root/'spool'/(lane+'-payload')),worker.c['generation'])[0]==native,
+                                           'Original uncatalogued native authority changed')
+        guards.require(guards.utc(ack['captured_at'])<=guards.utc(value['prepared_at'])<=guards.utc(native['time'])<=guards.utc(record['verified']['verified_at'])<=guards.utc(ack['confirmed_at'])<=clock(),
+                       'Finished producer admission/acknowledgement clock differs')
+        files=manifest['files'];full=sorted([*files,{'path':'manifest.json','bytes':len(raw),'sha256':md}],key=lambda item:item['path'])
+        guards.require(len(full)==record['verified']['file_count'] and sum(item['bytes'] for item in files)==record['verified']['payload_bytes'] and
+                       backup_catalog.digest(backup_catalog.canonical(full))==record['verified']['all_files_sha256'],'Finished producer all-file admission differs')
+        if lane=='binlog':
+            for item in manifest['logs']:
+                body=reader.binlog_bytes(ack['id'],item['file'])
+                __import__('binlog').validate_chain({item['file']:body},[item],{'file':item['file'],'position':4},{'file':item['file'],'position':item['size']})
+
 def _settle_producer(worker,reader,wait,*,unknown=(),deadline=None):
     pending_paths={lane:worker.root/'receipts'/lane/'pending.json' for lane in ('base','binlog')}
     lanes=[lane for lane,path in pending_paths.items() if path.exists() or path.is_symlink()]
-    if not lanes:
-        if not unknown:return reader
-        reader=reader.refresh(deadline=deadline)
-        guards.require(all(row['id'] in reader._records for _,row in unknown),'Uncatalogued current arrival lacks protected live producer')
-        return reader
+    if not lanes and not unknown:return reader
     guards.require(type(wait) is _FlightWait and wait not in _FLIGHT_USED,'Only one protected producer wait is allowed per observation')
     _FLIGHT_USED.add(wait);end=time.monotonic()+MAX_CRITICAL_SECONDS
     if deadline is not None:end=min(end,deadline)
     saved={};now=clock();original_head=copy.deepcopy(reader.head)
     native_seals=[(row,backup_catalog.digest(backup_catalog.canonical(row))) for _,row in unknown]
     prefix=retention.reader_raw_prefix_seal(reader,verify=True,deadline=end)
+    if not lanes:
+        return _completed_transition(worker,reader,sorted({lane for lane,_ in unknown}),saved,unknown,original_head,prefix,native_seals,end)
     for lane in lanes:
         journal=runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state()
-        value=runtime.load_json(private_path(pending_paths[lane]));payload=worker.root/'spool'/(lane+'-payload')
+        try:value=runtime.load_json(private_path(pending_paths[lane]))
+        except FileNotFoundError:
+            return _completed_transition(worker,reader,lanes,saved,unknown,original_head,prefix,native_seals,end)
+        payload=worker.root/'spool'/(lane+'-payload')
         required={'token','generation','payload','manifest_sha256','attempted','prepared_at','captured_at'}
         guards.require(set(value) in (required,required|{'parent_id'}) and value['attempted'] is True and value['generation']==worker.c['generation'] and
                        value['payload']==str(payload),'Pending producer authority differs')
         token=guards.hex_id(value['token'],32);md=guards.hex_id(value['manifest_sha256'],64)
-        capture=runtime.load_json(private_path(worker.root/'receipts'/('capture-'+lane+'.json')))
-        marker=runtime.load_json(private_path(payload/'.capture.json'))
+        try:
+            capture=runtime.load_json(private_path(worker.root/'receipts'/('capture-'+lane+'.json')))
+            marker=runtime.load_json(private_path(payload/'.capture.json'))
+        except FileNotFoundError:
+            return _completed_transition(worker,reader,lanes,{**saved,lane:value},unknown,original_head,prefix,native_seals,end)
         guards.require(isinstance(capture,dict) and set(capture)=={'generation','lane','token','phase'} and capture['generation']==worker.c['generation'] and capture['lane']==lane and
                        capture['phase']=='upload' and marker=={key:capture[key] for key in ('generation','lane','token')},'Pending producer capture ownership differs')
         guards.hex_id(capture['token'],32)
@@ -56,7 +122,9 @@ def _settle_producer(worker,reader,wait,*,unknown=(),deadline=None):
         try:
             with runtime.lane_lock(job):pass
         except runtime.LaneBusyError:pass
-        else:raise guards.GuardError('Pending producer is abandoned; job lock is free')
+        else:
+            guards.require(not pending_paths[lane].exists() and not pending_paths[lane].is_symlink(),'Pending producer is abandoned; job lock is free')
+            return _completed_transition(worker,reader,lanes,{**saved,lane:value},unknown,original_head,prefix,native_seals,end)
         manifest_path=private_path(payload/'manifest.json');manifest=runtime.load_json(manifest_path)
         guards.require(sha(manifest_path)==md and manifest['generation']==worker.c['generation'] and manifest['source']==worker.source and
                        manifest['format']==1 and manifest['captured_at']==value['captured_at'] and

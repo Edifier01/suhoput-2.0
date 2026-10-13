@@ -700,7 +700,9 @@ class ArchiveCatalog:
             init=decode(read_file(self.receipts/('init-'+lane+'.json'),MAX_RECORD_BYTES),MAX_RECORD_BYTES)
             repo=w.c['repositories'][lane]
             def native_read(args):
-                if deadline is None:return w.restic(lane,['--repo',repo,*args])
+                if deadline is None:
+                    bounded={'timeout':55} if w.c.get('retention_readiness_policy')=='native-v2' and args==['snapshots','--json'] else {}
+                    return w.restic(lane,['--repo',repo,*args],**bounded)
                 remaining=deadline-time.monotonic();guards.require(remaining>0,'Checkpoint final native deadline exceeded')
                 output=w.restic(lane,['--repo',repo,*args],timeout=remaining)
                 guards.require(time.monotonic()<deadline,'Checkpoint final native deadline exceeded');return output

@@ -173,7 +173,8 @@ def refresh_prepared_inventory(worker,current,views,reader,candidates,at):
     indexed={row['id']:row for row in current['snapshots']};fresh=[];manifests=dict(current['manifests']);updated_views={}
     for lane in ('base','binlog'):
         repo=worker.c['repositories'][lane];config=decode(worker.restic(lane,['--repo',repo,'cat','config']))
-        listed=decode(worker.restic(lane,['--repo',repo,'snapshots','--json']));reader=reader.refresh()
+        bounded={'timeout':55} if worker.c.get('retention_readiness_policy')=='native-v2' else {}
+        listed=decode(worker.restic(lane,['--repo',repo,'snapshots','--json'],**bounded));reader=reader.refresh()
         observed=retention_cohort.clock();guards.require(observed>=at,'Prepared refresh clock rollback');at=observed
         old={sid for sid,row in indexed.items() if row['lane']==lane};new={row['id'] for row in listed}-old
         # The prior reader may already contain a concurrent admission that
@@ -256,7 +257,12 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
     for lane in ('base','binlog'):
         repo=w.c['repositories'][lane];scope=str(w.root/'spool'/(lane+'-payload'))
         def run(args):
-            if deadline is None:return w.restic(lane,['--repo',repo,*args])
+            if deadline is None:
+                # Native cache.Clear can remove arrivals missed by this LIST.
+                # Bound that overlap before issuing a commissioned v2 view.
+                if w.c.get('retention_readiness_policy')=='native-v2' and args==['snapshots','--json']:
+                    return w.restic(lane,['--repo',repo,*args],timeout=55)
+                return w.restic(lane,['--repo',repo,*args])
             remaining=deadline-time.monotonic();guards.require(remaining>0,'Native critical inventory deadline exceeded')
             result=w.restic(lane,['--repo',repo,*args],timeout=remaining)
             guards.require(time.monotonic()<deadline,'Native critical inventory deadline exceeded');return result

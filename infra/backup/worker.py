@@ -121,6 +121,7 @@ class Worker:
         guards.require(lane in ('base','binlog'),'Wrong repository lane');expected=self.c['repositories'][lane]
         guards.require(len(args)>=3 and args[:2]==['--repo',expected],'Native repository mismatch')
         command=args[2];guards.require(command in ('init','backup','cat','dump','snapshots','check','restore','stats','ls'),'Unsafe restic operation')
+        if self.c.get('retention_readiness_policy')=='native-v2' and command=='snapshots':timeout=min(timeout,55)
         opts=['--password-file',str(self.password),'--cache-dir',str(self.root/'cache'/lane),'-o','s3.bucket-lookup=path','-o','s3.connections=1']
         if command in ('cat','dump','snapshots','check','restore','stats','ls'):opts.append('--no-lock')
         env={**self.credentials,'AWS_REGION':self.c['region']}

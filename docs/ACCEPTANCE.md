@@ -496,6 +496,17 @@
 
 ## Доказательства исполнения
 
+<a id="exec-chk-072"></a>
+### EXEC-CHK-072 — TASK-047: завершение pending и ограничение штатного Cache.Clear
+
+13.10.2026 19:06–19:39UTC, основа30fc7f54, рабочая копия отличается. NEW185623 FAIL до forget: producer удалил pending между exists и чтением. Наблюдатель теперь закрывает завершение только через точный ACK, native/raw/all-file/CRC proof и прежние prefix seals. Отдельный RED подтвердил уже admitted SID при исчезновении pending; protected capture/manifest остаются после настоящего Worker.finalize и связывают completion, а не произвольный последний ACK. Предположение root об удалении capture при finalize отозвано после чтения реализации.
+
+В native fixture V2 minute producer не создавал обязательные capture/marker. NEW V3 связывает настоящие Worker.prepare_payload/capture_intent/cleanup_confirmed/finalize, включает marker в raw manifest и all-file SHA, сохраняет ResticAdapter/UploadJournal/native readback/CRC/catalog admission. V2 receipts/том185623 сохранены, source native_forget_calls=[]; не переобозначены PASS. V3 fixture33ed0723d5ef4605e1d2f62656774003901e7df27cad6def64d974109bab618e/arrivals3b92242c8aec664d513d13a3f8c017355aa8b4ecee385ea4d151004e91379457 независимо reviewed; три file-only authority models PASS, не native performance.
+
+Штатный restic0.19.1 Cache.Clear может удалить arrivals, отсутствовавшие в его LIST. Native-v2 snapshots commands теперь получают timeout≤55 во всех путях: Worker, native inventory, prepared tail и outside catalog checkpoint; меньший inside deadline сохраняется. Содержательные RED193509 (три paths) → GREEN193627 (шесть tests); timeout не вызывает retry/effect. Full frozen590Linux/no skips39.549s PASS, raw `task047-all-backup-linux-20261013-193713.local.json`; independent111Linux/no skips20.053s PASS, `task047-catalog-r5-linux-20261013-193844.local.json`, source hashes до/после неизменны. Второе independent66Linux/no skips13.264s PASS193810 подтверждает ранее пропущенный direct-tail path. Python3.12.14/root/768MiB/1CPU/networknone; no S3/VPS effects. Exact abbreviated source pins: worker15258c30/retentionf3978b21/catalog a10156ad/cohort0582e62d/boundaryfd19cb67/listtest62f029db.
+
+На установленном30fc actual full/hourly/pre-update/binlog и uncached integrity PASS; свежие anchor/tip SQL controls PASS19:06:10/19:08:40, networknone/sourceSQL0/две import-replay calls каждый. Public index/tree cache control PASS5indexes/13treepacks; BOTH snapshot cache control PASS13base+10bin,23cipherSHA/size,2snapshot LIST/8846XMLbytes/backend snapshot reads0. Полный writer inventory при4disabledtimers:10postbillingACK,25,939,056raw-added/6,655,089packed-added bytes; wholevisible70,241,033B не назван billed storage. Последующие source changes требуют актуальных target bindings/controls либо явного compatibility review. Условный прогноз включает31warm-cache checks,6cold4KiB bodies/nativeview, отдельные651cold bodies для900s cachedchecks и positive1.4RUB reserve:499.957884RUB/4.36722GiB; не invoice/observed month/admission. Actual V3 native/source-off replay, publication и четыре calendar triggers ещё обязательны; TASK-047 не PASS. Шаблон daily20:15UTC, текущий installed19:45/timersdisabled.
+
 <a id="exec-chk-071"></a>
 ### EXEC-CHK-071 — TASK-047: границы наблюдения и commissioned restore cache
 
