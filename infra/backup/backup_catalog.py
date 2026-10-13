@@ -1211,7 +1211,8 @@ class ArchiveCatalog:
         with stage.catalog._db() as db:_,target_raw=stage.catalog._raw_prefix_seals(db,nexthead,nexthead['sequence'])
         prepared=self._derived_prepared(stage,witness,nexthead,records,captured,source_sha,proofs)
         guards.require(prepared['stage_sha256']==target_sha,'Audited target changed before prefix seal')
-        for turn in range(4):
+        folds=0
+        while True:
             current,current_marker,dbhead,current_committed=self._checkpoint_state()
             guards.require(current_marker is None and not current_committed,'Pending changed during derived preparation')
             if current==captured:
@@ -1221,6 +1222,11 @@ class ArchiveCatalog:
                 try:self._reserve_checkpoint_stage(stage,prepared)
                 except CheckpointArrival:continue
                 return prepared
+            # Activation checks do not adopt data. In particular, a writer
+            # finishing during group acquisition must not spend a second
+            # fold merely to return to this already verified private image.
+            guards.require(folds<4,'Minute arrivals outran bounded private tail adoption; live catalog unchanged')
+            folds+=1
             guards.require(current.get('checkpoint')==captured.get('checkpoint') and current['sequence']>captured['sequence'],'Source epoch or prefix changed')
             audit=CheckpointStage(self,reader=True)
             try:
@@ -1265,8 +1271,6 @@ class ArchiveCatalog:
                     os.replace(safe(source),target)
                 runtime.directory_sync(stage.root);stage.authority=audit.authority
             finally:audit.cleanup()
-        raise guards.GuardError('Minute arrivals outran bounded private tail adoption; live catalog unchanged')
-
     def _derived_prepared(self,stage,witness,nexthead,records,source_head,source_sha,proofs):
         inventory=self._projection_inventory(record for sid,record in records.items() if sid not in proofs)
         indexed={row['id']:row for row in inventory['snapshots']}

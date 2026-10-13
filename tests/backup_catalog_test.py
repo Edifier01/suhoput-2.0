@@ -508,6 +508,31 @@ class CatalogLifecycleTests(unittest.TestCase):
         self.assertEqual(result['retired_ids'],[SID]);self.assertEqual(len(reseals),1);self.assertEqual(len(scans),2)
         self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
 
+    def test_activation_checks_do_not_consume_the_four_tail_adoptions(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        reserve=self.c._reserve_checkpoint_stage;append=self.c._append_private_tail;arrivals=[];folds=[]
+        def activation(*args,**kwargs):
+            if len(arrivals)<4:
+                number=10+len(arrivals);self.put(format(number,'064x'),format(number+20,'032x'));arrivals.append(number)
+            return reserve(*args,**kwargs)
+        def adopt(*args,**kwargs):folds.append(True);return append(*args,**kwargs)
+        with mock.patch.object(self.c,'_reserve_checkpoint_stage',side_effect=activation),mock.patch.object(self.c,'_append_private_tail',side_effect=adopt),mock.patch.object(self.c,'_publish_checkpoint_stage',wraps=self.c._publish_checkpoint_stage) as publication:result=self.c.checkpoint()
+        self.assertEqual(result['retired_ids'],[SID]);self.assertEqual(len(folds),4)
+        self.assertEqual(publication.call_count,1)
+        self.assertEqual(set(self.c.entries()),{'4'*64,*[format(n,'064x') for n in arrivals]})
+
+    def test_fifth_activation_arrival_cannot_expand_four_fold_limit(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        reserve=self.c._reserve_checkpoint_stage;append=self.c._append_private_tail;arrivals=[];folds=[]
+        def activation(*args,**kwargs):
+            number=10+len(arrivals);self.put(format(number,'064x'),format(number+20,'032x'));arrivals.append(number)
+            return reserve(*args,**kwargs)
+        def adopt(*args,**kwargs):folds.append(True);return append(*args,**kwargs)
+        with mock.patch.object(self.c,'_reserve_checkpoint_stage',side_effect=activation),mock.patch.object(self.c,'_append_private_tail',side_effect=adopt),self.assertRaisesRegex(guards.GuardError,'bounded private tail'):
+            self.c.checkpoint()
+        self.assertEqual(len(folds),4);self.assertEqual(len(arrivals),5)
+        self.assertFalse(self.c._checkpoint_incomplete());self.assertIn(SID,self.c.entries())
+
     def test_admitted_arrival_cannot_hide_changed_raw_source_prefix(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
         insert=self.c._checkpoint_insert
