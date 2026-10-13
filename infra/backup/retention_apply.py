@@ -283,7 +283,7 @@ class Executor:
     Callers must not clear an intent to retry. Reconcile writes observed exact
     absence/presence; a partial receipt never authorizes retry or tombstones.
     """
-    def __init__(self, inventory_reader, runner, intent_store, receipt_writer, repository_paths, clock=None, *, effect_section=None, pre_effect=None):
+    def __init__(self, inventory_reader, runner, intent_store, receipt_writer, repository_paths, clock=None, *, effect_section=None, pre_effect=None, phase_section=None, pre_phase=None):
         self.read_inventory = inventory_reader
         self.runner = runner
         self.store = intent_store
@@ -291,6 +291,7 @@ class Executor:
         self.repositories = dict(repository_paths)
         self.clock = clock
         self.effect_section=effect_section;self.pre_effect=pre_effect
+        self.phase_section=phase_section;self.pre_phase=pre_phase
         guards.require(set(self.repositories) == {'base', 'binlog'} and
                        all(isinstance(v, str) and v and not v.startswith('-') for v in self.repositories.values()),
                        'Explicit repository paths required')
@@ -312,19 +313,23 @@ class Executor:
     def _observe(self, intent, at):
         try:
             after = self.read_inventory()
-            comparison = compatible_inventory(intent['before_inventory'], after, at, intent['candidate_ids'])
-            protected_dependencies(after, intent['candidate_ids'], at)
-            absent = sorted(set(intent['candidate_ids']) - {row['id'] for row in after['snapshots']})
-            return {'forgotten_ids': absent,
-                    'present_candidate_ids': sorted(set(intent['candidate_ids']) - set(absent)),
-                    'protected_arrival_ids': sorted(set(intent['protected_arrival_ids']) | set(comparison['arrival_ids'])),
-                    'post_inventory_sha256': retention.inventory_digest(after), 'observation_error': None}
+            return self._observation(intent,after,at)
         except Exception as error:
             return {'forgotten_ids': None, 'present_candidate_ids': None,
                     'protected_arrival_ids': [], 'post_inventory_sha256': None,
                     'observation_error': type(error).__name__}
 
-    def _receipt(self, intent, status, at, calls, observed, error=None):
+    def _observation(self,intent,after,at):
+        allowed=intent['candidate_ids']
+        if intent.get('phase_protocol')=='bounded-lanes-v1':allowed=self.store.attempted_ids()
+        comparison=compatible_inventory(intent['before_inventory'],after,at,allowed)
+        protected_dependencies(after,intent['candidate_ids'],at)
+        absent=sorted(set(intent['candidate_ids'])-{row['id'] for row in after['snapshots']})
+        return {'forgotten_ids':absent,'present_candidate_ids':sorted(set(intent['candidate_ids'])-set(absent)),
+                'protected_arrival_ids':sorted(set(intent['protected_arrival_ids'])|set(comparison['arrival_ids'])),
+                'post_inventory_sha256':retention.inventory_digest(after),'observation_error':None}
+
+    def _receipt_value(self, intent, status, at, calls, observed, error=None):
         receipt = {key: copy.deepcopy(intent[key]) for key in
                    ('token', 'generation', 'repositories', 'inventory_sha256', 'candidate_ids',
                     'keep_ids', 'anchor_id', 'proof_sha256', 'source', 'intent_sha256')}
@@ -332,6 +337,11 @@ class Executor:
                         'remote_delete_calls': calls, 'prune_run': False,
                         'error_type': error, 'completed_at': at.isoformat(), **observed})
         if 'cohort' in intent:receipt['cohort']=copy.deepcopy(intent['cohort'])
+        if intent.get('phase_protocol')=='bounded-lanes-v1':receipt['phase_witnesses']=self.store.phase_refs()
+        return receipt
+
+    def _receipt(self,intent,status,at,calls,observed,error=None):
+        receipt=self._receipt_value(intent,status,at,calls,observed,error)
         self.write_receipt(copy.deepcopy(receipt))
         return receipt
 
@@ -359,6 +369,7 @@ class Executor:
             validate_apply(inventory, plan, evidence, at)
         else:
             _plan(inventory, plan, at)
+        if self.phase_section is not None:return self._phased(inventory,plan,evidence,binding,before,at)
         # All complete proof validation is outside native upload lane locks.
         if self.effect_section is not None and plan['candidates']:
             validate_apply(inventory,plan,evidence,at)
@@ -430,12 +441,76 @@ class Executor:
             observed['history_coverage_accepted'] = False
         return self._receipt(intent, status, at, calls, observed, error)
 
+    def _publish_phased(self,intent,receipt,at):
+        try:
+            if callable(getattr(self.write_receipt,'stage',None)):self.write_receipt.stage(receipt)
+            with self.phase_section('publication'):
+                current=self.read_inventory();at=self._now(at);observed=self._observation(intent,current,at)
+                guards.require(observed['post_inventory_sha256']==receipt['post_inventory_sha256'] and
+                               observed['forgotten_ids']==receipt['forgotten_ids'],'Final staged native observation changed')
+                if self.pre_phase is not None:self.pre_phase(current,intent,observed['forgotten_ids'])
+                self.write_receipt(copy.deepcopy(receipt))
+            return receipt
+        except Exception as failure:
+            # A partial promotion remains quarantined. Failure receipt bytes
+            # and cleanup are persisted only after every upload lock released.
+            receipt={**receipt,'result':'RECONCILE_REQUIRED','error_type':type(failure).__name__}
+            self.write_receipt(copy.deepcopy(receipt));return receipt
+
+    def _phased(self,inventory,plan,evidence,binding,before,at):
+        comparison=compatible_inventory(inventory,before,at);protected_dependencies(before,binding['candidate_ids'],at)
+        body={**binding,'operation':'native-retention-forget','token':uuid.uuid4().hex,'prepared_at':at.isoformat(),
+              'before_inventory':compact_authenticated_inventory(before,at),'before_inventory_sha256':retention.inventory_digest(before),
+              'protected_arrival_ids':comparison['arrival_ids'],'repository_paths':self.repositories}
+        if callable(getattr(self.store,'phase',None)):body['phase_protocol']='bounded-lanes-v1'
+        intent={**body,'intent_sha256':document_digest(body)}
+        if callable(getattr(self.store,'stage',None)):self.store.stage(intent)
+        lane_ids={lane:sorted(row['id'] for row in before['snapshots'] if row['lane']==lane and row['id'] in intent['candidate_ids']) for lane in ('base','binlog')}
+        phases=[(lane,ids) for lane,ids in lane_ids.items() if ids] or [('no-op',[])]
+        removed=set();calls=0;error=None;promoted=False
+        for lane,ids in phases:
+            try:
+                with self.phase_section(lane):
+                    current=self.read_inventory();at=self._now(at)
+                    compared=compatible_inventory(before,current,at,removed)
+                    guards.require(compared['absent_ids']==sorted(removed),'Prior exact lane absence differs')
+                    protected_dependencies(current,intent['candidate_ids'],at)
+                    if self.pre_phase is not None:self.pre_phase(current,intent,sorted(removed))
+                    at=self._now(at)
+                    if ids:current_freshness(plan,evidence,at)
+                    else:_plan(inventory,plan,at)
+                    phase_document=self.store.phase_document(lane,current,sorted(removed),at) if callable(getattr(self.store,'phase',None)) else None
+                    if not promoted:
+                        self.store.prepare(intent);promoted=True
+                        guards.require(self._intent()==intent,'Durable phased intent readback differs')
+                    if phase_document is not None:self.store.phase(phase_document)
+                    at=self._now(at)
+                    if ids:
+                        current_freshness(plan,evidence,at);calls+=1
+                        result=self.runner(lane,['--repo',self.repositories[lane],'forget',*ids])
+                        guards.require(result is None or isinstance(result,bytes),'Runner must raise on uncertain result')
+                        removed.update(ids)
+            except Exception as failure:
+                if not promoted:raise
+                error=type(failure).__name__;break
+        at=self._now(at);observed=self._observe(intent,at)
+        status='APPLIED' if error is None and observed['forgotten_ids']==intent['candidate_ids'] else 'RECONCILE_REQUIRED'
+        if not intent['candidate_ids']:
+            status='NOOP' if observed['forgotten_ids'] is not None else 'RECONCILE_REQUIRED';observed['history_coverage_accepted']=False
+        receipt=self._receipt_value(intent,status,at,calls,observed,error)
+        if status=='RECONCILE_REQUIRED':self.write_receipt(copy.deepcopy(receipt));return receipt
+        return self._publish_phased(intent,receipt,at)
+
     def reconcile(self, at):
         """Explicit root operation: read only, never repeats a forget command."""
         _time(at); intent = self._intent()
         guards.require(intent is not None, 'No durable retention intent to reconcile')
         observed = self._observe(intent, at)
         status = 'RECONCILED' if observed['forgotten_ids'] is not None else 'RECONCILE_REQUIRED'
+        if self.phase_section is not None:
+            receipt=self._receipt_value(intent,status,at,0,observed)
+            if status=='RECONCILE_REQUIRED':self.write_receipt(copy.deepcopy(receipt));return receipt
+            return self._publish_phased(intent,receipt,at)
         return self._receipt(intent, status, at, 0, observed)
 
 

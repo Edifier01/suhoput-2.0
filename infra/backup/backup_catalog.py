@@ -500,9 +500,9 @@ class ArchiveCatalog:
                 receipt=store.latest();marker=decode(read_file(path/'journals-committed.json',MAX_RECORD_BYTES),MAX_RECORD_BYTES)
                 if receipt['result']=='NOOP':guards.require(marker=={'no_deletion':True},'Native no-op commitment differs')
                 else:
-                    guards.require(receipt['result'] in ('APPLIED','RECONCILED') and receipt['present_candidate_ids']==[] and
-                                   marker=={'intent_sha256':intent['intent_sha256'],'receipt_sha256':retention_apply.document_digest(receipt)},
-                                   'Unfinished or uncommitted native retirement')
+                    guards.require(receipt['result'] in ('APPLIED','RECONCILED') and receipt['present_candidate_ids']==[],
+                                   'Unfinished native retirement')
+                    retention_native.verify_journal_commit(w,store,receipt=receipt)
         repositories={};snapshots=[];manifests={};tokens=set()
         for lane in ('base','binlog'):
             init=decode(read_file(self.receipts/('init-'+lane+'.json'),MAX_RECORD_BYTES),MAX_RECORD_BYTES)

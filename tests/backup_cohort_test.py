@@ -209,6 +209,53 @@ class NativeCohortTests(unittest.TestCase):
                            stop={'file':plan['chain_last_file'],'position':plan['chain_last_position']},
                            verified_binlogs=retention.replay_range(manifest['coordinates'],{'file':plan['chain_last_file'],'position':plan['chain_last_position']},plan['logs']))
         return evidence
+    def prepared_apply(self):
+        import retention_cohort
+        cohort,_=retention_cohort.CohortStore(self.w).capture()
+        for name,item in self.documents(cohort).items():retention_native.publish_evidence(self.w,name,item['document'],cohort,NOW.isoformat())
+        self.w.gate=lambda:None;effects=[]
+        def forget(lane,ids,**kwargs):
+            effects.append((lane,ids))
+            for sid in ids:del self.native[sid]
+            return b''
+        self.w.retention_forget=forget;native=retention_native.NativeApply.__new__(retention_native.NativeApply);native.w=self.w
+        directory=self.root/'receipts/retention-applies';directory.mkdir(mode=0o700,exist_ok=True)
+        store=retention_native.NewIntentStore(directory/cohort['cohort']['sha256'])
+        return cohort,native,store,effects
+    def test_partial_journal_without_global_commit_cannot_seed_a_new_cohort(self):
+        import retention_cohort
+        cohort,_=retention_cohort.CohortStore(self.w).capture()
+        for name,item in self.documents(cohort).items():retention_native.publish_evidence(self.w,name,item['document'],cohort,NOW.isoformat())
+        self.w.gate=lambda:None
+        def forget(lane,ids,**kwargs):
+            if lane=='binlog':raise TimeoutError('No second effect')
+            for sid in ids:del self.native[sid]
+            return b''
+        self.w.retention_forget=forget;native=retention_native.NativeApply.__new__(retention_native.NativeApply);native.w=self.w
+        self.assertEqual(native.run('apply')['result'],'RECONCILE_REQUIRED')
+        store=retention_native.IntentStore(self.root/'receipts/retention-applies'/cohort['cohort']['sha256'])
+        ex=retention_apply.Executor(lambda:retention.native_inventory(self.w,NOW,cohort['repositories']),lambda *args:self.fail('Reconciliation deletion'),store,store.receipt,self.w.c['repositories'])
+        receipt=ex.reconcile(NOW);self.assertEqual(receipt['forgotten_ids'],['1'*64])
+        runtime.UploadJournal(self.root/'receipts/base',self.w.c['generation']).retire(store.load(),receipt,'base')
+        with self.assertRaises(guards.GuardError):retention_cohort.CohortStore(self.w).capture()
+    def test_native_mixed_lanes_have_separate_twenty_seven_second_authority_phases(self):
+        import retention_cohort
+        cohort,_=retention_cohort.CohortStore(self.w).capture()
+        for name,item in self.documents(cohort).items():retention_native.publish_evidence(self.w,name,item['document'],cohort,NOW.isoformat())
+        elapsed=[0.0];effects=[];original=self.w.restic
+        def read(lane,args,**kwargs):
+            result=original(lane,args,**kwargs);elapsed[0]+=6.75;return result
+        self.w.restic=read;self.w.gate=lambda:None
+        def forget(lane,ids,**kwargs):
+            effects.append(lane);elapsed[0]+=2
+            for sid in ids:del self.native[sid]
+            return b''
+        self.w.retention_forget=forget;native=retention_native.NativeApply.__new__(retention_native.NativeApply);native.w=self.w
+        with mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=native.run('apply')
+        self.assertEqual(result['result'],'APPLIED');self.assertEqual(effects,['base','binlog'])
+        timing=runtime.load_json(self.root/'receipts/retention-applies'/cohort['cohort']['sha256']/'phase-timing.json')['phase_seconds']
+        self.assertGreater(timing['critical_seconds'],55);self.assertLessEqual(timing['critical_max_seconds'],55)
+        self.assertEqual([phase['name'] for phase in timing['critical_phases']],['base','binlog','publication'])
     def test_native_capture_publish_load_all_six_receipts_and_reject_missing_cohort_member(self):
         import retention_cohort
         cohort,_=retention_cohort.CohortStore(self.w).capture()
@@ -248,7 +295,205 @@ class NativeCohortTests(unittest.TestCase):
         with mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',check):result=native.run('apply')
         self.assertEqual(result['result'],'APPLIED');self.assertEqual(effects,[('base',[OLD]),('binlog',['5'*64])])
         self.assertEqual(set(self.catalog().entries()),{'2'*64,'3'*64,LOG})
-        self.assertIn('phase_seconds',result)
+        store=retention_native.IntentStore(self.root/'receipts/retention-applies'/cohort['cohort']['sha256'])
+        self.assertEqual(result,store.latest())
+        timing=runtime.load_json(store.root/'phase-timing.json')
+        self.assertEqual(timing['receipt_sha256'],retention_apply.document_digest(result))
+        self.assertEqual([phase['name'] for phase in timing['phase_seconds']['critical_phases']],['base','binlog','publication'])
+    def test_every_publication_promotion_crash_is_read_only_recoverable_without_partial_reader_admission(self):
+        import retention_cohort
+        for step in ('receipt','base','binlog','latest','commit'):
+            if step!='receipt':self.setUp()
+            cohort,native,store,effects=self.prepared_apply();original=retention_native.StagedFiles.promote;crashed=[]
+            def promote(staging,path,target):
+                original(staging,path,target)
+                target=pathlib.Path(target)
+                selected=(target.name.startswith('receipt-') if step=='receipt' else
+                          target==self.root/'receipts'/step/'state.json' if step in ('base','binlog') else
+                          target==store.root/('latest.json' if step=='latest' else 'journals-committed.json'))
+                if selected and not crashed:crashed.append(step);raise OSError('Crash after '+step+' promotion')
+            with self.subTest(step=step),mock.patch.object(retention_native.StagedFiles,'promote',promote):
+                result=native.run('apply');self.assertEqual(result['result'],'RECONCILE_REQUIRED')
+            self.assertEqual([lane for lane,_ in effects],['base','binlog'])
+            if step!='commit':
+                with self.assertRaises(guards.GuardError):retention_cohort.CohortStore(self.w).capture()
+            else:self.assertEqual(len(retention_native.verified_tombstones(self.w)),2)
+            result=native.run('reconcile');self.assertEqual(result['result'],'RECONCILED',step)
+            self.assertEqual([lane for lane,_ in effects],['base','binlog'],'Read-only recovery repeated an effect')
+            self.assertEqual(len(retention_native.verified_tombstones(self.w)),2)
+            self.assertEqual(set(self.catalog().entries()),{'2'*64,'3'*64,LOG})
+    def test_safe_minute_between_lane_sections_is_witnessed_and_preserved(self):
+        import contextlib,retention_cohort
+        _,native,store,effects=self.prepared_apply();original=retention_cohort.upload_section;count=[0];arrival=[]
+        @contextlib.contextmanager
+        def section(worker):
+            count[0]+=1
+            with original(worker):yield
+            if count[0]==1:arrival.append(self.append_minute())
+        with mock.patch.object(retention_cohort,'upload_section',section):result=native.run('apply')
+        self.assertEqual(result['result'],'APPLIED');self.assertEqual([lane for lane,_ in effects],['base','binlog'])
+        self.assertEqual(result['protected_arrival_ids'],arrival);self.assertIn(arrival[0],self.native)
+        intent=store.load();self.assertNotIn(arrival[0],[row['id'] for row in intent['before_inventory']['snapshots']])
+        witness=store.phase_documents()['binlog'];self.assertEqual([row['id'] for row in witness['arrival_rows']],arrival)
+        self.assertEqual(witness['prior_absence_ids'],[OLD]);self.assertIn('catalog_head',witness)
+    def test_pending_expiry_and_lock_reacquisition_after_first_effect_stop_every_later_effect(self):
+        import contextlib,retention_cohort
+        for cause in ('pending','expiry','busy'):
+            if cause!='pending':self.setUp()
+            _,native,store,effects=self.prepared_apply();original=retention_cohort.upload_section;count=[0];at=[NOW]
+            @contextlib.contextmanager
+            def section(worker):
+                count[0]+=1
+                if count[0]==2 and cause=='busy':raise guards.GuardError('Actual nonblocking lane busy')
+                with original(worker):yield
+                if count[0]==1:
+                    if cause=='pending':runtime.atomic_json(self.root/'receipts/binlog/pending.json',{'unknown':True})
+                    if cause=='expiry':at[0]=NOW+dt.timedelta(seconds=901)
+            with self.subTest(cause=cause),mock.patch.object(retention_cohort,'upload_section',section),mock.patch.object(retention_cohort,'clock',side_effect=lambda:at[0]):
+                result=native.run('apply');self.assertEqual(result['result'],'RECONCILE_REQUIRED')
+            self.assertEqual([lane for lane,_ in effects],['base']);self.assertIn('5'*64,self.native)
+            self.assertEqual(set(store.phase_documents()),{'base'})
+            with self.assertRaises(guards.GuardError):native.run('apply')
+            (self.root/'receipts/binlog/pending.json').unlink(missing_ok=True)
+            with mock.patch.object(retention_cohort,'clock',side_effect=lambda:NOW+dt.timedelta(seconds=1800)):
+                result=native.run('reconcile')
+            self.assertEqual(result['result'],'RECONCILED');self.assertEqual(result['present_candidate_ids'],['5'*64])
+            self.assertEqual([lane for lane,_ in effects],['base'],'Expired read-only recovery executed unattempted binlog lane')
+            with self.assertRaises(guards.GuardError):native.run('apply')
+    def test_new_recovery_base_between_lanes_blocks_required_binlog_deletion(self):
+        import contextlib,retention_cohort
+        _,native,store,effects=self.prepared_apply();original=retention_cohort.upload_section;count=[0]
+        @contextlib.contextmanager
+        def section(worker):
+            count[0]+=1
+            with original(worker):yield
+            if count[0]==1:self.append_base('suhoput2-binlog.000001')
+        with mock.patch.object(retention_cohort,'upload_section',section):result=native.run('apply')
+        self.assertEqual(result['result'],'RECONCILE_REQUIRED');self.assertEqual([lane for lane,_ in effects],['base'])
+        self.assertIn('5'*64,self.native);self.assertEqual(set(store.phase_documents()),{'base'})
+        self.assertFalse((store.root/'journals-committed.json').exists())
+    def test_new_arrival_after_journal_staging_blocks_overwrite_and_read_only_recovery_preserves_it(self):
+        _,native,store,effects=self.prepared_apply();original=retention_native.StagedPublication.stage;arrivals=[]
+        def stage(writer,value):
+            original(writer,value)
+            if not arrivals:arrivals.append(self.append_minute())
+        with mock.patch.object(retention_native.StagedPublication,'stage',stage):result=native.run('apply')
+        self.assertEqual(result['result'],'RECONCILE_REQUIRED');self.assertFalse((store.root/'journals-committed.json').exists())
+        confirmed=runtime.UploadJournal(self.root/'receipts/binlog',self.w.c['generation']).state()['confirmed']
+        self.assertIn(arrivals[0],[row['id'] for row in confirmed])
+        result=native.run('reconcile');self.assertEqual(result['result'],'RECONCILED')
+        self.assertEqual([lane for lane,_ in effects],['base','binlog']);self.assertEqual(result['protected_arrival_ids'],arrivals)
+        self.assertIn(arrivals[0],self.catalog().entries())
+    def test_both_journal_union_and_raw_receipt_phase_marker_tampering_fail_closed(self):
+        _,native,store,_=self.prepared_apply();result=native.run('apply');self.assertEqual(result['result'],'APPLIED')
+        marker_path=store.root/'journals-committed.json';marker=runtime.load_json(marker_path)
+        baseline={path:path.read_bytes() for path in (marker_path,self.root/'receipts/base/state.json',self.root/'receipts/binlog/state.json',store.root/'phase-base.json',store.root/marker['receipt_ref']['file'])}
+        for mutation in ('missing','receipt','raw','rows','union','misplaced','phase','bytes'):
+            for path,raw in baseline.items():path.write_bytes(raw)
+            changed=copy.deepcopy(marker)
+            if mutation=='missing':marker_path.unlink()
+            elif mutation=='receipt':changed['receipt_sha256']='0'*64
+            elif mutation=='raw':changed['receipt_ref']['sha256']='0'*64
+            elif mutation=='rows':changed['retirement_sha256']['base']='0'*64
+            elif mutation=='union':
+                path=self.root/'receipts/binlog/state.json';state=runtime.load_json(path);state['retention']=[];runtime.atomic_json(path,state)
+                # Even the compatible old envelope must reject one-lane-only
+                # rows when its actual bound receipt acknowledges BOTH lanes.
+                changed={k:marker[k] for k in ('intent_sha256','receipt_sha256')}
+            elif mutation=='misplaced':
+                base=self.root/'receipts/base/state.json';logs=self.root/'receipts/binlog/state.json'
+                first=runtime.load_json(base);second=runtime.load_json(logs);second['retention']+=first['retention'];first['retention']=[]
+                runtime.atomic_json(base,first);runtime.atomic_json(logs,second)
+            elif mutation=='phase':
+                path=store.root/'phase-base.json';doc=runtime.load_json(path);doc['operation']='forged-phase';runtime.atomic_json(path,doc)
+            else:(store.root/marker['receipt_ref']['file']).write_bytes(b'{}\n')
+            if mutation!='missing':runtime.atomic_json(marker_path,changed)
+            with self.subTest(mutation=mutation),self.assertRaises(guards.GuardError):retention_native.verified_tombstones(self.w)
+        for path,raw in baseline.items():path.write_bytes(raw)
+        self.assertEqual(len(retention_native.verified_tombstones(self.w)),2)
+    def test_later_read_only_receipt_preserves_original_rows_and_both_old_new_marker_compatibility(self):
+        import retention_cohort
+        _,native,store,effects=self.prepared_apply();result=native.run('apply');original=retention_native.verified_tombstones(self.w)
+        marker=runtime.load_json(store.root/'journals-committed.json')
+        runtime.atomic_json(store.root/'journals-committed.json',{k:marker[k] for k in ('intent_sha256','receipt_sha256')})
+        self.assertEqual(retention_native.verified_tombstones(self.w),original)
+        self.catalog().checkpoint()  # legacy complete marker bridge stays valid
+        store.receipt({**result,'result':'RECONCILE_REQUIRED','error_type':'InterruptedAfterCompleteCommit'})
+        with mock.patch.object(retention_cohort,'clock',return_value=NOW+dt.timedelta(hours=1)):new=native.run('reconcile')
+        self.assertEqual(new['result'],'RECONCILED');self.assertNotEqual(retention_apply.document_digest(new),retention_apply.document_digest(result))
+        self.assertEqual(retention_native.verified_tombstones(self.w),original,'Later latest pointer rewrote original retirement receipt/time')
+        marker=runtime.load_json(store.root/'journals-committed.json');self.assertEqual(marker['format'],2)
+        self.assertEqual(set(marker['receipt_refs']),{retention_apply.document_digest(result),retention_apply.document_digest(new)})
+        self.assertEqual([lane for lane,_ in effects],['base','binlog'])
+    def test_bulk_staging_and_unknown_receipt_are_outside_locks_and_promotion_uses_reserved_tail(self):
+        import contextlib,retention_cohort
+        _,native,store,effects=self.prepared_apply();elapsed=[0.0];active=[False];original_section=retention_cohort.upload_section
+        original_read=self.w.restic;original_json=retention_native.exclusive_json;original_promote=retention_native.StagedFiles.promote
+        @contextlib.contextmanager
+        def section(worker):
+            with original_section(worker):
+                active[0]=True
+                try:yield
+                finally:active[0]=False
+        def read(lane,args,**kwargs):
+            result=original_read(lane,args,**kwargs)
+            if active[0]:elapsed[0]+=6.75
+            return result
+        def write(path,value):
+            path=pathlib.Path(path)
+            if 'retention-staging' in path.parts:
+                self.assertFalse(active[0],'Bulk serialization/fsync/readback holds job/upload locks');elapsed[0]+=60
+            elif path.name.startswith('receipt-'):
+                self.assertFalse(active[0],'Failure receipt was written inside the expired phase');elapsed[0]+=60
+            original_json(path,value)
+        def promote(staging,path,target):
+            original_promote(staging,path,target)
+            if pathlib.Path(target).name!='intent.json':elapsed[0]+=6
+        self.w.restic=read
+        with mock.patch.object(retention_cohort,'upload_section',section),mock.patch.object(retention_native,'exclusive_json',write),mock.patch.object(retention_native.StagedFiles,'promote',promote),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):
+            result=native.run('apply')
+        self.assertEqual(result['result'],'RECONCILE_REQUIRED');self.assertEqual([lane for lane,_ in effects],['base','binlog'])
+        self.assertFalse((store.root/'journals-committed.json').exists())
+        timing=runtime.load_json(store.root/'phase-timing.json')['phase_seconds']
+        self.assertEqual(timing['critical_max_seconds'],45);self.assertEqual(timing['journal_seconds'],18)
+        self.assertEqual(timing['critical_phases'][-1]['journal_seconds'],18)
+        self.assertEqual(timing['staging_seconds'],180);self.assertEqual(list((self.root/'receipts/retention-staging').iterdir()),[])
+        self.assertGreater(elapsed[0],55,'Model must include genuinely long unlocked writes')
+        self.w.restic=original_read;self.assertEqual(native.run('reconcile')['result'],'RECONCILED')
+    def test_actual_unlock_cleanup_overrun_is_recorded_and_stops_the_next_lane(self):
+        import contextlib,retention_cohort
+        _,native,store,effects=self.prepared_apply();elapsed=[0.0];original=retention_cohort.upload_section;read=self.w.restic
+        @contextlib.contextmanager
+        def section(worker):
+            with original(worker):
+                try:yield
+                finally:elapsed[0]+=30  # modeled OS cleanup delay, charged before release
+        def native_read(lane,args,**kwargs):
+            value=read(lane,args,**kwargs)
+            if 'timeout' in kwargs:elapsed[0]+=6.75
+            return value
+        self.w.restic=native_read
+        with mock.patch.object(retention_cohort,'upload_section',section),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=native.run('apply')
+        self.assertEqual(result['result'],'RECONCILE_REQUIRED');self.assertEqual([lane for lane,_ in effects],['base'])
+        timing=runtime.load_json(store.root/'phase-timing.json')['phase_seconds'];self.assertEqual(timing['critical_max_seconds'],57)
+        self.assertEqual(timing['critical_phases'][0]['readiness_validation_durability_cleanup_seconds'],30)
+        self.assertEqual(timing['critical_seconds'],57);self.assertIn('5'*64,self.native)
+    def test_phase_witness_sequence_operation_prior_absences_and_inventory_are_authenticated(self):
+        _,native,store,_=self.prepared_apply();self.assertEqual(native.run('apply')['result'],'APPLIED')
+        base=store.root/'phase-base.json';logs=store.root/'phase-binlog.json';original={p:p.read_bytes() for p in (base,logs)}
+        for mutation in ('first_missing','operation','prior_missing','native_hash','foreign_lane'):
+            for path,raw in original.items():path.write_bytes(raw)
+            doc=runtime.load_json(logs)
+            if mutation=='first_missing':base.unlink()
+            elif mutation=='operation':doc['operation']='untrusted'
+            elif mutation=='prior_missing':doc['prior_absence_ids']=[]
+            elif mutation=='native_hash':doc['native_inventory_sha256']='0'*64
+            else:runtime.atomic_json(store.root/'phase-foreign.json',doc)
+            doc['phase_sha256']=retention_apply.document_digest({k:v for k,v in doc.items() if k!='phase_sha256'});runtime.atomic_json(logs,doc)
+            with self.subTest(mutation=mutation),self.assertRaises(guards.GuardError):store.phase_documents()
+            (store.root/'phase-foreign.json').unlink(missing_ok=True)
+        for path,raw in original.items():path.write_bytes(raw)
+        self.assertEqual(set(store.phase_documents()),{'base','binlog'})
     def test_cached_audit_reads_sealed_bytes_and_rejects_splitting_base_coordinate(self):
         import retention_cohort
         cohort,_=retention_cohort.CohortStore(self.w).capture();target=self.root/'audited';target.mkdir(mode=0o700)
@@ -285,6 +530,18 @@ class NativeCohortTests(unittest.TestCase):
         self.catalog().admit('binlog',sid,meta,body,directory);self.native[sid]=('binlog',meta)
         state=runtime.UploadJournal(self.root/'receipts/binlog',self.w.c['generation']).state()
         state['confirmed'].append({'id':sid,'token':'9'*32,'manifest_sha256':hashlib.sha256(body).hexdigest()});runtime.atomic_json(self.root/'receipts/binlog/state.json',state)
+        return sid
+    def append_base(self,filename):
+        sid='a'*64;directory=self.root/'cache/new-base';directory.mkdir(mode=0o700)
+        data=b'synthetic database bytes';(directory/'db.sql').write_bytes(data);os.chmod(directory/'db.sql',0o600)
+        manifest={**self.manifest,**self.initial['manifests']['3'*64],'source':self.w.source,'kind':'full',
+                  'captured_at':NOW.isoformat(),'stage_app_sha':self.w.c['stage_app_sha'],'coordinates':{'file':filename,'position':4}}
+        body=json.dumps(manifest).encode();(directory/'manifest.json').write_bytes(body);os.chmod(directory/'manifest.json',0o600)
+        meta={'id':sid,'tree':'b'*64,'time':NOW.isoformat(),'paths':[str(self.root/'spool/base-payload')],
+              'tags':['task047','generation:'+self.w.c['generation'],'token:'+'a'*32,'manifest-sha:'+hashlib.sha256(body).hexdigest()]}
+        self.catalog().admit('base',sid,meta,body,directory);self.native[sid]=('base',meta)
+        state=runtime.UploadJournal(self.root/'receipts/base',self.w.c['generation']).state()
+        state['confirmed'].append({'id':sid,'token':'a'*32,'manifest_sha256':hashlib.sha256(body).hexdigest()});runtime.atomic_json(self.root/'receipts/base/state.json',state)
         return sid
     def test_safe_minute_arrival_crosses_all_producers_origin_loader_pure_intent_and_exact_effect(self):
         import retention_cohort

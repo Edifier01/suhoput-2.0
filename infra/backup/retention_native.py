@@ -51,6 +51,69 @@ class IntentStore:
         guards.require(isinstance(name,str) and name.startswith('receipt-') and name.endswith('.json'),'Invalid receipt pointer')
         guards.hex_id(name[8:-5],32);path=private_path(self.root/name)
         guards.require(sha(path)==pointer['sha256'],'Durable receipt hash differs');return runtime.load_json(path)
+    def phase_documents(self):
+        intent=self.load();baseline={row['id']:row for row in intent['before_inventory']['snapshots']};known=dict(baseline);result={};attempted=set()
+        expected_lanes=[lane for lane in ('base','binlog') if any(row['lane']==lane and row['id'] in intent['candidate_ids'] for row in baseline.values())] or ['no-op']
+        guards.require(all(path.name in ('phase-base.json','phase-binlog.json','phase-no-op.json','phase-timing.json') for path in self.root.glob('phase-*.json')),'Unknown phase authorization file')
+        for lane in ('base','binlog','no-op'):
+            path=self.root/('phase-'+lane+'.json')
+            if not path.exists():continue
+            doc=runtime.load_json(private_path(path));body={key:value for key,value in doc.items() if key!='phase_sha256'}
+            guards.require(len(result)<len(expected_lanes) and lane==expected_lanes[len(result)] and doc['operation']=='native-retention-phase-authorization' and
+                           doc['phase_sha256']==retention_apply.document_digest(body) and doc['intent_sha256']==intent['intent_sha256'] and
+                           doc['lane']==lane and doc['previous']=={key:value['phase_sha256'] for key,value in result.items()},'Phase authorization changed')
+            expected=sorted(row['id'] for row in baseline.values() if row['lane']==lane and row['id'] in intent['candidate_ids'])
+            guards.require(doc['candidate_ids']==expected and doc['prior_absence_ids']==sorted(set(doc['prior_absence_ids'])) and
+                           set(doc['prior_absence_ids'])==attempted,'Unknown or incomplete prior phase effect/absence')
+            for row in doc['arrival_rows']:
+                guards.require(row['id'] not in baseline and (row['id'] not in known or known[row['id']]==row),'Phase arrival identity changed');known[row['id']]=row
+            snapshot_rows=[row for sid,row in known.items() if sid not in doc['prior_absence_ids']]
+            view={'generation':intent['generation'],'repositories':intent['repositories'],'snapshots':snapshot_rows}
+            guards.require(__import__('retention').inventory_digest(view)==doc['native_inventory_sha256'],'Phase current inventory cannot be reconstructed')
+            authorized=guards.utc(doc['authorized_at'])
+            guards.require(authorized>=guards.utc(intent['prepared_at']) and all(authorized>=guards.utc(row['authorized_at']) for row in result.values()),'Phase authorization clock rollback')
+            attempted.update(expected);result[lane]=doc
+        return result
+    def phase_refs(self):
+        return {lane:{'file':'phase-'+lane+'.json','sha256':sha(private_path(self.root/('phase-'+lane+'.json'))),'document_sha256':doc['phase_sha256']}
+                for lane,doc in self.phase_documents().items()}
+    def attempted_ids(self):return sorted({sid for doc in self.phase_documents().values() for sid in doc['candidate_ids']})
+    def phase_document(self,lane,current,prior_absences,at):
+        intent=getattr(self,'staged_intent',None) or self.load();baseline={row['id']:row for row in intent['before_inventory']['snapshots']}
+        previous=self.phase_documents() if self.root.exists() else {}
+        guards.require(lane not in previous and lane in ('base','binlog','no-op'),'Existing phase never resumes')
+        body={'operation':'native-retention-phase-authorization','intent_sha256':intent['intent_sha256'],'lane':lane,
+              'candidate_ids':sorted(row['id'] for row in baseline.values() if row['lane']==lane and row['id'] in intent['candidate_ids']),
+              'authorized_at':at.isoformat(),'native_inventory_sha256':__import__('retention').inventory_digest(current),
+              'prior_absence_ids':list(prior_absences),'arrival_rows':[row for row in current['snapshots'] if row['id'] not in baseline],
+              'previous':{key:value['phase_sha256'] for key,value in previous.items()}}
+        if callable(getattr(self,'catalog_head',None)):body['catalog_head']=copy.deepcopy(self.catalog_head())
+        guards.require(len(json.dumps(body,sort_keys=True,separators=(',',':')).encode())<=1024*1024,'Phase witness too large; capture a new outside-lock cohort')
+        self.ensure_work()
+        return {**body,'phase_sha256':retention_apply.document_digest(body)}
+    def ensure_work(self):
+        if callable(getattr(self,'work_deadline',None)):
+            import time
+            guards.require(time.monotonic()<self.work_deadline(),'Reserved phase durability/cleanup budget reached')
+    def phase(self,value):self.ensure_work();exclusive_json(self.root/('phase-'+value['lane']+'.json'),value)
+
+class StagedFiles:
+    """Owned fsynced payloads prepared without holding upload/job locks."""
+    def __init__(self,root):
+        parent=root/'receipts/retention-staging';parent.mkdir(mode=0o700,exist_ok=True);protected_directory(parent)
+        self.root=parent/uuid.uuid4().hex;self.root.mkdir(mode=0o700);self.files=[]
+    def json(self,name,value):
+        path=self.root/name;exclusive_json(path,value);self.files.append(path);return path
+    def promote(self,path,target):
+        guards.require(path in self.files and path.exists(),'Unknown staged publication')
+        os.replace(private_path(path),target);runtime.directory_sync(pathlib.Path(target).parent);private_path(target)
+    def cleanup(self):
+        # Only this object's fixed owned paths are removed, after all four
+        # job/upload locks release. Unknown content preserves the orphan.
+        for path in self.files:
+            if path.exists():private_path(path).unlink()
+        for parent in sorted({path.parent for path in self.files if path.parent!=self.root},key=lambda path:len(path.parts),reverse=True):parent.rmdir()
+        self.root.rmdir();runtime.directory_sync(self.root.parent)
 
 class NewIntentStore(IntentStore):
     """Publish the new attempt directory only after final native admission."""
@@ -61,9 +124,16 @@ class NewIntentStore(IntentStore):
     def load(self):
         if not self.root.exists():return None
         protected_directory(self.root);return super().load()
+    def stage(self,value):
+        self.staged_intent=value;self.staging=StagedFiles(self.root.parents[2])
+        self.staged_path=self.staging.json('intent.json',value);self.staged_sha=sha(self.staged_path)
     def prepare(self,value):
+        self.ensure_work()
+        if hasattr(self,'staged_path'):
+            guards.require(value==self.staged_intent and sha(self.staged_path)==self.staged_sha,'Staged intent bytes changed')
         self.root.mkdir(mode=0o700);runtime.directory_sync(self.root.parent)
-        super().prepare(value)
+        if hasattr(self,'staged_path'):self.staging.promote(self.staged_path,self.path)
+        else:super().prepare(value)
 
 class ExactRunner:
     def __init__(self,worker,intent_reader,deadline=None):self.w=worker;self.intent_reader=intent_reader;self.deadline=deadline
@@ -195,35 +265,158 @@ def publish_owner(worker):
                  completed_at=retention_cohort.clock().isoformat())
     return publish_evidence(w,'owner',proof,inventory,started.isoformat())
 
-def verified_tombstones(worker):
-    """Re-derive every journal absence from immutable root intent/receipt bytes."""
+def _receipt_documents(store):
+    result={}
+    for path in sorted(store.root.glob('receipt-*.json')):
+        raw=private_path(path).read_bytes();doc=runtime.load_json(path)
+        guards.require(raw==json.dumps(doc,sort_keys=True,separators=(',',':'),allow_nan=False).encode()+b'\n','Immutable receipt bytes differ')
+        key=retention_apply.document_digest(doc)
+        result.setdefault(key,{'document':doc,'file':path.name,'sha256':hashlib.sha256(raw).hexdigest()})
+    return result
+
+def _recorded_retirements(worker,intent):
+    journals={lane:runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state() for lane in ('base','binlog')}
+    return {lane:[row for row in journal.get('retention',[]) if row['intent_sha256']==intent['intent_sha256']] for lane,journal in journals.items()}
+
+def _verify_recorded(intent,recorded,documents):
+    for lane,values in recorded.items():guards.require(all(row['lane']==lane for row in values),'Retirement recorded in the wrong lane journal')
+    rows=[row for values in recorded.values() for row in values];derived={}
+    for row in rows:
+        item=documents.get(row['receipt_sha256']);guards.require(item is not None,'Original retirement receipt missing')
+        proof={r['id']:r for r in retention_apply.retention_tombstones(intent,item['document'])}
+        guards.require(proof.get(row['id'])==row,'Journal retirement provenance differs')
+        guards.require(row['id'] not in derived,'Duplicate retirement identity');derived[row['id']]=row
+    return rows
+
+def verify_journal_commit(worker,store,*,receipt=None):
+    """One complete-commit verifier for closed readers and catalog checkpoints."""
+    intent=store.load();body={key:value for key,value in intent.items() if key!='intent_sha256'}
+    guards.require(retention_apply.document_digest(body)==intent['intent_sha256'] and intent['generation']==worker.c['generation'] and
+                   intent['repository_paths']==worker.c['repositories'] and intent['source']==worker.source,'Foreign or changed retirement intent')
+    marker=runtime.load_json(private_path(store.root/'journals-committed.json'));documents=_receipt_documents(store)
+    guards.require(set(marker) in ({'no_deletion'},{'intent_sha256','receipt_sha256'},
+                   {'format','operation','intent_sha256','receipt_sha256','receipt_ref','retirement_sha256','receipt_refs'}),'Malformed global journal commitment')
+    recorded=_recorded_retirements(worker,intent)
+    if marker=={'no_deletion':True}:
+        doc=store.latest();guards.require(doc['result']=='NOOP' and intent['candidate_ids']==[] and not any(recorded.values()),'No-op commitment differs')
+        return {'receipt':doc,'rows':[]}
+    guards.require(marker['intent_sha256']==intent['intent_sha256'],'Journal commit intent differs')
+    item=documents.get(marker['receipt_sha256']);guards.require(item is not None,'Committed immutable receipt missing');doc=item['document']
+    if receipt is not None:guards.require(doc==receipt,'Checkpoint latest receipt is not committed')
+    rows=_verify_recorded(intent,recorded,documents)
+    guards.require(doc['result'] in ('APPLIED','RECONCILED') and sorted(row['id'] for row in rows)==doc['forgotten_ids'],
+                   'Both journal retirement sets do not equal committed native absences')
+    # Revalidate the current committed observation even if original rows refer
+    # to older immutable observations after later read-only reconciliation.
+    retention_apply.retention_tombstones(intent,doc)
+    if intent.get('phase_protocol')=='bounded-lanes-v1':
+        guards.require(doc.get('phase_witnesses')==store.phase_refs() and set(doc['forgotten_ids'])<=set(store.attempted_ids()),'Committed phase authorization differs')
+    if set(marker)!={'intent_sha256','receipt_sha256'}:
+        guards.require(marker['format']==2 and marker['operation']=='native-retention-journals-commit','Unknown journal commitment')
+        guards.require(marker['retirement_sha256']=={lane:retention_apply.document_digest(values) for lane,values in recorded.items()},'Journal commit hashes differ')
+        keys={row['receipt_sha256'] for row in rows}|{marker['receipt_sha256']}
+        guards.require(set(marker['receipt_refs'])==keys and marker['receipt_ref']==marker['receipt_refs'][marker['receipt_sha256']],
+                       'Original immutable receipt references differ')
+        for key,ref in marker['receipt_refs'].items():
+            name=ref['file'];guards.require(pathlib.PurePath(name).name==name and name.startswith('receipt-') and name.endswith('.json'),'Foreign immutable receipt path')
+            path=private_path(store.root/name)
+            guards.require(sha(path)==ref['sha256'] and retention_apply.document_digest(runtime.load_json(path))==key,'Immutable receipt raw binding differs')
+    return {'receipt':doc,'rows':rows}
+
+def _retirements(worker,active_store=None):
     directory=worker.root/'receipts/retention-applies'
     journals={lane:runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state() for lane in ('base','binlog')}
-    recorded=[row for journal in journals.values() for row in journal.get('retention',[])]
-    if not directory.exists():
-        guards.require(not recorded,'Retirement store missing');return []
-    protected_directory(directory);derived={}
+    recorded=[row for journal in journals.values() for row in journal.get('retention',[])];derived={}
+    guards.require(len(recorded)==len({row['id'] for row in recorded}),'Duplicate retired identity')
+    if not directory.exists():guards.require(not recorded,'Retirement store missing');return [],[]
+    protected_directory(directory);active=[]
     for path in sorted(directory.iterdir()):
         guards.hex_id(path.name,64);store=IntentStore(path);intent=store.load()
-        guards.require(intent and intent['generation']==worker.c['generation'] and
-                       intent['repository_paths']==worker.c['repositories'],'Foreign retirement store')
-        if not (path/'latest.json').exists():continue
-        # Journals can bind an earlier immutable observation after a later
-        # read-only reconciliation. Revalidate those exact receipt bytes.
-        for receipt_path in sorted(path.glob('receipt-*.json')):
-            receipt=runtime.load_json(private_path(receipt_path))
-            if receipt['result'] not in ('APPLIED','RECONCILED'):continue
-            for row in retention_apply.retention_tombstones(intent,receipt):
-                matching=[r for r in recorded if r['id']==row['id'] and r['receipt_sha256']==row['receipt_sha256']]
-                if matching:
-                    sid=row['id'];guards.require(sid not in derived or derived[sid]==row,'Conflicting proven retirement');derived[sid]=row
-    # A crash can leave only one lane committed. Absences are accepted only
-    # after explicit reconciliation completes both journal writes.
-    guards.require(len(recorded)==len({r['id'] for r in recorded}) and
-                   all(derived.get(r['id'])==r for r in recorded),'Journal retirement provenance differs')
-    # Missing commitment is caught by NativeApply before effects. Reader may
-    # accept exactly committed journal rows without accepting unknown absences.
-    return recorded
+        guards.require(intent and intent['generation']==worker.c['generation'] and intent['repository_paths']==worker.c['repositories'] and
+                       intent['source']==worker.source and retention_apply.document_digest({k:v for k,v in intent.items() if k!='intent_sha256'})==intent['intent_sha256'],
+                       'Foreign or changed retirement store')
+        own=_recorded_retirements(worker,intent)
+        if active_store is not None and path==active_store.root:
+            # Explicit read-only recovery may follow a crash while replacing
+            # an older complete publication. These exact rows are internal
+            # to this intent, never exposed as globally committed absences.
+            rows=_verify_recorded(intent,own,_receipt_documents(store));active=rows;continue
+        elif (path/'journals-committed.json').exists():rows=verify_journal_commit(worker,store)['rows']
+        else:guards.require(not any(own.values()),'Incomplete journal publication; read-only reconciliation required');rows=[]
+        for row in rows:guards.require(row['id'] not in derived,'Conflicting retired identity');derived[row['id']]=row
+    guards.require(all(derived.get(row['id'])==row or row in active for row in recorded),'Unknown journal retirement intent')
+    return list(derived.values()),active
+
+def verified_tombstones(worker):
+    """Only complete global publication authorizes ordinary reader absences."""
+    rows,_=_retirements(worker);return rows
+
+def _confirmed_active(worker,current,intent,absent,store):
+    """Pending absence is internal to this exact protected live attempt only."""
+    committed,partial=_retirements(worker,store)
+    original={row['id']:row for row in intent['before_inventory']['snapshots']};absent=set(absent)
+    guards.require(absent<=set(intent['candidate_ids']) and absent<=set(original),'Unknown active absence')
+    guards.require(all(row['id'] in absent for row in partial),'Partial journal does not match actual active absence')
+    for lane in ('base','binlog'):
+        state=runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state()
+        confirmed={row['id']:(row['token'],row['manifest_sha256']) for row in state['confirmed']}
+        guards.require(len(confirmed)==len(state['confirmed']),'Duplicate active confirmation')
+        retired={row['id']:(row['token'],row['manifest_sha256']) for row in committed if row['lane']==lane}
+        active={sid:(original[sid]['token'],original[sid]['manifest_sha256']) for sid in absent if original[sid]['lane']==lane}
+        guards.require(not set(retired)&set(active) and all(confirmed.get(sid)==value for sid,value in {**retired,**active}.items()),'Active original confirmation differs')
+        actual={row['id']:(row['token'],row['manifest_sha256']) for row in current['snapshots'] if row['lane']==lane}
+        guards.require({sid:value for sid,value in confirmed.items() if sid not in retired and sid not in active}==actual,'Unknown active confirmation/native arrival')
+
+class StagedPublication:
+    """Complete receipt/journals prepared outside lanes; final marker is last."""
+    def __init__(self,worker,store,timing=None):self.w=worker;self.store=store;self.prepared=None;self.timing=timing
+    def stage(self,value):
+        import time
+        started=time.monotonic()
+        try:self._stage(value)
+        finally:
+            if self.timing is not None:self.timing['staging_seconds']+=time.monotonic()-started
+    def _stage(self,value):
+        w=self.w;store=self.store;intent=store.load();staging=StagedFiles(w.root)
+        name='receipt-'+uuid.uuid4().hex+'.json';receipt_path=staging.json(name,value)
+        documents=_receipt_documents(store);key=retention_apply.document_digest(value)
+        documents[key]={'document':value,'file':name,'sha256':sha(receipt_path)}
+        sources={};states={};row_hashes={};refs=set()
+        for lane in ('base','binlog'):
+            source=private_path(w.root/'receipts'/lane/'state.json');raw=source.read_bytes();sources[lane]=hashlib.sha256(raw).hexdigest()
+            target=staging.root/lane;target.mkdir(mode=0o700);state_path=target/'state.json'
+            with open(state_path,'xb') as output:output.write(raw);output.flush();os.fsync(output.fileno())
+            os.chmod(state_path,0o600);staging.files.append(state_path)
+            journal=runtime.UploadJournal(target,w.c['generation'])
+            if value['result']!='NOOP':journal.retire(intent,value,lane)
+            state=journal.state();own=[row for row in state.get('retention',[]) if row['intent_sha256']==intent['intent_sha256']]
+            row_hashes[lane]=retention_apply.document_digest(own);refs.update(row['receipt_sha256'] for row in own)
+            del state,own,raw
+            guards.require(sha(source)==sources[lane],'Journal changed during outside-lock staging');states[lane]=state_path
+        refs.add(key)
+        marker={'no_deletion':True} if value['result']=='NOOP' else {
+            'format':2,'operation':'native-retention-journals-commit','intent_sha256':intent['intent_sha256'],'receipt_sha256':key,
+            'receipt_ref':{field:documents[key][field] for field in ('file','sha256')},'retirement_sha256':row_hashes,
+            'receipt_refs':{ref:{field:documents[ref][field] for field in ('file','sha256')} for ref in refs}}
+        latest=staging.json('latest.json',{'file':name,'sha256':sha(receipt_path)});commit=staging.json('journals-committed.json',marker)
+        self.prepared={'value':value,'staging':staging,'name':name,'receipt':receipt_path,'states':states,'sources':sources,'latest':latest,'commit':commit}
+    def __call__(self,value):
+        if value['result']=='RECONCILE_REQUIRED':self.store.receipt(value);return
+        prepared=self.prepared;guards.require(prepared is not None and prepared['value']==value,'Completed publication was not staged')
+        for lane,digest in prepared['sources'].items():
+            guards.require(sha(private_path(self.w.root/'receipts'/lane/'state.json'))==digest,'Final journal source changed; do not overwrite arrivals')
+        self.store.ensure_work()
+        import time
+        started=time.monotonic()
+        try:
+            staging=prepared['staging'];staging.promote(prepared['receipt'],self.store.root/prepared['name'])
+            for lane,path in prepared['states'].items():self.store.ensure_work();staging.promote(path,self.w.root/'receipts'/lane/'state.json')
+            self.store.ensure_work()
+            staging.promote(prepared['latest'],self.store.root/'latest.json')
+            self.store.ensure_work()
+            staging.promote(prepared['commit'],self.store.root/'journals-committed.json')
+        finally:
+            if self.timing is not None:self.timing['journal_seconds']+=time.monotonic()-started
 
 def retained_chain(chain,tombstones):
     result=copy.deepcopy(chain);retired={r['id']:r for r in tombstones if r['lane']=='binlog'}
@@ -247,7 +440,8 @@ class NativeApply:
         w=self.w;w.gate();directory=w.root/'receipts/retention-applies'
         if not directory.exists():directory.mkdir(mode=0o700);runtime.directory_sync(directory.parent)
         protected_directory(directory);scan_started=time.monotonic()
-        timing={key:0 for key in ('scan_seconds','critical_seconds','effect_seconds','journal_seconds','checkpoint_seconds')}
+        timing={key:0 for key in ('scan_seconds','critical_seconds','critical_max_seconds','effect_seconds','journal_seconds','checkpoint_seconds','staging_seconds','staging_cleanup_seconds')}
+        timing['critical_phases']=[]
         with runtime.lane_lock(w.root/'receipts/retention-apply.lock'):
             catalog=backup_catalog.ArchiveCatalog(w)
             # A interrupted own checkpoint is never silently reset. Explicit
@@ -261,9 +455,35 @@ class NativeApply:
                     ids=retention_cohort.repository_ids(w)
                     current_reader=[reader]
                     critical_deadline=[None]
+                    active_phase=[None]
                     def read():
-                        current_reader[0]=current_reader[0].refresh()
-                        return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0])
+                        started=time.monotonic()
+                        try:
+                            current_reader[0]=current_reader[0].refresh()
+                            return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0])
+                        finally:
+                            if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
+                    from contextlib import contextmanager
+                    @contextmanager
+                    def section(name):
+                        # Native work ends before the reserved durability and
+                        # termination tail. Timestamp precedes the first lock;
+                        # final measurement follows the last lock release.
+                        started=time.monotonic()
+                        phase={'name':name,'seconds':0,'native_inventory_seconds':0,'effect_seconds':0,'journal_seconds':0}
+                        effect_before=timing['effect_seconds'];journal_before=timing['journal_seconds'];active_phase[0]=phase
+                        if not timing['critical_phases']:timing['scan_seconds']=started-scan_started
+                        try:
+                            with retention_cohort.upload_section(w):
+                                critical_deadline[0]=started+retention_cohort.MAX_CRITICAL_SECONDS-10
+                                retention_cohort.ready(w);yield
+                        finally:
+                            critical_deadline[0]=None;elapsed=time.monotonic()-started
+                            active_phase[0]=None;phase.update(seconds=elapsed,effect_seconds=timing['effect_seconds']-effect_before,journal_seconds=timing['journal_seconds']-journal_before)
+                            phase['readiness_validation_durability_cleanup_seconds']=max(0,elapsed-phase['native_inventory_seconds']-phase['effect_seconds']-phase['journal_seconds'])
+                            timing['critical_seconds']+=elapsed;timing['critical_max_seconds']=max(timing['critical_max_seconds'],elapsed)
+                            timing['critical_phases'].append(phase)
+                            guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual continuous phase lock limit exceeded')
                     unfinished=[]
                     for path in directory.iterdir():
                         guards.hex_id(path.name,64);old=IntentStore(path)
@@ -275,23 +495,14 @@ class NativeApply:
                     if unfinished:
                         guards.require(mode=='reconcile' and len(unfinished)==1,'Prior ambiguous apply requires read-only reconciliation')
                         store=unfinished[0]
-                        # Read-only reconciliation may be expensive; only its
-                        # exact protected journal publication needs lane locks.
-                        ex=retention_apply.Executor(read,ExactRunner(w,store.load),store,store.receipt,w.c['repositories'],clock=retention_cohort.clock)
-                        receipt=ex.reconcile(retention_cohort.clock())
-                        timing['scan_seconds']=time.monotonic()-scan_started;critical=time.monotonic()
-                        with retention_cohort.upload_section(w):
-                            critical_deadline[0]=time.monotonic()+retention_cohort.MAX_CRITICAL_SECONDS
-                            try:
-                                retention_cohort.ready(w)
-                                # Arrivals can occur between the unlocked scan
-                                # and this publication. Derive a fresh immutable
-                                # observation while upload jobs are excluded.
-                                receipt=ex.reconcile(retention_cohort.clock())
-                                journal_started=time.monotonic();self._journals(store,receipt)
-                                timing['journal_seconds']+=time.monotonic()-journal_started
-                            finally:critical_deadline[0]=None
-                        timing['critical_seconds']=time.monotonic()-critical
+                        store.work_deadline=lambda:critical_deadline[0]
+                        publication=StagedPublication(w,store,timing)
+                        ex=retention_apply.Executor(read,ExactRunner(w,store.load),store,publication,w.c['repositories'],clock=retention_cohort.clock,
+                             phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
+                        try:receipt=ex.reconcile(retention_cohort.clock())
+                        finally:
+                            if publication.prepared is not None:
+                                started=time.monotonic();publication.prepared['staging'].cleanup();timing['staging_cleanup_seconds']+=time.monotonic()-started
                     else:
                         guards.require(mode=='apply','No unfinished intent to reconcile')
                         inventory=retention_cohort.CohortStore(w).load(reader)
@@ -303,33 +514,21 @@ class NativeApply:
                         key=inventory['cohort']['sha256'];path=directory/key
                         guards.require(not path.exists() and not path.is_symlink(),'Existing cohort attempt; preserve, no retry')
                         store=NewIntentStore(path)
-                        from contextlib import contextmanager
-                        @contextmanager
-                        def section():
-                            timing['scan_seconds']=time.monotonic()-scan_started;critical=time.monotonic()
-                            with retention_cohort.upload_section(w):
-                                critical_deadline[0]=time.monotonic()+retention_cohort.MAX_CRITICAL_SECONDS
-                                retention_cohort.ready(w)
-                                try:yield
-                                finally:timing['critical_seconds']=time.monotonic()-critical;critical_deadline[0]=None
-                        def write(value):
-                            value['phase_seconds']=dict(timing)
-                            # Includes exact effect/readback elapsed time so far.
-                            value['phase_seconds']['critical_seconds']=time.monotonic()-critical_started[0]
-                            journal_started=time.monotonic();store.receipt(value);self._journals(store,value)
-                            timing['journal_seconds']+=time.monotonic()-journal_started
-                        critical_started=[0]
-                        @contextmanager
-                        def measured_section():
-                            with section():critical_started[0]=time.monotonic();yield
+                        store.work_deadline=lambda:critical_deadline[0];store.catalog_head=lambda:current_reader[0].head
+                        publication=StagedPublication(w,store,timing)
                         runner=ExactRunner(w,store.load,deadline=lambda:critical_deadline[0])
                         def effect(lane,argv):
                             effect_started=time.monotonic()
                             try:return runner(lane,argv)
                             finally:timing['effect_seconds']+=time.monotonic()-effect_started
-                        ex=retention_apply.Executor(read,effect,store,write,w.c['repositories'],clock=retention_cohort.clock,
-                             effect_section=measured_section,pre_effect=lambda current:retention_cohort.confirmed(w,current))
-                        receipt=ex.apply(inventory,plan,evidence,at);receipt=store.latest()
+                        ex=retention_apply.Executor(read,effect,store,publication,w.c['repositories'],clock=retention_cohort.clock,
+                             phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
+                        try:receipt=ex.apply(inventory,plan,evidence,at);receipt=store.latest()
+                        finally:
+                            started=time.monotonic()
+                            if hasattr(store,'staging'):store.staging.cleanup()
+                            if publication.prepared is not None:publication.prepared['staging'].cleanup()
+                            timing['staging_cleanup_seconds']+=time.monotonic()-started
         # Native exact effects and both protected journals precede checkpoint.
         # checkpoint() owns its own upload locks, so no caller locks remain.
         if checkpoint_only:
@@ -339,7 +538,8 @@ class NativeApply:
             # This sidecar records actual completed phase durations without
             # rewriting the immutable receipt hash acknowledged by journals.
             runtime.atomic_json(store.root/'phase-timing.json',{'operation':'native-retention-phase-timing',
-                                'receipt_sha256':retention_apply.document_digest(receipt),'phase_seconds':dict(timing)})
+                                'receipt_sha256':retention_apply.document_digest(receipt),'intent_sha256':receipt['intent_sha256'],
+                                'phase_witnesses':receipt.get('phase_witnesses',{}),'phase_seconds':dict(timing)})
         save_timing()
         if receipt['result'] in ('APPLIED','RECONCILED') and receipt.get('present_candidate_ids')==[]:
             checkpoint_started=time.monotonic()
