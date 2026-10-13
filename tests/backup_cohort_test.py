@@ -522,6 +522,30 @@ class NativeCohortTests(unittest.TestCase):
              mock.patch.object(backup_catalog.ArchiveReader,'__init__',reader), \
              mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',check):result=native.run('apply')
         self.assertEqual(result['result'],'APPLIED');self.assertEqual([lane for lane,_ in effects],['base','binlog'])
+    def test_checkpoint_failure_sidecar_records_actual_duration_without_mutating_applied_receipt(self):
+        import contextlib,backup_catalog,retention_cohort
+        _,native,store,effects=self.prepared_apply();elapsed=[0.0];checkpoint=backup_catalog.ArchiveCatalog.checkpoint;section=retention_cohort.upload_section
+        @contextlib.contextmanager
+        def slow(worker):
+            with section(worker):
+                try:yield
+                finally:elapsed[0]+=60
+        def check(catalog,**kwargs):
+            with mock.patch.object(retention_cohort,'upload_section',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):return checkpoint(catalog,**kwargs)
+        with mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',check),self.assertRaises(guards.GuardError):native.run('apply')
+        receipt=store.latest();self.assertEqual(receipt['result'],'APPLIED');self.assertEqual([lane for lane,_ in effects],['base','binlog'])
+        sidecar=runtime.load_json(store.root/'phase-timing.json')
+        self.assertEqual(sidecar['receipt_sha256'],retention_apply.document_digest(receipt))
+        self.assertEqual(sidecar['phase_seconds']['checkpoint_phase_seconds'],{'critical_seconds':60,'critical_max_seconds':60})
+        self.assertFalse(self.catalog().checkpoint_pending.exists());self.assertEqual(len(retention_native.verified_tombstones(self.w)),2)
+    def test_checkpoint_only_reconcile_reports_physical_section_and_never_repeats_native_effects(self):
+        import backup_catalog
+        _,native,store,effects=self.prepared_apply()
+        with mock.patch.object(backup_catalog.ArchiveCatalog,'_checkpoint_insert',side_effect=OSError('Before metadata transaction')),self.assertRaises(OSError):native.run('apply')
+        original=store.latest();self.assertEqual(original['result'],'APPLIED');self.assertTrue(self.catalog().checkpoint_pending.exists())
+        result=native.run('reconcile');self.assertEqual(result['result'],'RECONCILED');self.assertEqual(result['remote_delete_calls'],0)
+        self.assertEqual([lane for lane,_ in effects],['base','binlog']);self.assertEqual(store.latest(),original)
+        self.assertIn('checkpoint_phase_seconds',result['phase_seconds']);self.assertFalse(self.catalog().checkpoint_pending.exists())
     def test_cached_audit_reads_sealed_bytes_and_rejects_splitting_base_coordinate(self):
         import retention_cohort
         cohort,_=retention_cohort.CohortStore(self.w).capture();target=self.root/'audited';target.mkdir(mode=0o700)

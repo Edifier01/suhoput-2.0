@@ -456,7 +456,11 @@ class NativeApply:
         # Native exact effects and both protected journals precede checkpoint.
         # checkpoint() owns its own upload locks, so no caller locks remain.
         if checkpoint_only:
-            result=catalog.checkpoint(reconcile=True)
+            checkpoint_started=time.monotonic()
+            try:result=catalog.checkpoint(reconcile=True)
+            finally:
+                timing['checkpoint_seconds']=time.monotonic()-checkpoint_started
+                if hasattr(catalog,'last_checkpoint_timing'):timing['checkpoint_phase_seconds']=dict(catalog.last_checkpoint_timing)
             return {'result':'RECONCILED','operation':'native-catalog-checkpoint','remote_delete_calls':0,**result,'phase_seconds':timing}
         store=IntentStore(attempt_path)
         def save_timing():
@@ -469,7 +473,10 @@ class NativeApply:
         if receipt['result'] in ('APPLIED','RECONCILED') and receipt.get('present_candidate_ids')==[]:
             checkpoint_started=time.monotonic()
             try:catalog.checkpoint()
-            finally:timing['checkpoint_seconds']=time.monotonic()-checkpoint_started;save_timing()
+            finally:
+                timing['checkpoint_seconds']=time.monotonic()-checkpoint_started
+                if hasattr(catalog,'last_checkpoint_timing'):timing['checkpoint_phase_seconds']=dict(catalog.last_checkpoint_timing)
+                save_timing()
         return receipt
     def _attempt(self,catalog,directory,mode,timing,scan_started):
         """End the lifetime of all heavy attempt views before checkpoint starts."""

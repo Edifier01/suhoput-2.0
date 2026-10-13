@@ -46,6 +46,9 @@ def canonical(value):
 
 def digest(value):return hashlib.sha256(value).hexdigest()
 
+def _check_deadline(deadline):
+    if deadline is not None:guards.require(time.monotonic()<deadline,'Catalog checkpoint critical deadline exceeded')
+
 def decode(raw,limit=MAX_RAW_BYTES):
     guards.require(isinstance(raw,bytes) and len(raw)<=limit,'Catalog JSON oversized')
     try:
@@ -268,9 +271,11 @@ class ArchiveCatalog:
         guards.require(record['raw_compressed_sha256']==digest(body),'Catalog raw body seal differs')
         return record
 
-    def _scan(self,db,head):
+    def _scan(self,db,head,*,deadline=None):
+        _check_deadline(deadline)
         self._tail(db,head);witness=self._checkpoint_record(db,head);result={};previous=self._seed(head);sequence=0;tokens=set();baseline=[]
         for row in db.execute('SELECT sequence,sid,token,record,body,chain FROM archives ORDER BY sequence'):
+            _check_deadline(deadline)
             sequence+=1;guards.require(row[0]==sequence and sequence<=MAX_RECORDS,'Catalog record missing/reordered')
             record=self._row(row);expected=digest(bytes.fromhex(previous)+row[3])
             guards.require(row[5]==expected and row[1] not in result and row[2] not in tokens,'Catalog ordered chain/identity differs')
@@ -279,12 +284,13 @@ class ArchiveCatalog:
             previous=expected;tokens.add(row[2]);result[row[1]]=record
             if witness and sequence<=witness['survivor_count']:baseline.append(record)
         guards.require(sequence==head['sequence'] and previous==head['chain'],'Catalog head/index differs')
-        if witness:self._reconstruct(witness,baseline)
+        if witness:self._reconstruct(witness,baseline,deadline=deadline)
         expected={(sid,item['file']):item for sid,record in result.items() for item in record['cached_logs']}
         for sid,name,body in db.execute('SELECT sid,name,body FROM logs ORDER BY sid,name'):
+            _check_deadline(deadline)
             item=expected.pop((sid,name),None)
             guards.require(item is not None and isinstance(body,bytes) and len(body)<=MAX_FILE_BYTES and digest(body)==item['compressed_sha256'],'Catalog cached binlog seal differs')
-        guards.require(not expected,'Catalog cached binlog missing');return result
+        guards.require(not expected,'Catalog cached binlog missing');_check_deadline(deadline);return result
 
     def entries(self):
         with runtime.lane_lock(self.lock),self._db() as db:
@@ -455,12 +461,14 @@ class ArchiveCatalog:
             raise CatalogCapacityError('Catalog measured allocation/disk reserve exceeded before commit')
 
     @staticmethod
-    def _records_digest(records):
+    def _records_digest(records,*,deadline=None):
         value=hashlib.sha256()
-        for record in records:value.update(bytes.fromhex(record['id']));value.update(bytes.fromhex(digest(canonical(record))))
+        for record in records:
+            _check_deadline(deadline);value.update(bytes.fromhex(record['id']));value.update(bytes.fromhex(digest(canonical(record))))
+        _check_deadline(deadline)
         return value.hexdigest()
 
-    def _reconstruct(self,witness,survivors):
+    def _reconstruct(self,witness,survivors,*,deadline=None):
         """Reconstruct the prior committed compact chain, including retired rows.
 
         This roots a pending checkpoint in the old independent head even if its
@@ -469,10 +477,11 @@ class ArchiveCatalog:
         """
         prior=witness['prior_head'];retired={item['sequence']:item for item in witness['retired']}
         guards.require(len(retired)==len(witness['retired']) and len(survivors)==witness['survivor_count'] and
-                       self._records_digest(survivors)==witness['survivors_sha256'] and
+                       self._records_digest(survivors,deadline=deadline)==witness['survivors_sha256'] and
                        len(survivors)+len(retired)==prior['sequence'],'Catalog checkpoint reconstructed record set differs')
         previous=self._seed(prior);iterator=iter(survivors);ids=set()
         for sequence in range(1,prior['sequence']+1):
+            _check_deadline(deadline)
             if sequence in retired:
                 item=retired[sequence];record=item['record'];proof=item['proof']
                 guards.require(all(record[key]==proof[key] for key in ('id','lane','token','manifest_sha256','generation')),'Catalog retired proof identity differs')
@@ -480,7 +489,7 @@ class ArchiveCatalog:
                 record=next(iterator,None);guards.require(record is not None,'Catalog checkpoint survivor missing')
             guards.require(record['id'] not in ids,'Catalog checkpoint duplicated prior identity');ids.add(record['id'])
             previous=digest(bytes.fromhex(previous)+canonical(record))
-        guards.require(previous==prior['chain'],'Catalog checkpoint prior-head reconstruction differs')
+        guards.require(previous==prior['chain'],'Catalog checkpoint prior-head reconstruction differs');_check_deadline(deadline)
 
     def _retirement_evidence(self,records,deadline=None):
         import retention,retention_apply,retention_native,restic_adapter
@@ -569,19 +578,25 @@ class ArchiveCatalog:
         # catalog lock. Appends are subsequently sealed from the captured head.
         self._retirement_evidence(records)
         reader=ArchiveReader(self,head,records)
+        started=time.monotonic();hard_deadline=started+retention_cohort.MAX_CRITICAL_SECONDS;deadline=hard_deadline-10
         try:
             with retention_cohort.upload_section(self.worker):
-                deadline=time.monotonic()+retention_cohort.MAX_CRITICAL_SECONDS
+                _check_deadline(deadline)
                 retention_cohort.ready_uploads(self.worker)
                 if marker is None:reader=reader.refresh();head=reader.head;records=reader._records
+                _check_deadline(deadline)
                 with runtime.lane_lock(self.lock),self._db(write=True) as db:
                     guards.require(self._head()==head,'Catalog changed before final checkpoint section')
                     current_marker=read_file(self.checkpoint_pending,MAX_CHECKPOINT_BYTES) if self.checkpoint_pending.exists() else None
                     guards.require(current_marker==marker,'Checkpoint publication changed during unlocked audit')
-                    return self._checkpoint_locked(db,head,records,reconcile,deadline)
-        finally:reader.active=False
+                    result=self._checkpoint_locked(db,head,records,reconcile,deadline,hard_deadline)
+        finally:
+            reader.active=False;elapsed=time.monotonic()-started
+            self.last_checkpoint_timing={'critical_seconds':elapsed,'critical_max_seconds':elapsed}
+            guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual catalog checkpoint continuous lock limit exceeded')
+        return {**result,'phase_seconds':self.last_checkpoint_timing}
 
-    def _checkpoint_locked(self,db,head,records,reconcile,deadline):
+    def _checkpoint_locked(self,db,head,records,reconcile,deadline,hard_deadline):
         guards.require(not self.pending.exists(),'Interrupted admission blocks catalog checkpoint')
         if self.checkpoint_pending.exists():
             guards.require(reconcile is True,'Interrupted catalog checkpoint; explicit native reconciliation required')
@@ -591,24 +606,28 @@ class ArchiveCatalog:
             exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_checkpoint'").fetchone()
             current=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone() if exists else None
             committed=current is not None and digest(current[0])==nexthead['checkpoint']['sha256']
-            records=self._scan(db,nexthead if committed else prior)
+            records=self._scan(db,nexthead if committed else prior,deadline=deadline)
             survivors=list(records.values()) if committed else [r for r in records.values() if r['id'] not in {item['record']['id'] for item in witness['retired']}]
-            self._reconstruct(witness,survivors)
-            guards.require(self._checkpoint_head(witness,survivors)==nexthead,'Interrupted catalog checkpoint publication differs')
+            self._reconstruct(witness,survivors,deadline=deadline)
+            guards.require(self._checkpoint_head(witness,survivors,deadline=deadline)==nexthead,'Interrupted catalog checkpoint publication differs')
             proofs,_=self._retirement_evidence(records,deadline=deadline)
             guards.require(all(proofs.get(item['record']['id'])==item['proof'] for item in witness['retired']),'Interrupted checkpoint native retirement proof differs')
             if not committed:
                 guards.require(head==prior,'Checkpoint prior index after new head publication')
-                try:self._checkpoint_insert(db,witness,survivors,nexthead)
+                _check_deadline(deadline)
+                try:self._checkpoint_insert(db,witness,survivors,nexthead,deadline=hard_deadline)
                 except CatalogCapacityError:
                     self._tail(db,prior);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);raise
-            runtime.atomic_json(self.head,nexthead);self.checkpoint_pending.unlink();runtime.directory_sync(self.root)
+            _check_deadline(hard_deadline);runtime.atomic_json(self.head,nexthead)
+            _check_deadline(hard_deadline);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);_check_deadline(hard_deadline)
             return {'retired_ids':[item['record']['id'] for item in witness['retired']],'head':nexthead}
         proofs,inventory=self._retirement_evidence(records,deadline=deadline)
+        _check_deadline(deadline)
         eligible=[(sequence,record) for sequence,record in enumerate(records.values(),1) if record['id'] in proofs]
         if not eligible:return {'retired_ids':[],'head':head}
         retired=[]
         for sequence,record in eligible[:256]:
+            _check_deadline(deadline)
             item={'sequence':sequence,'record':record,'proof':proofs[record['id']]}
             # Leave enough room for bounded marker/witness publication.
             if len(canonical(retired+[item]))>MAX_CHECKPOINT_BYTES//2:break
@@ -616,40 +635,47 @@ class ArchiveCatalog:
         guards.require(retired,'Retirement witness exceeds bounded publication; no data removed')
         ids={item['record']['id'] for item in retired};survivors=[r for r in records.values() if r['id'] not in ids]
         witness={'format':1,'operation':'native-verified-catalog-checkpoint','prior_head':head,'epoch':head.get('checkpoint',{}).get('epoch',0)+1,
-                 'retired':retired,'survivor_count':len(survivors),'survivors_sha256':self._records_digest(survivors),
+                 'retired':retired,'survivor_count':len(survivors),'survivors_sha256':self._records_digest(survivors,deadline=deadline),
                  'native_inventory_sha256':__import__('retention').inventory_digest(inventory)}
         witness['lineage_sha256']=digest(bytes.fromhex(head.get('checkpoint',{}).get('lineage_sha256',ZERO))+canonical(witness))
-        nexthead=self._checkpoint_head(witness,survivors)
+        nexthead=self._checkpoint_head(witness,survivors,deadline=deadline)
         guards.require(shutil.disk_usage(self.root).free>=5*1024**3+2*self.database.stat().st_size+len(canonical(witness))+MAX_RECORD_BYTES,'Catalog checkpoint journal reserve exceeded')
         guards.require(time.monotonic()<deadline,'Checkpoint validation critical deadline exceeded')
-        runtime.atomic_json(self.checkpoint_pending,{'witness':witness,'next_head':nexthead})
-        try:self._checkpoint_insert(db,witness,survivors,nexthead)
+        runtime.atomic_json(self.checkpoint_pending,{'witness':witness,'next_head':nexthead});_check_deadline(hard_deadline)
+        try:self._checkpoint_insert(db,witness,survivors,nexthead,deadline=hard_deadline)
         except CatalogCapacityError:
             self._tail(db,head);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);raise
-        runtime.atomic_json(self.head,nexthead);self.checkpoint_pending.unlink();runtime.directory_sync(self.root)
+        _check_deadline(hard_deadline);runtime.atomic_json(self.head,nexthead)
+        _check_deadline(hard_deadline);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);_check_deadline(hard_deadline)
         return {'retired_ids':sorted(ids),'head':nexthead}
 
-    def _checkpoint_head(self,witness,survivors):
+    def _checkpoint_head(self,witness,survivors,*,deadline=None):
         seed=digest(canonical(witness));chain=seed
-        for record in survivors:chain=digest(bytes.fromhex(chain)+canonical(record))
+        for record in survivors:_check_deadline(deadline);chain=digest(bytes.fromhex(chain)+canonical(record))
+        _check_deadline(deadline)
         return {**self.binding,'sequence':len(survivors),'chain':chain,
                 'checkpoint':{'epoch':witness['epoch'],'sha256':seed,'lineage_sha256':witness['lineage_sha256']}}
 
-    def _checkpoint_insert(self,db,witness,survivors,nexthead):
+    def _checkpoint_insert(self,db,witness,survivors,nexthead,*,deadline=None):
         try:
+            _check_deadline(deadline)
             self._allocation_limit(db);db.execute('BEGIN IMMEDIATE')
             for item in witness['retired']:
+                _check_deadline(deadline)
                 sid=item['record']['id'];db.execute('DELETE FROM logs WHERE sid=?',(sid,));db.execute('DELETE FROM archives WHERE sid=?',(sid,))
             db.execute('UPDATE archives SET sequence=-sequence')
             chain=self._seed(nexthead)
             for sequence,record in enumerate(survivors,1):
-                chain=digest(bytes.fromhex(chain)+canonical(record));db.execute('UPDATE archives SET sequence=?,chain=? WHERE sid=?',(sequence,chain,record['id']))
+                _check_deadline(deadline);chain=digest(bytes.fromhex(chain)+canonical(record));_check_deadline(deadline)
+                db.execute('UPDATE archives SET sequence=?,chain=? WHERE sid=?',(sequence,chain,record['id']))
+            _check_deadline(deadline)
             db.execute('CREATE TABLE IF NOT EXISTS catalog_checkpoint (slot INTEGER PRIMARY KEY CHECK(slot=1), record BLOB NOT NULL)')
             db.execute('INSERT OR REPLACE INTO catalog_checkpoint VALUES(1,?)',(canonical(witness),))
-            self._allocation_check(db);db.commit()
-        except (sqlite3.Error,CatalogCapacityError) as error:
+            self._allocation_check(db);_check_deadline(deadline);db.commit();_check_deadline(deadline)
+        except (sqlite3.Error,guards.GuardError) as error:
             db.rollback()
             if isinstance(error,CatalogCapacityError) or getattr(error,'sqlite_errorcode',None)==sqlite3.SQLITE_FULL:
                 raise CatalogCapacityError('Catalog checkpoint allocation refused; prior sealed data preserved') from error
             raise
-        self._sync_db();self._scan(db,nexthead)
+        _check_deadline(deadline);self._sync_db();_check_deadline(deadline)
+        self._scan(db,nexthead,deadline=deadline);_check_deadline(deadline)

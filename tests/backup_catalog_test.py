@@ -304,6 +304,79 @@ class WorkerAdmissionTests(unittest.TestCase):
         self.assertFalse(any(cmd[0]=='restore' for cmd in commands))
 
 class CatalogLifecycleTests(unittest.TestCase):
+    def test_checkpoint_sixty_second_committed_tail_fails_and_preserves_pending_for_read_only_reconcile(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        before=self.c.head.read_bytes();elapsed=[0.0];original=self.c._checkpoint_insert
+        def slow(*args,**kwargs):original(*args,**kwargs);elapsed[0]+=60
+        with mock.patch.object(self.c,'_checkpoint_insert',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertEqual(self.c.head.read_bytes(),before);self.assertTrue(self.c.checkpoint_pending.exists())
+        with self.assertRaises(guards.GuardError):self.c.entries()
+        self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
+    def test_checkpoint_charges_first_acquisition_and_stops_native_work_at_forty_five_seconds(self):
+        import retention_cohort
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        elapsed=[0.0];original_section=retention_cohort.upload_section;original_read=self.w.restic;timeouts=[];head=self.c.head.read_bytes()
+        @contextlib.contextmanager
+        def section(worker):
+            elapsed[0]+=8
+            with original_section(worker):yield
+        def read(lane,args,**kwargs):
+            result=original_read(lane,args,**kwargs)
+            if 'timeout' in kwargs:timeouts.append(kwargs['timeout']);elapsed[0]+=10
+            return result
+        self.w.restic=read
+        with mock.patch.object(retention_cohort,'upload_section',section),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertTrue(timeouts);self.assertLessEqual(timeouts[0],37)
+        self.assertEqual(self.c.head.read_bytes(),head);self.assertFalse(self.c.checkpoint_pending.exists())
+    def test_completed_checkpoint_with_slow_unlock_reports_failure_without_undoing_committed_head(self):
+        import retention_cohort
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        elapsed=[0.0];original=retention_cohort.upload_section
+        @contextlib.contextmanager
+        def section(worker):
+            with original(worker):
+                try:yield
+                finally:elapsed[0]+=60
+        with mock.patch.object(retention_cohort,'upload_section',section),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertFalse(self.c.checkpoint_pending.exists());self.assertEqual(set(self.c.entries()),{'4'*64})
+        self.assertEqual(self.c.last_checkpoint_timing['critical_seconds'],60)
+    def test_checkpoint_reseal_timeout_rolls_back_uncommitted_bytes_and_retains_exact_pending(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.put('6'*64,'7'*32);self.prove_absence(SID)
+        elapsed=[0.0];original=subject().canonical;before=self.c.head.read_bytes()
+        def slow(value):
+            result=original(value)
+            if self.c.checkpoint_pending.exists() and isinstance(value,dict) and value.get('id') in ('4'*64,'6'*64):elapsed[0]+=30
+            return result
+        with mock.patch('backup_catalog.canonical',side_effect=slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertEqual(self.c.head.read_bytes(),before);self.assertTrue(self.c.checkpoint_pending.exists())
+        with self.c._db() as db:
+            self.c._tail(db,self.c._head());self.assertEqual(db.execute('SELECT COUNT(*) FROM archives').fetchone()[0],3)
+        self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
+    def test_checkpoint_head_publication_timeout_retains_new_head_and_pending_until_explicit_reconcile(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        elapsed=[0.0];writer=runtime.atomic_json
+        def slow(path,value):
+            writer(path,value)
+            if pathlib.Path(path)==self.c.head and value.get('checkpoint'):elapsed[0]+=60
+        with mock.patch('backup_catalog.runtime.atomic_json',side_effect=slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertTrue(self.c.checkpoint_pending.exists());pending=runtime.load_json(self.c.checkpoint_pending)
+        self.assertEqual(runtime.load_json(self.c.head),pending['next_head'])
+        with self.assertRaises(guards.GuardError):self.c.entries()
+        self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
+    def test_checkpoint_committed_readback_scan_timeout_retains_prior_head_and_actual_new_database(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        elapsed=[0.0];original=self.c._row;before=self.c.head.read_bytes()
+        def slow(row):
+            value=original(row)
+            if self.c.checkpoint_pending.exists():elapsed[0]+=60
+            return value
+        with mock.patch.object(self.c,'_row',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertEqual(self.c.head.read_bytes(),before);pending=runtime.load_json(self.c.checkpoint_pending)
+        with self.c._db() as db:
+            raw=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone()[0]
+            self.assertEqual(subject().digest(raw),pending['next_head']['checkpoint']['sha256'])
+        with self.assertRaises(guards.GuardError):self.c.entries()
+        self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
     def test_checkpoint_initial_native_audit_releases_upload_lanes(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
         original=self.c._retirement_evidence;calls=[]
