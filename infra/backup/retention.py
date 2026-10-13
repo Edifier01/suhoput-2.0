@@ -26,7 +26,35 @@ def decode(data):
     except (ValueError,UnicodeError,RecursionError) as error:
         raise guards.GuardError('Invalid authenticated JSON') from error
 
-def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=None,reader_out=None):
+def native_view_digest(config,listed):
+    """Seal every decoded native field, independent of list iteration order."""
+    guards.require(isinstance(config,dict) and isinstance(listed,list),'Complete native view required')
+    seen=set();digest=hashlib.sha256();digest.update(canonical(config));digest.update(b'\n')
+    for row in sorted(listed,key=lambda value:guards.hex_id(value['id'],64)):
+        sid=row['id'];guards.require(sid not in seen,'Duplicate native snapshot identity');seen.add(sid)
+        digest.update(canonical(row));digest.update(b'\n')
+    return digest.hexdigest()
+
+def verify_native_views(worker,expected,deadline):
+    """Re-read unfiltered config and snapshots under the reserved group.
+
+    The complete manifest/dependency audit and its exact protected authority
+    bytes were checked outside. Equality transfers that audit; no native field
+    is projected away, and unknown or duplicate snapshots cannot inherit it.
+    """
+    guards.require(set(expected)=={'base','binlog'},'Prepared native views missing')
+    for lane in ('base','binlog'):
+        def read(args):
+            remaining=deadline-time.monotonic();guards.require(remaining>0,'Native critical inventory deadline exceeded')
+            raw=worker.restic(lane,['--repo',worker.c['repositories'][lane],*args],timeout=remaining)
+            guards.require(time.monotonic()<deadline,'Native critical inventory deadline exceeded');return decode(raw)
+        config=read(['cat','config']);listed=read(['snapshots','--json'])
+        guards.require(native_view_digest(config,listed)==expected[lane],'Final unfiltered native inventory differs from prepared proof')
+        del config,listed
+        guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')
+
+def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=None,reader_out=None,native_views=None):
+    guards.require(native_views is None or isinstance(native_views,dict) and not native_views,'Empty native view output required')
     guards.require(reader_out is None or (reader is not None and isinstance(reader_out,list) and len(reader_out)==1 and reader_out[0] is reader),
                    'Native reader output must hold the supplied frozen reader')
     w=worker;entries=[];manifests={};tokens=set();observed=at
@@ -44,6 +72,7 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
         config=decode(run(['cat','config']))
         guards.require(config['version']==2 and config['id']==guards.hex_id(repository_ids[lane],64),'Repository identity changed')
         listed=decode(run(['snapshots','--json']));guards.require(isinstance(listed,list),'Complete snapshot inventory required')
+        if native_views is not None:native_views[lane]=native_view_digest(config,listed)
         if reader is not None:
             # A full native listing can finish after a normal upload has been
             # admitted. Authenticate its exact indexed tail before checking

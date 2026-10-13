@@ -1,14 +1,73 @@
 """Native daily preparation and exact final equality; synthetic repositories."""
-import contextlib,copy,datetime as dt,pathlib,sys,unittest
+import contextlib,copy,datetime as dt,json,pathlib,sys,unittest
 from unittest import mock
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'infra/backup'))
-import backup_catalog,guards,readiness_v2,retention_apply,retention_cohort,retention_native,runtime
+import backup_catalog,guards,readiness_v2,retention,retention_apply,retention_cohort,retention_native,runtime
 import backup_retention_native_test
 from backup_retention_apply_test import NOW
 
 class PreparedNativePhaseTests(unittest.TestCase):
     def case(self):
         return backup_retention_native_test.NativeBoundaryTests.v2_case(self)
+    def test_final_native_equality_transfers_full_audit_without_repeating_manifest_work(self):
+        case,_,executor,_,effects,evidence=self.case();active=[False];original=retention_cohort.upload_section
+        inventory=retention.native_inventory
+        @contextlib.contextmanager
+        def section(worker,**kwargs):
+            with original(worker,**kwargs) as acquired:
+                active[0]=True
+                try:yield acquired
+                finally:active[0]=False
+        def audit(*args,**kwargs):
+            self.assertFalse(active[0],'Exact unfiltered native equality transfers the outside manifest audit')
+            return inventory(*args,**kwargs)
+        with mock.patch.object(readiness_v2,'load_evidence',return_value=evidence),mock.patch.object(readiness_v2,'revalidate_budget',return_value=True), \
+             mock.patch.object(retention_cohort,'upload_section',section),mock.patch.object(retention,'native_inventory',audit), \
+             mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',return_value={}):result=executor.run('apply')
+        self.assertEqual(result['result'],'APPLIED');self.assertEqual(len(effects),2)
+
+    def test_full_native_equality_accepts_only_top_level_snapshot_order_changes(self):
+        case,_,executor,_,effects,evidence=self.case();native=case.w.restic;calls=[0]
+        def read(lane,args,**kwargs):
+            raw=native(lane,args,**kwargs)
+            if args[2:]==['snapshots','--json']:
+                calls[0]+=1
+                if calls[0]%2:raw=json.dumps(list(reversed(json.loads(raw)))).encode()
+            return raw
+        case.w.restic=read
+        with mock.patch.object(readiness_v2,'load_evidence',return_value=evidence),mock.patch.object(readiness_v2,'revalidate_budget',return_value=True), \
+             mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',return_value={}):result=executor.run('apply')
+        self.assertEqual(result['result'],'APPLIED');self.assertEqual(len(effects),2)
+
+    def test_unprojected_native_field_drift_blocks_effect(self):
+        case,_,executor,store,effects,evidence=self.case();active=[False];native=case.w.restic;original=retention_cohort.upload_section
+        @contextlib.contextmanager
+        def section(worker,**kwargs):
+            with original(worker,**kwargs) as acquired:
+                active[0]=True
+                try:yield acquired
+                finally:active[0]=False
+        def read(lane,args,**kwargs):
+            raw=native(lane,args,**kwargs)
+            if active[0] and args[2:]==['snapshots','--json']:
+                rows=json.loads(raw)
+                if rows:rows[0]['hostname']='unexpected-native-field-drift'
+                return json.dumps(rows).encode()
+            return raw
+        case.w.restic=read
+        with mock.patch.object(readiness_v2,'load_evidence',return_value=evidence),mock.patch.object(readiness_v2,'revalidate_budget',return_value=True), \
+             mock.patch.object(retention_cohort,'upload_section',section),self.assertRaisesRegex(guards.GuardError,'Final unfiltered native'):
+            executor.run('apply')
+        self.assertEqual(effects,[]);self.assertFalse(store.path.exists())
+
+    def test_native_view_digest_rejects_duplicate_ids_and_preserves_all_fields(self):
+        config={'id':'a'*64,'version':2};rows=[{'id':'b'*64,'tags':['one','two'],'hostname':'fixture'}]
+        initial=retention.native_view_digest(config,rows)
+        with self.assertRaisesRegex(guards.GuardError,'Duplicate native'):
+            retention.native_view_digest(config,rows+copy.deepcopy(rows))
+        self.assertNotEqual(initial,retention.native_view_digest({**config,'version':3},rows))
+        self.assertNotEqual(initial,retention.native_view_digest(config,[{**rows[0],'hostname':'changed'}]))
+        self.assertNotEqual(initial,retention.native_view_digest(config,[{**rows[0],'tags':['two','one']}]))
     def test_heavy_validation_is_outside_groups_but_every_group_reads_full_native_inventory(self):
         case,_,executor,store,effects,evidence=self.case();active=[False];reads=[]
         original=retention_cohort.upload_section;dependencies=retention_apply.protected_dependencies;confirmed=retention_native._confirmed_active;native=case.w.restic

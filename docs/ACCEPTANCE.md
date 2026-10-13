@@ -496,6 +496,17 @@
 
 ## Доказательства исполнения
 
+<a id="exec-chk-068"></a>
+### EXEC-CHK-068 — TASK-047: итоговый native audit transfer и запуск
+
+13.10.2026 UTC, основа7c70886/feat/local-foundation, рабочая копия отличается двумя expense helpers и тестами/документами. Saved continuation134901 FAIL после19base effects: native audit39.168s/group45.015s, minute admission43271 deadline FAIL; confirmed43265–43270/maxlag21.562s. Прежний том сохранён, повторapply/forget не выполняется. Readonly raw-native probe14:35 подтвердил только нестабильный порядок snapshot list; никакой semantic identity drift из этого не выводится.
+
+Команда Windows Python3.12.14 `-B -m unittest discover -s tests -p backup_retention_prepared_test.py`: две новые содержательные проверки initially FAIL (полный audit внутри locks и незамеченный unprojected hostname drift), затем13tests13.543s PASS. После добавления duplicate/all-fields digest negative полный Linux запуск `.cache/infrastructure/task047-run-all-backup-linux.local.py`:509tests/no skips29.734s PASS; root/pinnedPython3.12.14/networknone/read-only container/768MiB/1CPU/source via stdin, receipt `task047-all-backup-linux-20261013-144423.local.json`. Default-sandbox Docker попытка denied доtests, не выдана за testFAIL; разрешённая escalation успешно запустила тот же suite.
+
+Независимое read-only ревью точных SHA helpers/tests: существенных дефектов нет; Linux34tests/no skips7.301s PASS, Windows109tests/4platform skips27.423s PASS, десять отдельных config/field/duplicate/unknown/missing/deadline negatives PASS доintent/effect. Отчёт `task047-final-native-review.local.md`; native44k/55s/768MiB/cadence/billing этим ревью не закрыты. Supported shared-root locking trust boundary сохранён; это не защита от привилегированного обхода locks. Synchronous JSON/hash reject по deadline не является preemptive termination; actual scale control обязателен.
+
+Readonly SSH14:44:47/14:48:01: installedruntime7c/NTP/source guard/wholeS3 inventory77objects67512330bodybytes/versioning response empty/все4timersdisabled и полный writer authority прочитаны. Wholebody не объявлен полным billed storage; originals/known-hosts/credentials не изменены. Новый итоговый native trial14:46:06 стартовал на отдельномтоме `suhoput2-task047-native-minute-r5-20261013-144606` из readonlybaseline; actual source SHA сохранены, результаты пока pending. TASK-047 in_progress, budget/timers gate прежний.
+
 <a id="exec-chk-067"></a>
 ### EXEC-CHK-067 — TASK-047: блокировки, стоимость и упрощённый native-v2
 

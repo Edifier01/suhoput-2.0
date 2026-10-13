@@ -592,12 +592,13 @@ class NativeApply:
             current_reader=[reader]
             critical_deadline=[None]
             active_phase=[None]
-            prepared_inputs=[None];phase_budget=[None]
+            prepared_inputs=[None];phase_budget=[None];prepared_native={}
             def read():
                 started=time.monotonic()
                 try:
                     current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
-                    return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0],reader_out=current_reader)
+                    prepared_native.clear()
+                    return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0],reader_out=current_reader,native_views=prepared_native)
                 finally:
                     if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
             from contextlib import contextmanager
@@ -616,10 +617,10 @@ class NativeApply:
             def verify_prepared(expected):
                 if _phase_input_bytes(catalog,critical_deadline[0])!=prepared_inputs[0]:
                     raise retention_apply.PhasePreparationChanged('Phase authority advanced before reservation')
-                actual=read()
-                guards.require(actual['generation']==expected['generation'] and actual['repositories']==expected['repositories'] and
-                               {row['id']:row for row in actual['snapshots']}=={row['id']:row for row in expected['snapshots']} and
-                               actual['manifests']==expected['manifests'],'Final unfiltered native inventory differs from prepared proof')
+                started=time.monotonic()
+                try:retention.verify_native_views(w,prepared_native,critical_deadline[0])
+                finally:
+                    if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
                 guards.require(_phase_input_bytes(catalog,critical_deadline[0])==prepared_inputs[0],'Phase authority changed inside reserved group')
                 if phase_budget[0] is not None:phase_budget[0]()
             @contextmanager
