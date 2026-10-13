@@ -48,6 +48,43 @@ class MemoryIntent:
         self.value=copy.deepcopy(value)
 class ApplyTests(unittest.TestCase):
     def setUp(self): self.inventory,self.plan,self.evidence=fixture()
+    def test_fixed_u2_planned_time_equal_preupdate_hourly_bases_never_reach_strict_candidate_gate(self):
+        at=guards.utc('2026-10-13T07:58:12.799436+00:00');stamp='2026-09-13T06:59:16.922028+00:00'
+        inv,_,_=fixture(split=True);pre='f2'*32;hourly='bf'*32
+        base=next(row for row in inv['snapshots'] if row['id']==ANCHOR);inv['snapshots'].remove(base)
+        for sid,kind in ((pre,'pre-update'),(hourly,'hourly')):
+            inv['snapshots'].append({**base,'id':sid,'kind':kind,'token':sid[:32],'manifest_sha256':sid,'time':stamp,'snapshot_time':stamp})
+            inv['manifests'][sid]={**inv['manifests'][ANCHOR],'coordinates':{'file':'suhoput2-binlog.000721','position':348}}
+        inv['manifests'][hourly]['full_id']=OLD;del inv['manifests'][ANCHOR]
+        inv['manifests'][TIP]['coordinates']['file']='suhoput2-binlog.000722'
+        descriptors=[{'file':'suhoput2-binlog.%06d'%i,'size':500,'sha256':hashlib.sha256(str(i).encode()).hexdigest()} for i in range(1,723)]
+        inv['manifests']['5'*64].update(first_log=1,last_log=720,previous_count=0,logs=descriptors[:720])
+        inv['manifests'][LOG].update(first_log=721,last_log=722,previous_count=720,logs=descriptors[720:])
+        for order in (list(inv['snapshots']),list(reversed(inv['snapshots']))):
+            inv['snapshots']=order;plan=retention.bounded_plan(inv,retention.inventory_plan(inv,at));plan['planned_at']=at.isoformat()
+            subject()._plan(inv,plan,at)
+            self.assertEqual(plan['anchor_id'],hourly);self.assertTrue({pre,hourly,OLD}<=set(plan['keep']))
+            self.assertFalse({pre,hourly}&set(plan['candidates']));self.assertEqual(plan['candidates'],['5'*64])
+    def test_tied_earlier_coordinate_keeps_suffix_and_deferred_hourly_full_dependencies(self):
+        inv,_,_=fixture(split=True);base=next(row for row in inv['snapshots'] if row['id']==ANCHOR)
+        pre='9'*64;hourly='8'*64;extra_full=format(999,'064x')
+        for sid,kind,file in ((pre,'pre-update',1),(hourly,'hourly',2)):
+            inv['snapshots'].append({**base,'id':sid,'kind':kind,'token':sid[:32],'manifest_sha256':sid})
+            inv['manifests'][sid]={**inv['manifests'][ANCHOR],'coordinates':{'file':'suhoput2-binlog.%06d'%file,'position':4}}
+        inv['manifests'][hourly]['full_id']=OLD
+        old=next(row for row in inv['snapshots'] if row['id']==OLD)
+        inv['snapshots'].append({**old,'id':extra_full,'token':format(999,'032x'),'manifest_sha256':extra_full})
+        inv['manifests'][extra_full]=copy.deepcopy(inv['manifests'][OLD]);expired=[]
+        for number in range(1000,1257):
+            sid=format(number,'064x');expired.append(sid)
+            inv['snapshots'].append({**old,'id':sid,'kind':'hourly','token':format(number,'032x'),'manifest_sha256':sid,'time':'2026-09-01T12:00:00Z','snapshot_time':'2026-09-01T12:00:00Z'})
+            inv['manifests'][sid]={**inv['manifests'][OLD],'full_id':extra_full}
+        for order in (list(inv['snapshots']),list(reversed(inv['snapshots']))):
+            inv['snapshots']=order;plan=retention.bounded_plan(inv,retention.inventory_plan(inv,NOW));plan['planned_at']=NOW.isoformat()
+            subject()._plan(inv,plan,NOW);subject().protected_dependencies(inv,plan['candidates'],NOW)
+            self.assertEqual(plan['anchor_id'],pre);self.assertEqual(len(plan['candidates']),256)
+            self.assertTrue({ANCHOR,pre,hourly,OLD,extra_full,LOG,'5'*64}<=set(plan['keep']))
+            self.assertEqual(len(set(expired)-set(plan['candidates'])),1)
     def rebind(self,name):
         self.evidence[name]['sha256']=digest(self.evidence[name]['document'])
         self.plan['proof_sha256'][name]=self.evidence[name]['sha256']

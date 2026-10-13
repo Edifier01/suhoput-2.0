@@ -6,6 +6,7 @@ import unittest
 import tempfile
 import hashlib
 import json
+import itertools
 from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'infra' / 'backup'))
 import guards
@@ -96,6 +97,30 @@ class BackupRuntimeGuards(unittest.TestCase):
         self.assertIn(older['id'], plan['candidates'])
         self.assertIn(log_old['id'], plan['candidates'])
         self.assertFalse(plan['apply_allowed'])
+    def test_retention_anchor_time_ties_keep_every_base_and_full_dependency_in_any_order(self):
+        older=snapshot(1,'full',40,first_log=1)
+        dependency=snapshot(5,'full',60,first_log=1)
+        ties=[snapshot(3,'full',31,first_log=12),snapshot(2,'pre-update',31,first_log=10),snapshot(4,'hourly',31,first_log=11,full_id=dependency['id'])]
+        logs=[snapshot(6,'binlog',40,first_log=1,last_log=9),snapshot(7,'binlog',31,first_log=10,last_log=20)]
+        expected=None
+        for order in itertools.permutations(ties):
+            plan=guards.retention_candidates([older,*order,dependency,*logs],GEN,NOW)
+            self.assertEqual(plan['anchor_id'],ties[1]['id'])
+            self.assertTrue({x['id'] for x in ties}|{dependency['id']}<=set(plan['keep']))
+            self.assertTrue({older['id'],logs[0]['id']}<=set(plan['candidates']))
+            self.assertFalse({x['id'] for x in ties}&set(plan['candidates']))
+            if expected is None:expected=plan
+            else:self.assertEqual(plan,expected)
+        tied_first=[{**x,'first_log':10} for x in ties]
+        for order in itertools.permutations(tied_first):self.assertEqual(guards.retention_candidates([older,*order,dependency,*logs],GEN,NOW)['anchor_id'],ties[1]['id'])
+    def test_anchor_ties_at_cutoff_and_short_history_are_all_kept(self):
+        for days in (30,1):
+            full=snapshot(1,'full',days,first_log=1);pre=snapshot(2,'pre-update',days,first_log=1)
+            hourly=snapshot(3,'hourly',days,full_id=pre['id'],first_log=1)
+            for bases in itertools.permutations([full,pre,hourly]):
+                plan=guards.retention_candidates([*bases,snapshot(4,'binlog',days,first_log=1,last_log=2)],GEN,NOW)
+                self.assertEqual(plan['anchor_id'],full['id']);self.assertEqual(plan['candidates'],[])
+                self.assertEqual(plan['pre_window_anchor_present'],days==30)
 
     def test_unknown_snapshot_and_missing_dependency_stop_retention(self):
         full=snapshot(1,'full',31)

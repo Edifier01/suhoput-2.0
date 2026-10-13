@@ -119,8 +119,12 @@ def retention_candidates(snapshots,generation,now):
         bases=[x for x in snapshots if x['kind'] in ('full','pre-update','hourly')]
         require(bases,'No recovery base')
         old_bases=[x for x in bases if utc(x['time'])<=cutoff]
-        anchor=max(old_bases,key=lambda x:utc(x['time'])) if old_bases else min(bases,key=lambda x:utc(x['time']))
-        kept_bases=[x for x in bases if utc(x['time'])>=cutoff or x is anchor]
+        anchor_time=max(utc(x['time']) for x in old_bases) if old_bases else min(utc(x['time']) for x in bases)
+        tied_bases=[x for x in bases if utc(x['time'])==anchor_time]
+        if any(x['kind']=='binlog' for x in snapshots):
+            require(all(type(x.get('first_log')) is int and x['first_log']>0 for x in tied_bases),'Anchor log coordinates missing')
+        anchor=min(tied_bases,key=lambda x:(x['first_log'] if type(x.get('first_log')) is int and x['first_log']>0 else float('inf'),x['id']))
+        kept_bases=[x for x in bases if utc(x['time'])>=cutoff or utc(x['time'])==anchor_time]
         keep={x['id'] for x in kept_bases}
         for base in kept_bases:
             if base['kind']=='hourly':
