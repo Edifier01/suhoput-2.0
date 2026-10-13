@@ -814,6 +814,7 @@ def commissioning_projection(raw_access, raw_inventory, admission, forecast, rat
                 'provider_raw_sha256': observed['file_sha256'], 'observed': observed,
                 'monthly_jobs': jobs, 'projection_days': 31, 'billing_month_hours': 730,
                 'usage': usage, 'workload_envelope': envelope, 'model_sha256': forecast['model_sha256'], 'model_basis': forecast['basis'],
+                'capture_policy': configuration['maintenance_policy'].get('capture_policy',{}),
                 'projected_storage_bytes': stored, 'projected_monthly_rub': number_text(base_cost + reserve),
                 'forecast_before_reserve_rub': number_text(base_cost), 'reserve_rub': number_text(reserve),
                 'storage_reserve_bytes': storage_reserve, 'budget_rub': '500', 'max_gib': '10',

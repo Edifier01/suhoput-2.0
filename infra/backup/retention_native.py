@@ -536,6 +536,57 @@ def _phase_input_bytes(catalog,deadline=None):
             paths.extend(path for path in sorted(attempt.iterdir()) if path.name!='phase-timing.json')
     return {path.relative_to(root).as_posix():backup_catalog.file_digest(private_path(path),deadline) for path in paths}
 
+def _phase_journals(catalog,inputs):
+    """Capture exactly the journal bytes named by the preparation seal."""
+    result={}
+    for lane in ('base','binlog'):
+        key=lane+'/state.json';raw=private_path(catalog.receipts/key).read_bytes()
+        if hashlib.sha256(raw).hexdigest()!=inputs[key]:
+            raise retention_apply.PhasePreparationChanged('Journal advanced during preparation seal')
+        result[lane]=json.loads(raw,object_pairs_hook=runtime.no_duplicates)
+    return result
+
+def _journal_prefix_seal(state,count=None):
+    rows=state['confirmed'];count=len(rows) if count is None else count
+    guards.require(isinstance(rows,list) and len(rows)>=count,'Confirmation prefix shortened')
+    stable={k:v for k,v in state.items() if k not in ('confirmed','last_success_at','last_confirmation_at')}
+    return {'count':count,'prefix':retention_apply.document_digest(rows[:count]),
+            'stable':retention_apply.document_digest(stable)}
+
+def _prepared_append(catalog,before,after,prior,journals,current,reader):
+    """Transfer only appends already authenticated by the prepared native view.
+
+    The reader refresh checks the captured catalog chain prefix. Every other
+    authority path and raw byte remains exact, and original confirmation rows
+    retain all fields, including historical timestamps and retirement links.
+    """
+    mutable={'base/state.json','binlog/state.json',catalog.head.relative_to(catalog.receipts).as_posix()}
+    if set(before)!=set(after) or any(before[k]!=after[k] for k in before if k not in mutable):return False
+    indexed={row['id']:row for row in current['snapshots']};appended=0
+    for lane in ('base','binlog'):
+        old=prior[lane];new=journals[lane];count=old['count']
+        guards.require(old==_journal_prefix_seal(new,count),'Prepared historical confirmation or retirement changed')
+        fresh=new['confirmed'][count:];appended+=len(fresh)
+        if not fresh:
+            if before[lane+'/state.json']!=after[lane+'/state.json']:return False
+            continue
+        guards.require(len({row['id'] for row in new['confirmed']})==len(new['confirmed']),'Duplicate appended confirmation')
+        for row in fresh:
+            native=indexed.get(row['id'])
+            if native is None:return False # Arrival after the native read needs a fresh outside audit.
+            guards.require(native['lane']==lane and all(row[k]==native[k] for k in ('token','manifest_sha256')),
+                           'Appended confirmation differs from prepared native identity')
+            keys=set(row)
+            guards.require(keys in ({'id','token','manifest_sha256'},{'id','token','manifest_sha256','captured_at','prepared_at','confirmed_at'}),
+                           'Unknown appended confirmation fields')
+            if 'captured_at' in row:
+                guards.require(row['captured_at']==native['time'] and guards.utc(row['captured_at'])<=guards.utc(row['prepared_at'])<=guards.utc(row['confirmed_at']),
+                               'Appended confirmation clock or capture differs')
+        guards.require(new.get('last_success_at')==fresh[-1].get('captured_at') and new.get('last_confirmation_at')==fresh[-1].get('confirmed_at'),
+                       'Appended journal watermark differs')
+    head=hashlib.sha256((json.dumps(reader.head,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+    return appended>0 and head==after[catalog.head.relative_to(catalog.receipts).as_posix()]
+
 
 class NativeApply:
     def __init__(self,config):
@@ -592,19 +643,39 @@ class NativeApply:
             current_reader=[reader]
             critical_deadline=[None]
             active_phase=[None]
-            prepared_inputs=[None];phase_budget=[None];prepared_native={}
+            prepared_inputs=[None];phase_budget=[None];prepared_native={};prepared_current=[None];journal_prefix=[None];fixed_authorities=[None]
             def read():
                 started=time.monotonic()
                 try:
                     current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
                     prepared_native.clear()
-                    return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0],reader_out=current_reader,native_views=prepared_native)
+                    result=retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0],reader_out=current_reader,native_views=prepared_native)
+                    prepared_current[0]=result;return result
                 finally:
                     if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
             from contextlib import contextmanager
             @contextmanager
             def preparation():
                 before=_phase_input_bytes(catalog)
+                mutable={'base/state.json','binlog/state.json',catalog.head.relative_to(catalog.receipts).as_posix()}
+                if fixed_authorities[0] is None:fixed_authorities[0]={key:value for key,value in before.items() if key not in mutable}
+                guards.require(all(before.get(key)==value for key,value in fixed_authorities[0].items()),
+                               'Original immutable preparation authority changed')
+                if hasattr(store,'prepared_authority'):
+                    # The final staged phase can legitimately be absent after a
+                    # pre-effect retry; existing own intent/phase bytes can never
+                    # be resealed as different valid documents on that retry.
+                    prefix=store.root.relative_to(catalog.receipts).as_posix()+'/'
+                    guards.require(all(before[prefix+name]==digest for name,digest in store.prepared_authority[2].items() if prefix+name in before),
+                                   'Previously prepared immutable phase authority changed')
+                    fixed_authorities[0].update({prefix+name:digest for name,digest in store.prepared_authority[2].items() if prefix+name in before})
+                prior=_phase_journals(catalog,before)
+                if journal_prefix[0] is None:journal_prefix[0]={lane:_journal_prefix_seal(state) for lane,state in prior.items()}
+                for lane,state in prior.items():
+                    guards.require(_journal_prefix_seal(state,journal_prefix[0][lane]['count'])==journal_prefix[0][lane],
+                                   'Original confirmation or retirement prefix changed')
+                prior={lane:_journal_prefix_seal(state) for lane,state in prior.items()}
+                prepared_current[0]=None
                 try:
                     # Unknown/malformed ordinal authorities are rejected here;
                     # only equal raw bytes may transfer this complete audit.
@@ -612,7 +683,10 @@ class NativeApply:
                     yield
                 finally:
                     after=_phase_input_bytes(catalog)
-                    if before!=after:raise retention_apply.PhasePreparationChanged('Read-only phase authority advanced')
+                    if before!=after:
+                        journals=_phase_journals(catalog,after)
+                        if prepared_current[0] is None or not _prepared_append(catalog,before,after,prior,journals,prepared_current[0],current_reader[0]):
+                            raise retention_apply.PhasePreparationChanged('Read-only phase authority advanced')
                 prepared_inputs[0]=after
             def verify_prepared(expected):
                 if _phase_input_bytes(catalog,critical_deadline[0])!=prepared_inputs[0]:

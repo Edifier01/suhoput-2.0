@@ -5,6 +5,10 @@ UTC=dt.timezone.utc
 DB_IMAGE='mariadb:10.11@sha256:7db29378d4fdab73f8123bbc2b48905c90d1a4b00cf848b028f1e81e623257f2'
 WP_IMAGE='wordpress:7.1.3-php8.3-apache@sha256:8ecd8d8e374167ea22235acf30f80d1165b82f07ffa5bcef90c1cad8f7be251f'
 RESTIC_SHA='20d4142678d0d95ec11a4759def1b73fd9190abc9ca19e4b62d067c0b387e639'
+CAPTURE_LIMITS={'hourly':384*1024,'full':192*1024**2,'pre-update':192*1024**2,'binlog':64*1024**2}
+CAPTURE_METADATA_LIMITS={'hourly':64*1024,'full':9*1024**2,'pre-update':9*1024**2,'binlog':8*1024}
+CAPTURE_MANIFEST_LIMITS={'hourly':64*1024,'full':2*1024**2,'pre-update':2*1024**2,'binlog':2*1024}
+PUBLIC_HELPERS=('worker.py','restore.py','retention.py','retention_native.py','retention_cohort.py','maintenance.py','storage.py','readiness_v2.py','integrity.py','retention_restore.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','backup_catalog.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py')
 class NativeError(RuntimeError):
     def __init__(self,phase,diagnostic=None):super().__init__('Native backup operation failed: '+phase)
 def now():return dt.datetime.now(UTC).isoformat()
@@ -276,12 +280,104 @@ class Worker:
         backup_catalog.ArchiveCatalog(self,deadline=deadline).admit(lane,sid,native_metadata,raw_manifest,restored,reconcile=reconcile,deadline=deadline)
         guards.require(temporary.resolve()==temporary and temporary.parent==self.root/'cache' and not temporary.is_symlink(),'Readback cleanup scope changed');tree_inventory(temporary)
         shutil.rmtree(temporary);runtime.directory_sync(temporary.parent);return True
+    def check_capture_budget(self,manifest,payload=None):
+        """Bind commissioned raw capture growth before creating upload authority.
+
+        Initial manual calibration predates admission. Once either protected
+        report/origin exists, the complete authenticated forecast must load;
+        deleting half the pair, expiry or changed expense bytes fail closed.
+        Raw bytes are never substituted with native compressed pack sizes.
+        """
+        report=self.root/'receipts/commissioning-budget.json';origin=self.root/'receipts/commissioning-budget.origin.json'
+        if self.c.get('retention_readiness_policy','legacy-v1')!='native-v2':return
+        if not any(p.exists() or p.is_symlink() for p in (report,origin)):return
+        import budget
+        forecast=budget.load_commissioning_budget(self)
+        result=self.validate_capture_geometry(manifest,payload,fixed_helpers=forecast.get('capture_policy',{}).get('fixed_helpers'))
+        if payload is not None and manifest['kind']!='binlog':
+            identity=forecast.get('capture_policy',{}).get('application_identity',{})
+            guards.require(set(identity)=={'application_sha256','configuration_sha256'} and
+                           all(guards.hex_id(value,64)==manifest.get(key) for key,value in identity.items()),
+                           'Commissioned application identity changed; recalibrate before uploading new code')
+        return result
+    def validate_capture_geometry(self,manifest,payload=None,*,fixed_helpers=None):
+        """Pure capture calibration; does not admit a budget or create upload authority."""
+        kind=manifest.get('kind');files=manifest.get('files')
+        guards.require(kind in CAPTURE_LIMITS and isinstance(files,list),'Unknown commissioned capture kind')
+        guards.require(all(type(row.get('bytes')) is int and row['bytes']>=0 for row in files),'Invalid commissioned raw capture size')
+        if payload is not None:
+            raw=backup_catalog.read_file(payload/'manifest.json',CAPTURE_MANIFEST_LIMITS[kind])
+            guards.require(backup_catalog.decode(raw)==manifest,'Commissioned manifest changed during validation')
+        else:raw=(json.dumps(manifest,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+        guards.require(sum(row['bytes'] for row in files)+len(raw)<=CAPTURE_LIMITS[kind],
+                       'Capture exceeds commissioned raw bound; preserve payload and recalibrate budget')
+        guards.require(len(raw)<=CAPTURE_MANIFEST_LIMITS[kind],'Commissioned manifest metadata exceeds bound')
+        fixed_config={'configuration/'+name for name in ('.env','infra/staging/compose.yaml',
+                      'infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf')}
+        helper_rows={row['path'].removeprefix('configuration/backup-public/'):row for row in files
+                     if str(row.get('path','')).startswith('configuration/backup-public/')}
+        if helper_rows or (payload is not None and kind in ('full','pre-update')):
+            guards.require(isinstance(fixed_helpers,dict) and set(fixed_helpers)==set(PUBLIC_HELPERS) and
+                           set(helper_rows)==set(PUBLIC_HELPERS) and
+                           all(set(value)=={'bytes','sha256'} and type(value['bytes']) is int and value['bytes']>=0 and
+                               guards.hex_id(value['sha256'],64)==helper_rows[name].get('sha256') and
+                               value['bytes']==helper_rows[name]['bytes'] for name,value in fixed_helpers.items()),
+                           'Commissioned recovery helper identity changed; recalibrate budget')
+        def fixed(row):
+            path=str(row.get('path',''))
+            return path in fixed_config or (path.startswith('configuration/backup-public/') and path.removeprefix('configuration/backup-public/') in helper_rows) or (path.startswith('wordpress/') and not path.startswith('wordpress/wp-content/uploads/'))
+        # Only the captured application's authenticated identity is reusable.
+        # Include every other byte: dump, both media copies, public helper
+        # configuration, ownership marker and any unexpected extra file.
+        dynamic=sum(row['bytes'] for row in files if not fixed(row))
+        if kind!='binlog':guards.require(dynamic<=384*1024,'Dynamic base database/media exceeds commissioned bound')
+        else:guards.require(len(raw)+sum(row['bytes'] for row in files if not str(row.get('path','')).startswith('logs/'))<=2*1024,
+                            'Binlog control bytes exceed commissioned bound')
+        # With root-owned files, no xattrs or links and controlled names, each
+        # native Linux Node has at most512 fixed JSON bytes, eight UTF8 name
+        # bytes after JSON escaping, and72 bytes per possible content ID.
+        # Restic's minimum chunk is512KiB. Count every directory, including
+        # empty ones; content-only inventories cannot bound native trees.
+        metadata=4096;nodes=0
+        def add(name,size=0):
+            nonlocal metadata,nodes
+            encoded=name.encode('utf-8')
+            guards.require(len(encoded)<=256 and all(ord(c)>=32 for c in name),'Commissioned capture name exceeds metadata bound')
+            metadata+=512+8*len(pathlib.PurePosixPath(name).name.encode('utf-8'))+72*((size+512*1024-1)//(512*1024)+1);nodes+=1
+            guards.require(nodes<=16384 and metadata<=CAPTURE_METADATA_LIMITS[kind],'Commissioned native metadata exceeds bound')
+        if payload is None:
+            add('');add('manifest.json',len(raw))
+            for number,row in enumerate(files):add(row.get('path','file-'+str(number)),row['bytes'])
+        else:
+            guards.require(payload==self.root/'spool'/('binlog-payload' if kind=='binlog' else 'base-payload'),
+                           'Commissioned capture path differs')
+            if os.name=='posix':
+                import pwd,grp
+                guards.require(pwd.getpwuid(0).pw_name==grp.getgrgid(0).gr_name=='root','Commissioned native owner name differs')
+                ancestor=0
+                for path in payload.parents:
+                    info=path.lstat()
+                    guards.require(stat.S_ISDIR(info.st_mode) and info.st_uid==info.st_gid==0 and
+                                   not os.listxattr(path,follow_symlinks=False),'Commissioned ancestor metadata differs')
+                    ancestor+=512+8*len(path.name.encode('utf-8'))+72
+                guards.require(ancestor<=4096,'Commissioned ancestor tree exceeds bound')
+            for directory,dirs,names in os.walk(payload,followlinks=False):
+                for path in [pathlib.Path(directory),*(pathlib.Path(directory)/name for name in names)]:
+                    info=path.lstat();guards.require(not stat.S_ISLNK(info.st_mode) and (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)),
+                                                   'Commissioned native metadata type differs')
+                    if os.name=='posix':guards.require(info.st_uid==info.st_gid==0,'Commissioned native owner differs')
+                    if hasattr(os,'listxattr'):guards.require(not os.listxattr(path,follow_symlinks=False),'Commissioned native xattrs exceed model')
+                    add('' if path==payload else path.relative_to(payload).as_posix(),info.st_size if stat.S_ISREG(info.st_mode) else 0)
+                guards.require(all(not (pathlib.Path(directory)/name).is_symlink() for name in dirs),'Commissioned directory symlink')
+        return {'raw_bytes':sum(row['bytes'] for row in files)+len(raw),'manifest_bytes':len(raw),
+                'dynamic_base_bytes':dynamic,'native_metadata_bound_bytes':metadata,'node_count':nodes}
     def upload(self,lane,payload):
         from maintenance import require_clear
         require_clear(self)
         deadline=self.catalog_deadline(lane)
         backup_catalog.ArchiveCatalog(self,deadline=deadline).ready(deadline=deadline)
         manifest=runtime.load_json(payload/'manifest.json');verify_payload(payload,manifest)
+        self.check_capture_budget(manifest,payload)
         adapter=restic_adapter.ResticAdapter(self.c['repositories'][lane],self.c['generation'],str(payload),runner=lambda args:self.restic(lane,args,timeout=50 if lane=='binlog' else 900),verify_archive=lambda sid,metadata,**proof:self.verify_archive(lane,sid,metadata,**proof))
         capture=self.capture_intent(lane,payload);runtime.atomic_json(self.root/'receipts'/('capture-'+lane+'.json'),{**capture,'phase':'upload'})
         sid=runtime.UploadJournal(self.root/'receipts'/lane,self.c['generation']).upload(payload,sha(payload/'manifest.json'),adapter)
@@ -315,7 +411,7 @@ class Worker:
                 for name in ('.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf'):
                     source=self.stage/name;guards.require(source.is_file() and not source.is_symlink(),'Missing full configuration');dest=payload/'configuration'/name;dest.parent.mkdir(mode=0o700,parents=True,exist_ok=True);shutil.copyfile(source,dest);os.chmod(dest,0o600)
                 public=payload/'configuration/backup-public';public.mkdir(mode=0o700)
-                for name in ('worker.py','restore.py','retention.py','retention_native.py','retention_cohort.py','maintenance.py','storage.py','readiness_v2.py','integrity.py','retention_restore.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','backup_catalog.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
+                for name in PUBLIC_HELPERS:
                     source=self.bin/name;guards.require(source.is_file() and not source.is_symlink(),'Missing recovery public helper');shutil.copyfile(source,public/name);os.chmod(public/name,0o600)
             guards.require(media_before==tree_inventory(uploads)==tree_inventory(payload/'uploads'),'Uploads changed during capture')
             if kind in ('full','pre-update'):guards.require(identity==self.captured_identity(payload),'Captured application/configuration differs from baseline')
