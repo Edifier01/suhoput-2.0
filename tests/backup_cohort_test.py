@@ -481,8 +481,12 @@ class NativeCohortTests(unittest.TestCase):
     def test_phase_witness_sequence_operation_prior_absences_and_inventory_are_authenticated(self):
         _,native,store,_=self.prepared_apply();self.assertEqual(native.run('apply')['result'],'APPLIED')
         base=store.root/'phase-base.json';logs=store.root/'phase-binlog.json';original={p:p.read_bytes() for p in (base,logs)}
-        for mutation in ('first_missing','operation','prior_missing','native_hash','foreign_lane'):
-            for path,raw in original.items():path.write_bytes(raw)
+        failures={'first_missing':'Phase authorization changed','operation':'Phase authorization changed',
+                  'prior_missing':'Unknown or incomplete prior phase effect/absence',
+                  'native_hash':'Phase current inventory cannot be reconstructed','foreign_lane':'Unknown phase authorization file'}
+        for mutation,error in failures.items():
+            # Recreating a deleted witness must not inherit a permissive umask.
+            for path,raw in original.items():path.write_bytes(raw);path.chmod(0o600)
             doc=runtime.load_json(logs)
             if mutation=='first_missing':base.unlink()
             elif mutation=='operation':doc['operation']='untrusted'
@@ -490,9 +494,9 @@ class NativeCohortTests(unittest.TestCase):
             elif mutation=='native_hash':doc['native_inventory_sha256']='0'*64
             else:runtime.atomic_json(store.root/'phase-foreign.json',doc)
             doc['phase_sha256']=retention_apply.document_digest({k:v for k,v in doc.items() if k!='phase_sha256'});runtime.atomic_json(logs,doc)
-            with self.subTest(mutation=mutation),self.assertRaises(guards.GuardError):store.phase_documents()
+            with self.subTest(mutation=mutation),self.assertRaisesRegex(guards.GuardError,error):store.phase_documents()
             (store.root/'phase-foreign.json').unlink(missing_ok=True)
-        for path,raw in original.items():path.write_bytes(raw)
+        for path,raw in original.items():path.write_bytes(raw);path.chmod(0o600)
         self.assertEqual(set(store.phase_documents()),{'base','binlog'})
     def test_completed_attempt_releases_heavy_views_before_catalog_checkpoint(self):
         import weakref,backup_catalog,retention_cohort
