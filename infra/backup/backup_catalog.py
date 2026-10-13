@@ -79,8 +79,17 @@ class CheckpointStage:
         self.catalog.root=root;self.catalog.database=root/'index.sqlite3';self.catalog.head=self.root/'head.json'
         self.catalog.pending=root/'pending.json';self.catalog.checkpoint_pending=root/'checkpoint-pending.json'
         self.manifest=self.root/'preparation.json';self.files=[]
+    def check_layout(self,*,sealed=False):
+        safe(self.root,directory=True);safe(self.catalog.root,directory=True)
+        names={p.name for p in self.root.iterdir()};images={p.name for p in self.catalog.root.iterdir()}
+        expected={'catalog','head.json','preparation.json'}
+        guards.require(names==expected if sealed else names<=expected,'Unknown/incomplete preparation root')
+        guards.require(images=={'index.sqlite3'} if sealed else images<= {'index.sqlite3'},'Unknown/incomplete preparation image layout')
+        for path in (self.manifest,self.catalog.head,self.catalog.database):
+            if path.exists() or path.is_symlink():safe(path)
     def cleanup(self):
         # Fixed owned paths only; unknown content keeps the orphan for review.
+        self.check_layout()
         for path in (self.manifest,self.catalog.head,self.catalog.database):
             if path.exists():safe(path).unlink()
         self.catalog.root.rmdir();self.root.rmdir();runtime.directory_sync(self.root.parent)
@@ -897,6 +906,7 @@ class ArchiveCatalog:
         try:
             with retention_cohort.upload_section(self.worker),runtime.lane_lock(self.lock):
                 retention_cohort.ready_uploads(self.worker);self._layout()
+                stage.check_layout(sealed=True)
                 guards.require(not self.pending.exists() and self._head()==prepared['source_head'] and self.worker.source==prepared['source'],'Source/head changed before image activation')
                 guards.require(self.worker.c['code_sha']==prepared['code_sha'] and self.worker.c['generation']==self.binding['generation'] and
                                self.worker.c['repositories']==self.binding['repository_paths'],'Prepared code/generation/repositories changed')
@@ -912,6 +922,7 @@ class ArchiveCatalog:
                 native=time.monotonic();self._final_checkpoint_native(prepared,work);profile['final_native_seconds']+=time.monotonic()-native
                 guards.require(shutil.disk_usage(self.root).free>=5*1024**3+2*max(self.database.stat().st_size,stage.catalog.database.stat().st_size)+MAX_CHECKPOINT_BYTES+MAX_RECORD_BYTES,
                                'Final staged image/journal reserve exceeded')
+                stage.check_layout(sealed=True)
                 _check_deadline(work);promotion=time.monotonic()
                 if os.name=='posix':oldfd=os.open(safe(self.database),os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))
                 if raw is None:runtime.atomic_json(self.checkpoint_pending,{'witness':prepared['witness'],'next_head':prepared['next_head']})

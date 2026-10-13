@@ -459,6 +459,28 @@ class CatalogLifecycleTests(unittest.TestCase):
         parent=self.root/'receipts/catalog-preparations';parent.mkdir(mode=0o700);(parent/'foreign').mkdir(mode=0o700)
         with self.assertRaises(guards.GuardError):self.c.checkpoint()
         self.assertEqual(self.c.head.read_bytes(),head);self.assertFalse(self.c.checkpoint_pending.exists())
+    def test_stage_foreign_or_linked_artifacts_block_before_activation_and_preserve_evidence(self):
+        for change in ('foreign','hardlink','root_foreign','late_native'):
+            if change!='foreign':self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+            head=self.c.head.read_bytes();database=self.c.database.read_bytes();publish=self.c._publish_checkpoint_stage;native=self.c._final_checkpoint_native;observed=[]
+            def add(stage):
+                unknown=stage.root/('foreign.json' if change=='root_foreign' else 'catalog/foreign.sqlite')
+                if change=='hardlink':os.link(stage.catalog.database,unknown)
+                else:unknown.write_bytes(b'unknown protected artifact');os.chmod(unknown,0o600)
+                observed.append((stage,stage.manifest.read_bytes(),unknown))
+            def publication(stage,prepared,profile):
+                if change!='late_native':add(stage)
+                return publish(stage,prepared,profile)
+            def late(prepared,deadline):
+                native(prepared,deadline)
+                stage_root=next((self.root/'receipts/catalog-preparations').iterdir());add(subject().CheckpointStage(self.c,stage_root.name))
+            with self.subTest(change=change):
+                with mock.patch.object(self.c,'_publish_checkpoint_stage',side_effect=publication),mock.patch.object(self.c,'_final_checkpoint_native',side_effect=late if change=='late_native' else native),self.assertRaises(guards.GuardError):self.c.checkpoint()
+                self.assertEqual(self.c.head.read_bytes(),head);self.assertEqual(self.c.database.read_bytes(),database)
+                self.assertFalse(self.c.checkpoint_pending.exists());self.assertFalse((self.root/'receipts/catalog-checkpoint-stage.json').exists())
+                stage,descriptor,unknown=observed[0];self.assertTrue(unknown.exists());self.assertEqual(stage.manifest.read_bytes(),descriptor)
+                self.assertTrue(stage.catalog.head.exists());self.assertTrue(stage.catalog.database.exists())
     def test_preparation_reserves_both_images_and_rollback_before_copy(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID);head=self.c.head.read_bytes();copied=[];connect=sqlite3.connect
         def connection(path,*args,**kwargs):
