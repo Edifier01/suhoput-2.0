@@ -2,7 +2,7 @@
 Description=Suhoput STAGE-B full schedule (budget gated)
 
 [Timer]
-OnCalendar=*-*-* 00:15:00 UTC
+OnCalendar=*-*-* 01:15:00 UTC
 AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=false
