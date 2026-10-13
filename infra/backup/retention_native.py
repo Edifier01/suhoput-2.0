@@ -132,7 +132,8 @@ class IntentStore:
     def ensure_work(self):
         if callable(getattr(self,'work_deadline',None)):
             import time
-            guards.require(time.monotonic()<self.work_deadline(),'Reserved phase durability/cleanup budget reached')
+            deadline=self.work_deadline()
+            if deadline is not None:guards.require(time.monotonic()<deadline,'Reserved phase durability/cleanup budget reached')
     def phase(self,value):
         self.ensure_work();key=format(value['index'],'04d') if value['operation']=='native-retention-batch-authorization' else value['lane']
         exclusive_json(self.root/('phase-'+key+'.json'),value)
@@ -174,6 +175,32 @@ class NewIntentStore(IntentStore):
         self.root.mkdir(mode=0o700);runtime.directory_sync(self.root.parent)
         if hasattr(self,'staged_path'):self.staging.promote(self.staged_path,self.path)
         else:super().prepare(value)
+    def phase_document(self,*args,**kwargs):
+        value=super().phase_document(*args,**kwargs)
+        if getattr(self,'prepared_effect_readback',False):
+            phases=self.phase_documents() if self.root.exists() else {}
+            key=format(value['index'],'04d');phases[key]=value
+            files={'intent.json':self.staged_sha}
+            for name,document in phases.items():
+                filename='phase-'+name+'.json'
+                files[filename]=hashlib.sha256((json.dumps(document,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()).hexdigest() if name==key else sha(private_path(self.root/filename))
+            self.prepared_authority=(self.staged_intent,phases,files)
+        return value
+    def _effect_authority(self):
+        """Read back every bound byte without reconstructing historic rows."""
+        import backup_catalog
+        self.ensure_work();intent,phases,expected=self.prepared_authority
+        deadline=self.work_deadline() if callable(getattr(self,'work_deadline',None)) else None
+        names={path.name for path in self.root.glob('phase-*.json') if path.name!='phase-timing.json'}|{'intent.json'}
+        guards.require(names==set(expected),'Prepared phase authority path set changed')
+        guards.require(all(backup_catalog.file_digest(private_path(self.root/name),deadline)==digest for name,digest in expected.items()),'Prepared phase authority bytes changed')
+        guards.require(retention_apply.document_digest({key:value for key,value in intent.items() if key!='intent_sha256'})==intent['intent_sha256'],
+                       'Prepared intent memory changed')
+        guards.require(all(retention_apply.document_digest({key:value for key,value in doc.items() if key!='phase_sha256'})==doc['phase_sha256'] for doc in phases.values()),
+                       'Prepared phase memory changed')
+        return intent,phases
+    def effect_intent(self):return self._effect_authority()[0]
+    def effect_phases(self):return self._effect_authority()[1]
 
 class ExactRunner:
     def __init__(self,worker,intent_reader,deadline=None,*,phase_reader=None):self.w=worker;self.intent_reader=intent_reader;self.deadline=deadline;self.phase_reader=phase_reader
@@ -429,7 +456,10 @@ class StagedPublication:
     def stage(self,value):
         import time
         started=time.monotonic()
-        try:self._stage(value)
+        try:
+            if self.prepared is not None:
+                self.prepared['staging'].cleanup();self.prepared=None
+            self._stage(value)
         finally:
             if self.timing is not None:self.timing['staging_seconds']+=time.monotonic()-started
     def _stage(self,value):
@@ -487,6 +517,26 @@ def retained_chain(chain,tombstones):
     result['snapshots']=kept;result['logs']=[r for r in chain['logs'] if guards.log_number(r['file']) not in removed]
     guards.retained_logs(result['logs']);return result
 
+def _phase_input_bytes(catalog,deadline=None):
+    """Byte equality only; full authority validation precedes preparation.
+
+    Include the complete path set, so a new, missing or renamed authorization
+    cannot inherit a previous validation. This map never authorizes an effect
+    by itself, and never replaces the final unfiltered native inventory.
+    """
+    import backup_catalog
+    root=catalog.receipts
+    paths=[root/lane/'state.json' for lane in ('base','binlog')]
+    paths += [root/('init-'+lane+'.json') for lane in ('base','binlog')]+[catalog.head]
+    directory=root/'retention-applies'
+    if directory.exists():
+        protected_directory(directory)
+        for attempt in sorted(directory.iterdir()):
+            guards.hex_id(attempt.name,64);protected_directory(attempt)
+            paths.extend(path for path in sorted(attempt.iterdir()) if path.name!='phase-timing.json')
+    return {path.relative_to(root).as_posix():backup_catalog.file_digest(private_path(path),deadline) for path in paths}
+
+
 class NativeApply:
     def __init__(self,config):
         from worker import Worker
@@ -542,6 +592,7 @@ class NativeApply:
             current_reader=[reader]
             critical_deadline=[None]
             active_phase=[None]
+            prepared_inputs=[None];phase_budget=[None]
             def read():
                 started=time.monotonic()
                 try:
@@ -550,6 +601,27 @@ class NativeApply:
                 finally:
                     if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
             from contextlib import contextmanager
+            @contextmanager
+            def preparation():
+                before=_phase_input_bytes(catalog)
+                try:
+                    # Unknown/malformed ordinal authorities are rejected here;
+                    # only equal raw bytes may transfer this complete audit.
+                    catalog._checkpoint_inputs()
+                    yield
+                finally:
+                    after=_phase_input_bytes(catalog)
+                    if before!=after:raise retention_apply.PhasePreparationChanged('Read-only phase authority advanced')
+                prepared_inputs[0]=after
+            def verify_prepared(expected):
+                if _phase_input_bytes(catalog,critical_deadline[0])!=prepared_inputs[0]:
+                    raise retention_apply.PhasePreparationChanged('Phase authority advanced before reservation')
+                actual=read()
+                guards.require(actual['generation']==expected['generation'] and actual['repositories']==expected['repositories'] and
+                               {row['id']:row for row in actual['snapshots']}=={row['id']:row for row in expected['snapshots']} and
+                               actual['manifests']==expected['manifests'],'Final unfiltered native inventory differs from prepared proof')
+                guards.require(_phase_input_bytes(catalog,critical_deadline[0])==prepared_inputs[0],'Phase authority changed inside reserved group')
+                if phase_budget[0] is not None:phase_budget[0]()
             @contextmanager
             def section(name):
                 # Native work ends before the reserved durability and
@@ -585,7 +657,8 @@ class NativeApply:
                 store.work_deadline=lambda:critical_deadline[0]
                 publication=StagedPublication(w,store,timing)
                 ex=retention_apply.Executor(read,ExactRunner(w,store.load),store,publication,w.c['repositories'],clock=retention_cohort.clock,
-                     phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
+                     phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store),
+                     **({'phase_preparation':preparation,'phase_verify':verify_prepared} if w.c.get('retention_readiness_policy')=='native-v2' else {}))
                 try:receipt=ex.reconcile(retention_cohort.clock())
                 finally:
                     if publication.prepared is not None:
@@ -610,17 +683,20 @@ class NativeApply:
                 store=NewIntentStore(path)
                 store.work_deadline=lambda:critical_deadline[0];store.catalog_head=lambda:current_reader[0].head
                 publication=StagedPublication(w,store,timing)
-                runner=ExactRunner(w,store.load,deadline=lambda:critical_deadline[0],phase_reader=store.phase_documents)
+                store.prepared_effect_readback=policy=='native-v2'
+                runner=ExactRunner(w,store.effect_intent if store.prepared_effect_readback else store.load,deadline=lambda:critical_deadline[0],
+                                   phase_reader=store.effect_phases if store.prepared_effect_readback else store.phase_documents)
                 def effect(lane,argv):
                     effect_started=time.monotonic()
                     try:return runner(lane,argv)
                     finally:timing['effect_seconds']+=time.monotonic()-effect_started
                 def pre_phase(current,intent,absent):
                     _confirmed_active(w,current,intent,absent,store)
-                    if policy=='native-v2' and plan['candidates']:
-                        readiness_v2.revalidate_budget(w,evidence,at=retention_cohort.clock())
+                if policy=='native-v2' and plan['candidates']:
+                    phase_budget[0]=lambda:readiness_v2.revalidate_budget(w,evidence,at=retention_cohort.clock())
                 ex=retention_apply.Executor(read,effect,store,publication,w.c['repositories'],clock=retention_cohort.clock,
-                     phase_section=section,pre_phase=pre_phase)
+                     phase_section=section,pre_phase=pre_phase,
+                     **({'phase_preparation':preparation,'phase_verify':verify_prepared} if policy=='native-v2' else {}))
                 try:receipt=ex.apply(inventory,plan,evidence,at);receipt=store.latest()
                 finally:
                     started=time.monotonic()

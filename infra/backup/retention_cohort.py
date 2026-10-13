@@ -12,6 +12,16 @@ def clock():return dt.datetime.now(dt.timezone.utc)
 MAX_CRITICAL_SECONDS=55
 
 @contextlib.contextmanager
+def minute_job(worker,deadline):
+    """Reserve the next job turn while an existing retention group finishes.
+
+    Both acquisitions spend the original minute deadline. The OS releases
+    the reservation on process death; it carries no durable authority.
+    """
+    with backup_catalog._catalog_lock(worker.root/'receipts/job-binlog-wait.lock',MAX_CRITICAL_SECONDS,deadline,'minute turn'):
+        with backup_catalog._catalog_lock(worker.root/'receipts/job-binlog.lock',MAX_CRITICAL_SECONDS,deadline,'minute job'):yield
+
+@contextlib.contextmanager
 def upload_section(worker,*,deadline=None,extra_locks=()):
     """Acquire the complete group; never wait with a partial group held.
 
@@ -24,13 +34,21 @@ def upload_section(worker,*,deadline=None,extra_locks=()):
     paths=[worker.root/'receipts'/name for name in ('job-base.lock','job-binlog.lock','base/lane.lock','binlog/lane.lock')]+list(extra_locks)
     while True:
         guards.require(time.monotonic()<end,'Retention lock acquisition deadline exceeded')
-        stack=contextlib.ExitStack();started=time.monotonic()
+        stack=contextlib.ExitStack();priority=contextlib.ExitStack();started=time.monotonic()
         try:
+            priority.enter_context(runtime.lane_lock(worker.root/'receipts/job-binlog-wait.lock'))
             for path in paths:stack.enter_context(runtime.lane_lock(path))
         except runtime.LaneBusyError:
-            stack.close();remaining=end-time.monotonic()
+            with priority:stack.close()
+            remaining=end-time.monotonic()
             guards.require(remaining>0,'Retention lock acquisition deadline exceeded')
             time.sleep(min(.025,remaining));continue
+        except BaseException:
+            with priority:stack.close()
+            raise
+        # A minute may queue during this body and own the next group turn.
+        # Unlock failure is outside acquisition retry and releases the group.
+        try:priority.close()
         except BaseException:stack.close();raise
         break
     with stack:yield started

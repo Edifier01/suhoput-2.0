@@ -369,6 +369,10 @@ def intent_batches(intent):
         binlog_seen=binlog_seen or lane=='binlog';seen.update(ids)
     guards.require(seen==set(candidates),'Batch partition differs from frozen intent');return batches
 
+class PhasePreparationChanged(guards.GuardError):
+    """Read-only phase inputs advanced before any authorization or effect."""
+
+
 class Executor:
     """Injected runner(lane, argv) must raise on nonzero or ambiguous exit.
 
@@ -376,7 +380,7 @@ class Executor:
     Callers must not clear an intent to retry. Reconcile writes observed exact
     absence/presence; a partial receipt never authorizes retry or tombstones.
     """
-    def __init__(self, inventory_reader, runner, intent_store, receipt_writer, repository_paths, clock=None, *, effect_section=None, pre_effect=None, phase_section=None, pre_phase=None):
+    def __init__(self, inventory_reader, runner, intent_store, receipt_writer, repository_paths, clock=None, *, effect_section=None, pre_effect=None, phase_section=None, pre_phase=None, phase_preparation=None, phase_verify=None):
         self.read_inventory = inventory_reader
         self.runner = runner
         self.store = intent_store
@@ -385,6 +389,8 @@ class Executor:
         self.clock = clock
         self.effect_section=effect_section;self.pre_effect=pre_effect
         self.phase_section=phase_section;self.pre_phase=pre_phase
+        self.phase_preparation=phase_preparation;self.phase_verify=phase_verify
+        guards.require((phase_preparation is None)==(phase_verify is None),'Complete prepared phase boundary required')
         guards.require(set(self.repositories) == {'base', 'binlog'} and
                        all(isinstance(v, str) and v and not v.startswith('-') for v in self.repositories.values()),
                        'Explicit repository paths required')
@@ -539,6 +545,7 @@ class Executor:
         return self._receipt(intent, status, at, calls, observed, error)
 
     def _publish_phased(self,intent,receipt,at):
+        if self.phase_preparation is not None:return self._publish_prepared(intent,receipt,at)
         try:
             if callable(getattr(self.write_receipt,'stage',None)):self.write_receipt.stage(receipt)
             with self.phase_section('publication'):
@@ -553,6 +560,39 @@ class Executor:
             # and cleanup are persisted only after every upload lock released.
             receipt={**receipt,'result':'RECONCILE_REQUIRED','error_type':type(failure).__name__}
             self.write_receipt(copy.deepcopy(receipt));return receipt
+
+    def _publish_prepared(self,intent,receipt,at):
+        try:
+            for attempt in range(4):
+                try:
+                    with self.phase_preparation():
+                        current=self.read_inventory();at=self._now(at);observed=self._observation(intent,current,at)
+                        guards.require(observed['forgotten_ids']==receipt['forgotten_ids'],'Prepared native absences changed')
+                        if self.pre_phase is not None:self.pre_phase(current,intent,observed['forgotten_ids'])
+                        receipt={**receipt,**observed,'completed_at':at.isoformat()}
+                        if callable(getattr(self.write_receipt,'stage',None)):self.write_receipt.stage(receipt)
+                except PhasePreparationChanged:continue
+                with self.phase_section('publication'):
+                    try:self.phase_verify(current)
+                    except PhasePreparationChanged:continue
+                    # Promotion failures never re-enter this body.
+                    self.write_receipt(copy.deepcopy(receipt));return receipt
+            raise guards.GuardError('Four read-only publication preparations advanced')
+        except Exception as failure:
+            receipt={**receipt,'result':'RECONCILE_REQUIRED','error_type':type(failure).__name__}
+            self.write_receipt(copy.deepcopy(receipt));return receipt
+
+    def _phase_data(self,intent,before,plan,evidence,lane,ids,removed,index,daily,at,inventory):
+        current=self.read_inventory();at=self._now(at)
+        compared=compatible_inventory(before,current,at,removed)
+        guards.require(compared['absent_ids']==sorted(removed),'Prior exact lane absence differs')
+        protected_dependencies(current,intent['candidate_ids'],at)
+        if self.pre_phase is not None:self.pre_phase(current,intent,sorted(removed))
+        at=self._now(at)
+        if ids:current_freshness(plan,evidence,at)
+        else:_plan(inventory,plan,at)
+        phase=self.store.phase_document(lane,current,sorted(removed),at,index=index) if daily else (self.store.phase_document(lane,current,sorted(removed),at) if callable(getattr(self.store,'phase',None)) else None)
+        return current,phase,at
 
     def _phased(self,inventory,plan,evidence,binding,before,at):
         comparison=compatible_inventory(inventory,before,at);protected_dependencies(before,binding['candidate_ids'],at)
@@ -571,26 +611,30 @@ class Executor:
         removed=set();calls=0;error=None;promoted=False
         for index,(lane,ids) in enumerate(phases):
             try:
-                with self.phase_section(lane):
-                    current=self.read_inventory();at=self._now(at)
-                    compared=compatible_inventory(before,current,at,removed)
-                    guards.require(compared['absent_ids']==sorted(removed),'Prior exact lane absence differs')
-                    protected_dependencies(current,intent['candidate_ids'],at)
-                    if self.pre_phase is not None:self.pre_phase(current,intent,sorted(removed))
-                    at=self._now(at)
-                    if ids:current_freshness(plan,evidence,at)
-                    else:_plan(inventory,plan,at)
-                    phase_document=self.store.phase_document(lane,current,sorted(removed),at,index=index) if daily else (self.store.phase_document(lane,current,sorted(removed),at) if callable(getattr(self.store,'phase',None)) else None)
-                    if not promoted:
-                        self.store.prepare(intent);promoted=True
-                        guards.require(self._intent()==intent,'Durable phased intent readback differs')
-                    if phase_document is not None:self.store.phase(phase_document)
-                    at=self._now(at)
-                    if ids:
-                        current_freshness(plan,evidence,at);calls+=1
-                        result=self.runner(lane,['--repo',self.repositories[lane],'forget',*ids])
-                        guards.require(result is None or isinstance(result,bytes),'Runner must raise on uncertain result')
-                        removed.update(ids)
+                for attempt in range(4 if self.phase_preparation is not None else 1):
+                    if self.phase_preparation is not None:
+                        try:
+                            with self.phase_preparation():current,phase_document,at=self._phase_data(intent,before,plan,evidence,lane,ids,removed,index,daily,at,inventory)
+                        except PhasePreparationChanged:continue
+                    with self.phase_section(lane):
+                        if self.phase_preparation is not None:
+                            try:self.phase_verify(current)
+                            except PhasePreparationChanged:continue
+                        else:current,phase_document,at=self._phase_data(intent,before,plan,evidence,lane,ids,removed,index,daily,at,inventory)
+                        at=self._now(at)
+                        if ids:current_freshness(plan,evidence,at)
+                        if not promoted:
+                            self.store.prepare(intent);promoted=True
+                            guards.require(self._intent()==intent,'Durable phased intent readback differs')
+                        if phase_document is not None:self.store.phase(phase_document)
+                        at=self._now(at)
+                        if ids:
+                            current_freshness(plan,evidence,at);calls+=1
+                            result=self.runner(lane,['--repo',self.repositories[lane],'forget',*ids])
+                            guards.require(result is None or isinstance(result,bytes),'Runner must raise on uncertain result')
+                            removed.update(ids)
+                    break
+                else:raise guards.GuardError('Four read-only effect preparations advanced')
             except Exception as failure:
                 if not promoted:raise
                 error=type(failure).__name__;break

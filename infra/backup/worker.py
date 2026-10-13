@@ -380,10 +380,10 @@ class Worker:
             else:self._binlog_job_deadline=previous
     def _binlog(self):
         from maintenance import require_clear
-        from backup_catalog import _catalog_lock
+        from retention_cohort import minute_job
         require_clear(self)
         self.source_check();self.gate()
-        with _catalog_lock(self.root/'receipts/job-binlog.lock',55,self._binlog_job_deadline,'minute job'):
+        with minute_job(self,self._binlog_job_deadline):
             require_clear(self)
             pending=self.pending_payload('binlog')
             if pending:

@@ -59,5 +59,31 @@ class RetentionLockTests(unittest.TestCase):
         w,calls=self.minute();w._binlog_job_deadline=time.monotonic()+.06
         with mock.patch('maintenance.require_clear',return_value=None),retention_cohort.upload_section(self.w),self.assertRaises(guards.GuardError):w.binlog()
         self.assertEqual(calls,[])
+    def test_waiting_minute_runs_between_back_to_back_retention_groups(self):
+        import backup_catalog
+        w,calls=self.minute();waiting=threading.Event();retry=threading.Event();second_attempt=threading.Event()
+        order=[];errors=[];sleep=time.sleep;original_upload=w.upload
+        def upload(*args):order.append('minute');return original_upload(*args)
+        w.upload=upload
+        def pause(seconds):
+            if threading.current_thread().name=='minute' and not retry.is_set():
+                waiting.set();self.assertTrue(retry.wait(2))
+            else:sleep(seconds)
+        def minute():
+            try:w.binlog()
+            except BaseException as error:errors.append(error)
+        def next_group():
+            second_attempt.set()
+            try:
+                with retention_cohort.upload_section(self.w,deadline=time.monotonic()+2):order.append('retention')
+            except BaseException as error:errors.append(error)
+        with mock.patch('maintenance.require_clear',return_value=None),mock.patch.object(backup_catalog.time,'sleep',pause):
+            with retention_cohort.upload_section(self.w):
+                writer=threading.Thread(target=minute,name='minute');writer.start();self.assertTrue(waiting.wait(2))
+            second=threading.Thread(target=next_group,name='retention');second.start();self.assertTrue(second_attempt.wait(2));sleep(.06)
+            before=list(order);retry.set();writer.join(2);second.join(2)
+        self.assertEqual(before,[],'A queued minute must prevent the next retention group from overtaking it')
+        self.assertEqual(errors,[]);self.assertEqual(order,['minute','retention']);self.assertEqual(len(calls),1)
+        self.assertFalse(writer.is_alive());self.assertFalse(second.is_alive())
 
 if __name__=='__main__':unittest.main()
