@@ -103,6 +103,8 @@ VPS Timeweb, отдельные STAGE-B/S3-B, домен и почта обсл�
 
 ## Git и проверки документов
 
+Protected backup Python suites на Linux запускаются в pinned root-контейнере по [workflow](.github/workflows/checks.yml): source/tests read-only, networknone,768MiB/1CPU, отдельный scratch с прежним5GiB reserve. Обычный hosted runner не владеет fixture как root и закономерно не проходит owner/mode guards. Защита каталога не отключается; Windows выполняет только модели файловой системы. После исправления CI окружения все165 сценариев девяти protected suites прошли без skips; [доказательство](docs/ACCEPTANCE.md#exec-chk-064).
+
 TASK-019: `pnpm test:commerce` (или `node tests/commerce-suite.cjs`) запускает серверные правила контекста, реальные локальные HTTP/Store API, смену прав/сессий, конкурентные квоты и письмо имитированного гостевого заказа в Mailpit. Внешнего резерва/платежа нет. Используются example.invalid, временные настройки и только собственные fixture; suite восстанавливает настройки и удаляет свои объекты/письма. На Windows задать PLAYWRIGHT_BROWSERS_PATH как выше. Suite входит в foundation CI.
 
 WooCommerce → Гостевые ограничения: менеджер/администратор задаёт окно и лимиты браузера/общего IP; defaults 10/120 действий за 60 секунд и 2/20 активных неоплаченных намерений. Настройки хранятся в `suhoput_guest_limits`, не публикуются REST. Не доверять Forwarded/X-Forwarded-For от клиента: перед production настроить реальный REMOTE_ADDR только от проверенного прокси (TASK-046); на закрытом local все браузеры действительно имеют общий адрес прокси. Не освобождать unknown слот удалением cookie/по времени. Будущий адаптер вызывает settle после подтверждения; это не складская гарантия и не разрешение EXT-013.

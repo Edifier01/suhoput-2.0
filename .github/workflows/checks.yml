@@ -42,16 +42,10 @@ jobs:
           chmod 0755 .cache/packages/restic
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 1 --pids-limit 256 --tmpfs /control:rw,exec,nosuid,nodev,size=805306368,mode=0700 --tmpfs /tmp:rw,nosuid,nodev,size=16777216 --mount "type=bind,source=$PWD/.cache/packages/restic,target=/input/restic,readonly" --mount "type=bind,source=$PWD/tests/backup-mariadb-local.sh,target=/input/test.sh,readonly" --entrypoint bash mariadb:10.11@sha256:7db29378d4fdab73f8123bbc2b48905c90d1a4b00cf848b028f1e81e623257f2 /input/test.sh
       - name: Protected backup worker capture and crash recovery (synthetic)
+        shell: bash
         run: |
-          python3 tests/backup_worker_test.py
-          python3 tests/backup_restore_test.py
-          python3 tests/backup_retention_test.py
-          python3 tests/backup_retention_apply_test.py
-          python3 tests/backup_retained_suffix_test.py
-          python3 tests/backup_retention_native_test.py
-          python3 tests/backup_budget_test.py
-          python3 tests/backup_meter_test.py
-          python3 tests/backup_binlog_test.py
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 768m --cpus 1 --pids-limit 128 --env TMPDIR=/control --tmpfs /control:rw,nosuid,nodev,size=8589934592,mode=0700 --mount "type=bind,source=$PWD/infra/backup,target=/source/infra/backup,readonly" --mount "type=bind,source=$PWD/tests,target=/source/tests,readonly" --entrypoint sh python:3.12.14-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f -c 'set -eu; for test in backup_worker_test.py backup_restore_test.py backup_retention_test.py backup_retention_apply_test.py backup_retained_suffix_test.py backup_retention_native_test.py backup_budget_test.py backup_meter_test.py backup_binlog_test.py; do python -B "/source/tests/$test"; done'
       - name: Portable owner-kit crypto and exact-ID retention (synthetic; no S3 or host credentials)
         shell: bash
         run: |
