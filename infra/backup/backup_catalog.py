@@ -746,14 +746,19 @@ class ArchiveCatalog:
         head: every historic body/record/blob must still match the private
         sealed graph. No live read cursor/transaction spans this full pass.
         """
-        before=file_digest(self.database);expected={**records,**{item['record']['id']:item['record'] for item in retired}}
-        for sid,record in expected.items():
+        before=file_digest(self.database);_,_,dbhead,committed=self._checkpoint_state()
+        accepted=dbhead if committed else head
+        removed={item['sequence']:item['record'] for item in retired};iterator=iter(records.values());previous=self._seed(accepted);log_count=0
+        guards.require(len(records)+len(removed)==accepted['sequence'] and len(removed)==len(retired),'Accepted source membership differs')
+        for sequence in range(1,accepted['sequence']+1):
+            record=removed.get(sequence) or next(iterator);sid=record['id']
             with runtime.lane_lock(self.lock),self._db() as source:
-                row=source.execute('SELECT sequence,sid,token,record,body,chain FROM archives WHERE sid=?',(sid,)).fetchone()
-                guards.require(row is not None and self._row(row)==record,'Historic source record/body changed during append')
+                row=source.execute('SELECT sequence,sid,token,record,body,chain FROM archives WHERE sequence=?',(sequence,)).fetchone()
+                guards.require(row is not None and row[0]==sequence and row[1]==sid and self._row(row)==record,'Historic source sequence/record/body changed during append')
+                previous=digest(bytes.fromhex(previous)+row[3]);guards.require(row[5]==previous,'Historic source chain changed during append')
                 logs=dict(source.execute('SELECT name,length(body) FROM logs WHERE sid=?',(sid,)))
             seals={item['file']:item['compressed_sha256'] for item in record['cached_logs']}
-            guards.require(set(logs)==set(seals),'Historic source cached set changed')
+            guards.require(set(logs)==set(seals),'Historic source cached set changed');log_count+=len(seals)
             for name,size in logs.items():
                 guards.require(type(size) is int and 0<=size<=MAX_FILE_BYTES,'Historic source cached size differs');seal=hashlib.sha256()
                 for offset in range(0,size,1024*1024):
@@ -762,7 +767,15 @@ class ArchiveCatalog:
                     guards.require(block is not None and isinstance(block[0],bytes) and len(block[0])==min(1024*1024,size-offset),'Historic source cached body missing')
                     seal.update(block[0])
                 guards.require(seal.hexdigest()==seals[name],'Historic source cached body changed')
-        current,_,_,_=self._checkpoint_state();after=file_digest(self.database)
+        del iterator
+        guards.require(previous==accepted['chain'],'Accepted complete source head chain differs')
+        current,_,current_dbhead,_=self._checkpoint_state()
+        with runtime.lane_lock(self.lock),self._db() as source:
+            guards.require(source.execute('SELECT COUNT(*) FROM archives').fetchone()[0]==current_dbhead['sequence'] and
+                           source.execute('SELECT 1 FROM logs LEFT JOIN archives ON archives.sid=logs.sid WHERE archives.sid IS NULL LIMIT 1').fetchone() is None,
+                           'Unknown source archive/cached membership')
+            if current==head:guards.require(source.execute('SELECT COUNT(*) FROM logs').fetchone()[0]==log_count,'Unknown complete source cached membership')
+        after=file_digest(self.database)
         if current==head:guards.require(before==after,'Source bytes changed during complete accepted prefix verification')
         return current,after
 

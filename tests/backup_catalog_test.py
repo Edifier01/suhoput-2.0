@@ -477,6 +477,25 @@ class CatalogLifecycleTests(unittest.TestCase):
                     with db:db.execute("UPDATE archives SET body=x'00' WHERE sid=?",('4'*64,))
         with mock.patch.object(self.c,'_checkpoint_insert',side_effect=tamper),self.assertRaises(guards.GuardError):self.c.checkpoint()
         self.assertFalse(self.c.checkpoint_pending.exists());self.assertEqual(runtime.load_json(self.c.head)['sequence'],3)
+    def test_accepted_append_rejects_historic_sequence_chain_and_foreign_membership(self):
+        for change in ('sequence','chain','extra_archive','extra_log'):
+            if change!='sequence':self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.put('6'*64,'7'*32);self.prove_absence(SID)
+            reseal=self.c._checkpoint_insert;changed=[]
+            def tamper(*args,**kwargs):
+                reseal(*args,**kwargs)
+                if changed:return
+                changed.append(True)
+                with contextlib.closing(sqlite3.connect(self.c.database)) as db:
+                    with db:
+                        if change=='sequence':db.execute('UPDATE archives SET sequence=-sequence WHERE sid=?',('4'*64,))
+                        elif change=='chain':db.execute('UPDATE archives SET chain=? WHERE sid=?',('0'*64,'4'*64))
+                        elif change=='extra_archive':db.execute('INSERT INTO archives SELECT -1,?, ?, record,body,chain FROM archives WHERE sid=?',('e'*64,'f'*32,'4'*64))
+                        else:db.execute('INSERT INTO logs VALUES (?,?,?)',('e'*64,'suhoput2-binlog.000001',b'foreign'))
+                self.put('8'*64,'9'*32)
+            with self.subTest(change=change):
+                with mock.patch.object(self.c,'_checkpoint_insert',side_effect=tamper),self.assertRaises(guards.GuardError):self.c.checkpoint()
+                self.assertTrue(changed);self.assertFalse(self.c.checkpoint_pending.exists());self.assertEqual(runtime.load_json(self.c.head)['sequence'],4)
     def test_stage_crashes_preserve_prior_next_dispositions_and_readonly_reconcile(self):
         for point in ('pending','pointer','replace','head','clear'):
             if point!='pending':self.setUp()
