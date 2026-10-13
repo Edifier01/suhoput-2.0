@@ -299,7 +299,61 @@ class Worker:
             guards.require(set(identity)=={'application_sha256','configuration_sha256'} and
                            all(guards.hex_id(value,64)==manifest.get(key) for key,value in identity.items()),
                            'Commissioned application identity changed; recalibrate before uploading new code')
+        if payload is not None and manifest['kind']=='binlog':
+            guards.require(self.recent_source_binlog_bytes()<=2*1024**2,
+                           'Recent source binlog growth exceeds commissioned daily bound; recalibrate budget')
+            log_bytes=sum(row['bytes'] for row in manifest['files'] if str(row.get('path','')).startswith('logs/'))
+            recent,covered=self.recent_confirmed_binlog_bytes(result['manifest_sha256'])
+            guards.require(log_bytes<=2*1024**2 and recent+(0 if covered else log_bytes)<=2*1024**2,
+                           'Confirmed plus captured binlog bytes exceed commissioned daily bound; recalibrate budget')
         return result
+    def recent_confirmed_binlog_bytes(self,manifest_sha256):
+        """Use actual confirmation times; aged backlog still consumes this day.
+
+        The existing finalization marker authenticates the chain's exact bytes;
+        every span must also match its upload journal acknowledgement. No new
+        ledger, upload, cache timestamp or caller admission flag is created.
+        """
+        path=self.root/'receipts/binlog-chain.json'
+        if not path.exists():
+            guards.require(not runtime.UploadJournal(self.root/'receipts/binlog',self.c['generation']).state()['confirmed'],
+                           'Confirmed binlog chain absent')
+            return 0,False
+        raw=backup_catalog.read_file(path,64*1024**2);chain=backup_catalog.decode(raw)
+        marker=runtime.load_json(private_path(self.root/'receipts/binlog/finalized.json'))
+        guards.require(chain['generation']==self.c['generation'] and
+                       marker['domains']['binlog-chain.json']==hashlib.sha256(raw).hexdigest() and
+                       marker['snapshot_id']==chain['snapshot_id'],'Confirmed binlog chain origin differs')
+        confirmed=runtime.UploadJournal(self.root/'receipts/binlog',self.c['generation']).state()['confirmed']
+        proofs={row['id']:row for row in confirmed};logs=chain['logs'];snapshots=chain['snapshots']
+        guards.require(len(proofs)==len(confirmed) and len(snapshots)==len(proofs) and
+                       {row['id'] for row in snapshots}==set(proofs),'Confirmed binlog authority differs')
+        cutoff=dt.datetime.now(UTC)-dt.timedelta(days=1);total=0;covered=False;end=0;seen=set()
+        for row in snapshots:
+            proof=proofs.get(row['id']);first=row['first_log'];last=row['last_log']
+            guards.require(row['id'] not in seen and proof is not None and
+                           all(proof[k]==row[k] for k in ('manifest_sha256','captured_at')) and
+                           type(first) is int and type(last) is int and first==end+1 and first<=last<=len(logs) and
+                           guards.log_number(logs[first-1]['file'])==first and guards.log_number(logs[last-1]['file'])==last,
+                           'Confirmed binlog byte span differs')
+            seen.add(row['id']);end=last
+            stamp=guards.utc(proof['confirmed_at']);guards.require(stamp<=dt.datetime.now(UTC),'Future binlog confirmation')
+            if stamp>=cutoff:
+                sizes=[item['size'] for item in logs[first-1:last]]
+                guards.require(all(type(size) is int and size>=0 for size in sizes),'Invalid confirmed binlog byte size')
+                total+=sum(sizes);covered=covered or row['manifest_sha256']==manifest_sha256
+        guards.require(end==len(logs) and len(seen)==len(snapshots),'Incomplete confirmed binlog byte coverage')
+        return total,covered
+    def recent_source_binlog_bytes(self):
+        """Bound the rolling source day, including the still-active log."""
+        current=time.time();cutoff=current-86400;total=0;count=0
+        for path in self.db_volume.glob('suhoput2-binlog.*'):
+            if path.name=='suhoput2-binlog.index':continue
+            guards.log_number(path.name);info=path.lstat();count+=1
+            guards.require(count<=100000 and stat.S_ISREG(info.st_mode) and info.st_nlink==1 and
+                           info.st_mtime<=current+1,'Invalid commissioned source binlog metadata')
+            if info.st_mtime>=cutoff:total+=info.st_size
+        return total
     def validate_capture_geometry(self,manifest,payload=None,*,fixed_helpers=None):
         """Pure capture calibration; does not admit a budget or create upload authority."""
         kind=manifest.get('kind');files=manifest.get('files')
@@ -330,7 +384,18 @@ class Worker:
         # Include every other byte: dump, both media copies, public helper
         # configuration, ownership marker and any unexpected extra file.
         dynamic=sum(row['bytes'] for row in files if not fixed(row))
-        if kind!='binlog':guards.require(dynamic<=384*1024,'Dynamic base database/media exceeds commissioned bound')
+        if kind!='binlog':
+            guards.require(dynamic<=384*1024,'Dynamic base database/media exceeds commissioned bound')
+            guards.require(sum(not fixed(row) for row in files)<=22,'Dynamic base file count exceeds commissioned restore bound')
+            if kind in ('full','pre-update'):
+                guards.require(all(fixed(row) or row.get('path') in ('db.sql','media.json','.capture.json') or
+                                   str(row.get('path','')).startswith(('uploads/','wordpress/wp-content/uploads/')) for row in files),
+                               'Unknown full variable file exceeds commissioned restore profile')
+                if payload is not None:guards.require({'db.sql','media.json','.capture.json'}<= {row['path'] for row in files},
+                                                     'Incomplete commissioned full variable profile')
+                media={row['path'].removeprefix('uploads/'):(row['bytes'],row.get('sha256')) for row in files if str(row.get('path','')).startswith('uploads/')}
+                copied={row['path'].removeprefix('wordpress/wp-content/uploads/'):(row['bytes'],row.get('sha256')) for row in files if str(row.get('path','')).startswith('wordpress/wp-content/uploads/')}
+                guards.require(media==copied,'Full media copies differ; recapture before commissioned upload')
         else:guards.require(len(raw)+sum(row['bytes'] for row in files if not str(row.get('path','')).startswith('logs/'))<=2*1024,
                             'Binlog control bytes exceed commissioned bound')
         # With root-owned files, no xattrs or links and controlled names, each
@@ -370,7 +435,8 @@ class Worker:
                     add('' if path==payload else path.relative_to(payload).as_posix(),info.st_size if stat.S_ISREG(info.st_mode) else 0)
                 guards.require(all(not (pathlib.Path(directory)/name).is_symlink() for name in dirs),'Commissioned directory symlink')
         return {'raw_bytes':sum(row['bytes'] for row in files)+len(raw),'manifest_bytes':len(raw),
-                'dynamic_base_bytes':dynamic,'native_metadata_bound_bytes':metadata,'node_count':nodes}
+                'dynamic_base_bytes':dynamic,'native_metadata_bound_bytes':metadata,'node_count':nodes,
+                'manifest_sha256':hashlib.sha256(raw).hexdigest()}
     def upload(self,lane,payload):
         from maintenance import require_clear
         require_clear(self)

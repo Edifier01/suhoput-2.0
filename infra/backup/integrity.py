@@ -131,7 +131,7 @@ def _current(w,inventory):
         guards.require(inventory['repositories']==retention_cohort.repository_ids(w),'Integrity initialized repositories differ')
         tombstones=retention_native.verified_tombstones(w)
         journals={lane:runtime.UploadJournal(w.root/'receipts'/lane,w.c['generation']).state() for lane in LANES}
-        retention.confirmed_inventory(inventory,journals,tombstones)
+        retention_cohort.confirm_observation(w,inventory,reader,journals=journals,tombstones=tombstones)
         current={lane:{} for lane in LANES}
         for row in inventory['snapshots']:
             lane=row['lane'];guards.require(lane in LANES,'Unknown integrity current lane');sid=row['id'];record=reader._record(sid)

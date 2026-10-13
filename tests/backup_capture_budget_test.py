@@ -117,5 +117,43 @@ class CaptureBudgetTests(unittest.TestCase):
         w=self.case()
         with self.assertRaisesRegex(guards.GuardError,'Dynamic base'):
             w.validate_capture_geometry({'kind':'full','files':[{'path':'unknown-extra','bytes':384*1024+1}]})
+    def test_rolling_source_binlog_bound_counts_active_and_recent_closed_files(self):
+        import os,time
+        w=self.case();w.db_volume=w.root/'source';w.db_volume.mkdir()
+        for n,size in ((1,111),(2,222),(3,333)):(w.db_volume/('suhoput2-binlog.'+str(n).zfill(6))).write_bytes(b'x'*size)
+        old=w.db_volume/'suhoput2-binlog.000001';os.utime(old,(time.time()-86401,)*2)
+        (w.db_volume/'suhoput2-binlog.index').write_bytes(b'not log data')
+        self.assertEqual(w.recent_source_binlog_bytes(),555)
+    def test_small_minute_capture_cannot_bypass_large_daily_source_growth(self):
+        w=self.case();p=w.root/'spool/binlog-payload';m={'kind':'binlog','files':[]}
+        with mock.patch.object(budget,'load_commissioning_budget',return_value={'capture_policy':{}}), \
+             mock.patch.object(w,'validate_capture_geometry',return_value={'raw_bytes':1}), \
+             mock.patch.object(w,'recent_source_binlog_bytes',return_value=2*1024**2+1):
+            with self.assertRaisesRegex(guards.GuardError,'daily bound'):w.check_capture_budget(m,p)
+    def test_aged_backlog_cannot_bypass_captured_or_confirmed_day_bound(self):
+        w=self.case();p=w.root/'spool/binlog-payload'
+        with mock.patch.object(budget,'load_commissioning_budget',return_value={'capture_policy':{}}), \
+             mock.patch.object(w,'validate_capture_geometry',return_value={'manifest_sha256':'a'*64}), \
+             mock.patch.object(w,'recent_source_binlog_bytes',return_value=0), \
+             mock.patch.object(w,'recent_confirmed_binlog_bytes',return_value=(0,False)) as confirmed:
+            m={'kind':'binlog','files':[{'path':'logs/suhoput2-binlog.000001','bytes':3*1024**2}]}
+            with self.assertRaisesRegex(guards.GuardError,'daily bound'):w.check_capture_budget(m,p)
+            m['files'][0]['bytes']=1000000;confirmed.return_value=(1500000,False)
+            with self.assertRaisesRegex(guards.GuardError,'daily bound'):w.check_capture_budget(m,p)
+            confirmed.return_value=(1500000,True);w.check_capture_budget(m,p)
+    def test_restore_wire_bound_limits_tiny_variable_files(self):
+        w=self.case()
+        with self.assertRaisesRegex(guards.GuardError,'file count'):
+            w.validate_capture_geometry({'kind':'hourly','files':[{'path':'uploads/'+str(n),'bytes':1} for n in range(23)]})
+    def test_full_media_duplicates_match_before_applying_fixed_pack_wire_bound(self):
+        w=self.case();files=[{'path':'uploads/p.jpg','bytes':5,'sha256':'a'*64},{'path':'wordpress/wp-content/uploads/p.jpg','bytes':5,'sha256':'a'*64}]
+        w.validate_capture_geometry({'kind':'full','files':files})
+        files[1]['sha256']='b'*64
+        with self.assertRaisesRegex(guards.GuardError,'media copies differ'):w.validate_capture_geometry({'kind':'full','files':files})
+
+    def test_small_unpaired_full_file_cannot_expand_restore_pack_selection(self):
+        w=self.case()
+        with self.assertRaisesRegex(guards.GuardError,'Unknown full variable file'):
+            w.validate_capture_geometry({'kind':'full','files':[{'path':'other-small-file','bytes':1}]})
 
 if __name__=='__main__':unittest.main()

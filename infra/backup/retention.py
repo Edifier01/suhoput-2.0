@@ -53,14 +53,205 @@ def verify_native_views(worker,expected,deadline):
         del config,listed
         guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')
 
-def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=None,reader_out=None,native_views=None):
+def verify_reader_prefix(reader):
+    """Recheck every cached old row/blob byte in short independent read batches."""
+    c=reader.catalog;previous=c._seed(reader.head);count=reader.head['sequence']
+    for first in range(1,count+1,256):
+        last=min(count,first+255);expected={}
+        with reader._read_lock(),c._db() as db:
+            rows=db.execute('SELECT sequence,sid,token,record,body,chain FROM archives WHERE sequence BETWEEN ? AND ? ORDER BY sequence',(first,last))
+            sequence=first-1
+            for seq,sid,token,raw,body,chain in rows:
+                sequence+=1;record=reader._records.get(sid)
+                guards.require(seq==sequence and record is not None and token==record['token'] and raw==backup_catalog.canonical(record) and
+                               isinstance(body,bytes) and hashlib.sha256(body).hexdigest()==record['raw_compressed_sha256'],
+                               'Prepared catalog old row or raw manifest bytes changed')
+                previous=hashlib.sha256(bytes.fromhex(previous)+raw).hexdigest()
+                guards.require(chain==previous,'Prepared catalog old ordinal chain changed')
+                expected.update({(sid,item['file']):item for item in record['cached_logs']})
+            guards.require(sequence==last,'Prepared catalog old prefix shortened')
+            for sid,name,body in db.execute('SELECT l.sid,l.name,l.body FROM logs l JOIN archives a ON a.sid=l.sid WHERE a.sequence BETWEEN ? AND ?',(first,last)):
+                item=expected.pop((sid,name),None)
+                guards.require(item is not None and isinstance(body,bytes) and len(body)<=backup_catalog.MAX_FILE_BYTES and
+                               hashlib.sha256(body).hexdigest()==item['compressed_sha256'],'Prepared catalog old binlog bytes changed')
+            guards.require(not expected,'Prepared catalog old binlog missing')
+    guards.require(previous==reader.head['chain'],'Prepared catalog old head changed')
+    with reader._read_lock(),c._db() as db:
+        guards.require(db.execute('SELECT 1 FROM logs l LEFT JOIN archives a ON a.sid=l.sid WHERE a.sid IS NULL LIMIT 1').fetchone() is None,
+                       'Prepared catalog foreign binlog row')
+
+def reader_raw_prefix_seal(reader,*,head=None,verify=False,deadline=None):
+    """Hash exact old logical bytes using independent 256-row read batches.
+
+    Outside preparation compares every byte seal to its original reader.
+    Later digest equality transfers that audit without a second object graph.
+    """
+    c=reader.catalog;head=head or reader.head;boundary=head['sequence'];value=hashlib.sha256()
+    def check():
+        if deadline is not None:guards.require(time.monotonic()<deadline,'Catalog raw-prefix deadline exceeded')
+    def add(item):
+        if item is None:tag=b'n';raw=b''
+        elif type(item) is int:tag=b'i';raw=str(item).encode()
+        elif isinstance(item,str):tag=b's';raw=item.encode()
+        else:guards.require(isinstance(item,bytes),'Catalog raw-prefix type differs');tag=b'b';raw=item
+        value.update(tag);value.update(len(raw).to_bytes(8,'big'));value.update(raw)
+    def state(db):
+        check();current=c._head();c._tail(db,current)
+        guards.require(current.get('checkpoint')==head.get('checkpoint') and current['sequence']>=boundary,'Original catalog prefix epoch changed')
+        return list(db.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name'))
+    def checkpoints(db,schema):
+        if not any(row[1]=='catalog_checkpoint' and row[0]=='table' for row in schema):return []
+        result=[]
+        for slot,raw in db.execute('SELECT slot,record FROM catalog_checkpoint ORDER BY slot'):
+            check();guards.require(isinstance(raw,bytes),'Original catalog checkpoint body type differs')
+            result.append((slot,len(raw),hashlib.sha256(raw).hexdigest()))
+        return result
+    with reader._read_lock(deadline),c._db() as db:
+        schema=state(db);checkpoint=checkpoints(db,schema)
+    proof=head.get('checkpoint')
+    guards.require((not checkpoint if proof is None else len(checkpoint)==1 and checkpoint[0][0]==1 and checkpoint[0][2]==proof['sha256']),
+                   'Catalog checkpoint differs from original head')
+    for row in schema:
+        add('schema')
+        for item in row:add(item)
+    for row in checkpoint:
+        add('checkpoint')
+        for item in row:add(item)
+    previous=c._seed(head);sequence=0;logs=0
+    for first in range(1,boundary+1,256):
+        last=min(boundary,first+255);expected_logs=0;batch_logs=0
+        with reader._read_lock(deadline),c._db() as db:
+            guards.require(state(db)==schema,'Original catalog schema changed between batches')
+            for row in db.execute('SELECT sequence,sid,token,record,body,chain FROM archives WHERE sequence BETWEEN ? AND ? ORDER BY sequence',(first,last)):
+                check();seq,sid,token,raw,body,chain=row;sequence+=1
+                guards.require(seq==sequence and isinstance(raw,bytes) and isinstance(body,bytes),'Original catalog prefix membership differs')
+                if verify:
+                    record=reader._records.get(sid)
+                    guards.require(record is not None and token==record['token'] and raw==backup_catalog.canonical(record) and
+                                   hashlib.sha256(body).hexdigest()==record['raw_compressed_sha256'],'Prepared catalog old row or raw manifest bytes changed')
+                    expected_logs+=len(record['cached_logs'])
+                previous=hashlib.sha256(bytes.fromhex(previous)+raw).hexdigest()
+                guards.require(chain==previous,'Original catalog raw-prefix chain changed');add('archive')
+                for item in (seq,sid,token,raw,hashlib.sha256(body).digest(),chain):add(item)
+            guards.require(sequence==last,'Original catalog prefix shortened')
+            query="""SELECT a.sequence,l.rowid,l.sid,l.name,typeof(l.body),length(l.body),
+                     CASE WHEN length(l.body)<=1048576 THEN l.body ELSE NULL END FROM logs l JOIN archives a ON a.sid=l.sid
+                     WHERE a.sequence BETWEEN ? AND ? ORDER BY a.sequence,l.name"""
+            for seq,rowid,sid,name,kind,size,body in db.execute(query,(first,last)):
+                check();guards.require(kind=='blob' and type(size) is int and 0<=size<=backup_catalog.MAX_FILE_BYTES,'Original cached body type/size differs')
+                if body is None:
+                    compressed=hashlib.sha256()
+                    with db.blobopen('logs','body',rowid,readonly=True) as blob:
+                        while block:=blob.read(1024**2):check();compressed.update(block)
+                    seal=compressed.hexdigest()
+                else:
+                    guards.require(isinstance(body,bytes),'Original cached body type differs');seal=hashlib.sha256(body).hexdigest()
+                if verify:
+                    item=next((item for item in reader._records[sid]['cached_logs'] if item['file']==name),None)
+                    guards.require(item is not None and item['compressed_sha256']==seal,'Prepared catalog old binlog bytes changed')
+                add('cached')
+                for item in (seq,sid,name,kind,size,seal):add(item)
+                logs+=1;batch_logs+=1
+            if verify:guards.require(batch_logs==expected_logs,'Original cached body membership differs')
+    guards.require(sequence==boundary and previous==head['chain'],'Original catalog raw-prefix head changed')
+    with reader._read_lock(deadline),c._db() as db:
+        guards.require(state(db)==schema,'Original catalog schema changed after batches')
+        guards.require(checkpoints(db,schema)==checkpoint,'Original catalog checkpoint raw body changed')
+        guards.require(db.execute('SELECT 1 FROM logs l LEFT JOIN archives a ON a.sid=l.sid WHERE a.sid IS NULL LIMIT 1').fetchone() is None,'Catalog foreign cached row')
+    for item in ('end',boundary,logs):add(item)
+    check();return value.hexdigest()
+
+def refresh_prepared_inventory(worker,current,views,reader,candidates,at):
+    """Transfer the old complete audit; validate only authenticated appended IDs.
+
+    One unfiltered native refresh seals every field again. Filtering exactly
+    new catalog IDs must reproduce the prior complete native digest; old
+    identities, configurations, source bodies and ordinals never get resealed.
+    """
+    import binlog,retention_cohort
+    prior_reader=reader
+    indexed={row['id']:row for row in current['snapshots']};fresh=[];manifests=dict(current['manifests']);updated_views={}
+    for lane in ('base','binlog'):
+        repo=worker.c['repositories'][lane];config=decode(worker.restic(lane,['--repo',repo,'cat','config']))
+        listed=decode(worker.restic(lane,['--repo',repo,'snapshots','--json']));reader=reader.refresh()
+        observed=retention_cohort.clock();guards.require(observed>=at,'Prepared refresh clock rollback');at=observed
+        old={sid for sid,row in indexed.items() if row['lane']==lane};new={row['id'] for row in listed}-old
+        # The prior reader may already contain a concurrent admission that
+        # finished after the earlier native response. New membership is relative
+        # to that complete native view, rather than the newer catalog view.
+        # Old native fields remain exact below; every new row still requires its
+        # authenticated catalog seal, full manifest/file proof and journal check.
+        guards.require(not new&set(indexed) and new<=set(reader._records),
+                       'Native refresh contains an unknown or cross-lane arrival')
+        guards.require(native_view_digest(config,[row for row in listed if row['id'] not in new])==views[lane],
+                       'Prepared old complete native fields or configuration changed')
+        updated_views[lane]=native_view_digest(config,listed)
+        for metadata in listed:
+            sid=metadata['id']
+            if sid not in new:continue
+            record=reader._record(sid);scope=str(worker.root/'spool'/(lane+'-payload'))
+            native,token,digest=backup_catalog.native_identity(metadata,sid,scope,worker.c['generation'])
+            guards.require(record['lane']==lane and record['repository_id']==config['id'] and record['native']==native and record['manifest_sha256']==digest,
+                           'Prepared arrival native metadata differs from catalog')
+            raw=reader.raw_manifest(sid);manifest=decode(raw)
+            guards.require({k:v for k,v in manifest.items() if k!='files'}==record['projection'] and
+                           manifest['source']==worker.source and manifest['generation']==worker.c['generation'] and manifest['format']==1,
+                           'Prepared arrival full manifest differs')
+            guards.hex_id(manifest['code_sha'],40);captured=guards.utc(manifest['captured_at']);uploaded=guards.utc(metadata['time'])
+            guards.require(captured<=uploaded<=at,'Prepared arrival timestamp differs')
+            guards.require(manifest['kind'] in (('full','pre-update','hourly') if lane=='base' else ('binlog',)), 'Prepared arrival lane/kind differs')
+            if lane=='base':guards.require(manifest['stage_app_sha']==worker.c['stage_app_sha'],'Prepared arrival application differs')
+            files=manifest['files'];actual=sorted([*files,{'path':'manifest.json','bytes':len(raw),'sha256':digest}],key=lambda item:item['path'])
+            guards.require(len(actual)==record['verified']['file_count'] and sum(item['bytes'] for item in files)==record['verified']['payload_bytes'] and
+                           backup_catalog.digest(backup_catalog.canonical(actual))==record['verified']['all_files_sha256'],
+                           'Prepared arrival actual all-file proof differs')
+            if lane=='binlog':
+                for item in manifest['logs']:
+                    body=reader.binlog_bytes(sid,item['file'])
+                    binlog.validate_chain({item['file']:body},[item],{'file':item['file'],'position':4},{'file':item['file'],'position':item['size']})
+            fresh.append({'id':sid,'lane':lane,'token':token,'manifest_sha256':digest,'kind':manifest['kind'],'generation':worker.c['generation'],
+                          'time':manifest['captured_at'],'snapshot_time':metadata['time'],'tree':native['tree']})
+            manifests[sid]=record['projection']
+            del actual,files,raw,manifest
+        del listed,config
+    guards.require(len({row['id'] for row in fresh})==len(fresh) and not set(candidates)&{row['id'] for row in fresh},'Prepared arrival identity overlaps frozen authority')
+    rows=[*current['snapshots'],*fresh];all_rows={row['id']:row for row in rows};tokens=[row['token'] for row in rows]
+    guards.require(len(tokens)==len(set(tokens)),'Prepared arrival token duplicate')
+    last=max(manifest['last_log'] for sid,manifest in current['manifests'].items() if indexed[sid]['lane']=='binlog')
+    for row in sorted((row for row in fresh if row['lane']=='binlog'),key=lambda row:manifests[row['id']]['first_log']):
+        m=manifests[row['id']];guards.checked_logs(m['logs'])
+        guards.require(m['previous_count']==last and m['first_log']==last+1 and guards.log_number(m['logs'][0]['file'])==last+1 and
+                       m['last_log']==guards.log_number(m['logs'][-1]['file']),'Prepared appended chain range differs')
+        last=m['last_log']
+    descriptors={item['file']:item for sid,m in manifests.items() if all_rows[sid]['lane']=='binlog' for item in m['logs']}
+    last_deleted=max((manifests[sid]['last_log'] for sid in candidates if sid in all_rows and all_rows[sid]['lane']=='binlog'),default=0)
+    for row in fresh:
+        if row['lane']!='base':continue
+        m=manifests[row['id']];start=m['coordinates'];descriptor=descriptors.get(start['file'])
+        guards.require(descriptor is not None and type(start['position']) is int and 4<=start['position']<=descriptor['size'] and
+                       last_deleted<guards.log_number(start['file']),'Prepared base arrival requires a frozen binlog candidate')
+        if row['kind']=='hourly':
+            full_id=guards.hex_id(m['full_id'],64);full=all_rows.get(full_id)
+            guards.require(full is not None and full['kind'] in ('full','pre-update') and full_id not in candidates and guards.utc(full['time'])<=guards.utc(row['time']) and
+                           all(m[key]==manifests[full_id][key] for key in ('source','stage_app_sha','application_sha256','configuration_sha256')),
+                           'Prepared hourly arrival requires a frozen or different full')
+    verify_reader_prefix(prior_reader)
+    return {**current,'snapshots':rows,'manifests':manifests,'observed_at':at.isoformat()},updated_views,reader
+
+def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=None,reader_out=None,native_views=None,native_prefix=None,_flight_wait=None):
     guards.require(native_views is None or isinstance(native_views,dict) and not native_views,'Empty native view output required')
     guards.require(reader_out is None or (reader is not None and isinstance(reader_out,list) and len(reader_out)==1 and reader_out[0] is reader),
                    'Native reader output must hold the supplied frozen reader')
+    if native_prefix is not None:
+        guards.require(isinstance(native_prefix,dict) and set(native_prefix)=={'ids','views'} and
+                       set(native_prefix['ids'])==set(native_prefix['views'])=={'base','binlog'}, 'Complete original native prefix required')
     w=worker;entries=[];manifests={};tokens=set();observed=at
     catalog=backup_catalog.ArchiveCatalog(w)
     if reader is not None:records=reader._records
     else:records=catalog.entries()
+    if reader is not None:
+        import retention_cohort
+        _flight_wait=_flight_wait if _flight_wait is not None else retention_cohort._FlightWait()
     backfilled=False;live={}
     for lane in ('base','binlog'):
         repo=w.c['repositories'][lane];scope=str(w.root/'spool'/(lane+'-payload'))
@@ -73,12 +264,17 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
         guards.require(config['version']==2 and config['id']==guards.hex_id(repository_ids[lane],64),'Repository identity changed')
         listed=decode(run(['snapshots','--json']));guards.require(isinstance(listed,list),'Complete snapshot inventory required')
         if native_views is not None:native_views[lane]=native_view_digest(config,listed)
+        if native_prefix is not None:
+            guards.require(native_view_digest(config,[row for row in listed if row['id'] in native_prefix['ids'][lane]])==native_prefix['views'][lane],
+                           'Original complete native fields or configuration changed')
         if reader is not None:
             # A full native listing can finish after a normal upload has been
             # admitted. Authenticate its exact indexed tail before checking
             # those IDs; neither native tags nor an unknown ID admit a row.
             # Keep the caller's frozen reader unchanged until both lanes pass.
-            reader=reader.refresh(deadline=deadline);records=reader._records
+            reader=reader.refresh(deadline=deadline)
+            unknown=[(lane,row) for row in listed if row['id'] not in reader._records]
+            reader=retention_cohort._settle_producer(w,reader,_flight_wait,unknown=unknown,deadline=deadline);records=reader._records
         for row in listed:
             if deadline is not None:guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')
             sid=guards.hex_id(row['id'],64);guards.require(sid not in manifests,'Duplicate snapshot across inventory')
@@ -96,7 +292,10 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
             guards.require(tag('generation:')==w.c['generation'],'Foreign generation in repository')
             token=guards.hex_id(tag('token:'),32);digest=guards.hex_id(tag('manifest-sha:'),64)
             guards.require(token not in tokens,'Duplicate upload token');tokens.add(token)
-            native,_,_=backup_catalog.native_identity(metadata,sid,scope,w.c['generation']);live[sid]=(lane,native)
+            native,_,_=backup_catalog.native_identity(metadata,sid,scope,w.c['generation'])
+            # A supplied reader forbids cold backfill, so it needs no second
+            # retained graph of every native identity after exact comparison.
+            if reader is None:live[sid]=(lane,native)
             if sid in records:
                 record=records[sid]
                 guards.require(record['lane']==lane and record['repository_id']==config['id'] and record['native']==native and record['manifest_sha256']==digest,
@@ -124,9 +323,14 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
                 guards.require(callable(getattr(w,'verify_archive',None)) and
                                w.verify_archive(lane,sid,manifest,native_metadata=metadata,raw_manifest=body) is True,
                                'Actual native catalog backfill required');backfilled=True
+            if sid in records:
+                # Reuse equal immutable scalar strings from the sealed record;
+                # the mutable projected row remains a separate dictionary.
+                sid=record['id'];token=record['token'];digest=record['manifest_sha256'];metadata=record['native']
             entries.append({'id':sid,'lane':lane,'token':token,'manifest_sha256':digest,'kind':kind,
-                            'generation':w.c['generation'],'time':manifest['captured_at'],'snapshot_time':metadata['time'],'tree':native['tree']})
+                            'generation':w.c['generation'],'time':manifest['captured_at'],'snapshot_time':metadata['time'],'tree':metadata['tree']})
             manifests[sid]={k:v for k,v in manifest.items() if k!='files'}
+        del listed
     if backfilled:
         # One full seal scan for the cold run, never one scan per admission.
         records=catalog.entries()
@@ -301,21 +505,27 @@ class Inspector:
             self.root.mkdir(mode=0o700);(self.root/'logs').mkdir(mode=0o700)
             runtime.atomic_json(self.root/'intent.json',{'generation':w.c['generation'],'code_sha':w.c['code_sha'],'started_at':now(),'remote_delete':False})
             current_inventory=None
+            from retention_native import verified_tombstones
+            def audit_journals():
+                journals={}
+                for lane in ('base','binlog'):
+                    guards.require(not (w.root/'receipts'/lane/'pending.json').exists(),'Unknown pending upload; retention audit stopped')
+                    journals[lane]=runtime.UploadJournal(w.root/'receipts'/lane,w.c['generation']).state()
+                return journals
             if w.c.get('retention_readiness_policy','legacy-v1')=='native-v2':
                 current_inventory={}
                 with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
                     before=retention_cohort.CohortStore(w).load(reader,current_out=current_inventory)
+                    journals=audit_journals()
+                    retention_cohort.confirm_observation(w,current_inventory,reader,journals=journals,tombstones=verified_tombstones(w))
                 age=(guards.utc(now())-guards.utc(before['cohort']['planned_at'])).total_seconds()
                 guards.require(0<=age<=900,'Existing frozen audit cohort expired')
                 capture_timing={'critical_seconds':0}
-            else:before,capture_timing=retention_cohort.CohortStore(w).capture()
+            else:
+                before,capture_timing=retention_cohort.CohortStore(w).capture();journals=audit_journals()
+                confirmed_inventory(before,journals,verified_tombstones(w))
             repository_ids=before['repositories']
-            journals={}
-            for lane in ('base','binlog'):
-                guards.require(not (w.root/'receipts'/lane/'pending.json').exists(),'Unknown pending upload; retention audit stopped')
-                journals[lane]=runtime.UploadJournal(w.root/'receipts'/lane,w.c['generation']).state()
-            from retention_native import verified_tombstones
-            confirmed_inventory(current_inventory if current_inventory is not None else before,journals,verified_tombstones(w));plan=inventory_plan(before,guards.utc(before['cohort']['planned_at']))
+            plan=inventory_plan(before,guards.utc(before['cohort']['planned_at']))
             integrity_report=None
             if w.c.get('retention_readiness_policy','legacy-v1')=='native-v2':
                 import integrity

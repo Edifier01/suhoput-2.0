@@ -5,14 +5,17 @@ after-base engine controls and independent owner recovery remain separate proofs
 No source database reads, target replacement, automatic SQL retry or deletion.
 """
 import datetime as dt
+import copy
 import hashlib
 import json
 import os
 import pathlib
 import re
 import secrets
+import stat
 import time
 import uuid
+import xml.etree.ElementTree as ET
 
 import backup_catalog
 import binlog
@@ -29,6 +32,136 @@ from worker import DB_IMAGE, Worker, NativeError, now, private_path, sha, tree_i
 FORMAT = 'native-retention-restore-plan-v1'
 OPERATION = 'native-retention-restore-v1'
 STARTED_FROM = 'private encrypted S3-B base+full; sealed verified catalog binlogs; original source reads=0'
+
+
+def metadata_cache_preflight(worker, repository_id):
+    """Prove warm base metadata without hydrating, repairing or admitting cache.
+
+    Manual calibration can call this before initial commissioning. Once either
+    protected budget artifact exists, its real authenticated loader must pass
+    before any paid LIST/native read. No proof flag persists beyond this call.
+    """
+    import budget, storage
+    w = worker; receipts = w.root / 'receipts'
+    budget_paths = [receipts / name for name in ('commissioning-budget.json', 'commissioning-budget.origin.json')]
+    if w.c.get('retention_readiness_policy') == 'native-v2' and any(path.exists() or path.is_symlink() for path in budget_paths):
+        budget.load_commissioning_budget(w)
+    started = dt.datetime.now(dt.timezone.utc); deadline = time.monotonic() + 180
+    try:
+        repository_id = guards.hex_id(repository_id, 64)
+        initialization = runtime.load_json(private_path(receipts / 'init-base.json'))
+        guards.require(initialization['repository_id'] == repository_id and initialization['generation'] == w.c['generation'],
+                       'Metadata cache repository initialization differs')
+        repo = guards.repository_url(w.c['endpoint'], w.c['bucket'], 'base')
+        guards.require(w.c['repositories']['base'] == repo, 'Metadata cache repository namespace differs')
+        cache = w.root / 'cache' / 'base' / repository_id
+        def check_directories(path):
+            guards.require(path.is_absolute() and '..' not in path.parts, 'Canonical metadata cache path required')
+            for parent in [*reversed(path.parents), path]:
+                info = parent.lstat()
+                guards.require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not parent.is_symlink(),
+                               'Metadata cache directory owner/type/symlink differs')
+        check_directories(cache)
+        guards.require(private_path(cache / 'version').read_bytes() == b'1', 'Metadata cache version differs')
+
+        def listing():
+            indexes = {}; packs = {}; keys = {}; count = 0
+            read = storage.S3Reader(w, min(40, max(0, deadline - time.monotonic())))
+            prefix = storage.PREFIX + 'base/'
+            def observed(query):
+                nonlocal count
+                guards.require(count < 8 and time.monotonic() < deadline, 'Metadata cache listing request bound exceeded')
+                count += 1; raw = read(query)
+                guards.require(isinstance(raw, bytes) and len(raw) <= storage.MAX_XML and b'<!' not in raw, 'Bounded plain metadata listing XML required')
+                tree = ET.fromstring(raw)
+                for node in tree.iter(): node.tag = node.tag.rsplit('}', 1)[-1]
+                for row in tree.findall('Contents'):
+                    k = row.findall('Key'); s = row.findall('Size')
+                    guards.require(len(k) == len(s) == 1 and isinstance(k[0].text, str) and isinstance(s[0].text, str) and
+                                   s[0].text.isascii() and s[0].text.isdecimal(), 'Metadata listing fields differ')
+                    key = k[0].text; size = int(s[0].text)
+                    for kind, output in (('index', indexes), ('data', packs), ('keys', keys)):
+                        stem = prefix + kind + '/'
+                        if not key.startswith(stem): continue
+                        tail = key[len(stem):]; sid = guards.hex_id(tail.split('/')[-1], 64)
+                        guards.require(tail == (sid[:2] + '/' + sid if kind == 'data' else sid) and sid not in output,
+                                       'Metadata listing object namespace/identity differs')
+                        output[sid] = size
+                return raw
+            proof = storage.list_objects(observed, w.c['bucket'], prefix)
+            guards.require(0 < len(indexes) <= 64 and sum(indexes.values()) <= 16 * 1024**2, 'Metadata index count/ciphertext bound exceeded')
+            guards.require(len(keys) == 1, 'Metadata cache requires one native unlock key')
+            return indexes, packs, keys, proof
+
+        def cached(kind, sid, size):
+            guards.require(time.monotonic() < deadline, 'Metadata cache verification deadline exceeded')
+            path = cache / kind / sid[:2] / sid; check_directories(path.parent)
+            before = path.lstat()
+            guards.require(stat.S_ISREG(before.st_mode) and before.st_uid == 0 and before.st_nlink == 1 and
+                           before.st_size == size and 32 < size <= 128 * 1024**2, 'Metadata cache ciphertext file/size differs')
+            value = hashlib.sha256()
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'rb') as stream:
+                opened = os.fstat(stream.fileno())
+                signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink, info.st_uid)
+                guards.require(signature(opened) == signature(before), 'Metadata cache ciphertext changed before hash')
+                for block in iter(lambda: stream.read(1024 * 1024), b''):
+                    guards.require(time.monotonic() < deadline, 'Metadata cache verification deadline exceeded'); value.update(block)
+                guards.require(signature(os.fstat(stream.fileno())) == signature(before), 'Metadata cache ciphertext changed during hash')
+            after = path.lstat(); check_directories(path.parent)
+            guards.require(stat.S_ISREG(after.st_mode) and signature(after) == signature(before) and value.hexdigest() == sid,
+                           'Metadata cache ciphertext SHA/identity changed')
+            return {'id': sid, 'bytes': size, 'sha256': value.hexdigest()}
+
+        indexes, packs, keys, before = listing()
+        # Complete every active index check before any native process can load
+        # or transparently hydrate an index from a different cache namespace.
+        index_seals = [cached('index', sid, size) for sid, size in sorted(indexes.items())]
+        guards.require(time.monotonic() < deadline, 'Metadata cache native deadline exceeded')
+        config = backup_catalog.decode(w.restic('base', ['--repo', repo, 'cat', 'config'], timeout=min(45, max(0, deadline - time.monotonic()))))
+        guards.require(isinstance(config, dict) and config.get('version') == 2 and config.get('id') == repository_id, 'Native metadata cache repository identity differs')
+        trees = set(); blobs = 0
+        for sid in sorted(indexes):
+            guards.require(time.monotonic() < deadline, 'Metadata cache native deadline exceeded')
+            raw = w.restic('base', ['--repo', repo, 'cat', 'index', sid], timeout=min(45, deadline - time.monotonic()))
+            value = backup_catalog.decode(raw)
+            guards.require(isinstance(value, dict) and set(value) == {'packs'} and isinstance(value['packs'], list), 'Native metadata index schema differs')
+            seen = set()
+            for pack in value['packs']:
+                guards.require(isinstance(pack, dict) and set(pack) == {'id', 'blobs'} and isinstance(pack['blobs'], list), 'Native metadata pack schema differs')
+                pid = guards.hex_id(pack['id'], 64)
+                guards.require(pid not in seen and pid in packs, 'Native metadata pack identity differs'); seen.add(pid)
+                for blob in pack['blobs']:
+                    guards.require(isinstance(blob, dict) and set(blob) in ({'id', 'type', 'offset', 'length'},
+                                   {'id', 'type', 'offset', 'length', 'uncompressed_length'}), 'Native metadata blob schema differs')
+                    guards.hex_id(blob['id'], 64)
+                    guards.require(blob['type'] in ('data', 'tree') and all(type(blob[k]) is int and 0 <= blob[k] <= 2**32 - 1 for k in ('offset', 'length')) and
+                                   blob['length'] > 32 and blob['offset'] + blob['length'] <= packs[pid], 'Native metadata blob type/range differs')
+                    if 'uncompressed_length' in blob:
+                        guards.require(type(blob['uncompressed_length']) is int and 0 <= blob['uncompressed_length'] <= 2**32 - 1, 'Native metadata blob unpacked length differs')
+                    if blob['type'] == 'tree': trees.add(pid)
+                    blobs += 1
+            cached('index', sid, indexes[sid]); del value, raw
+        guards.require(trees, 'Native base metadata tree packs absent')
+        tree_seals = [cached('data', sid, packs[sid]) for sid in sorted(trees)]
+        after_indexes, after_packs, after_keys, after = listing()
+        guards.require(indexes == after_indexes and keys == after_keys and all(after_packs.get(sid) == packs[sid] for sid in trees),
+                       'Metadata index/key/tree object listing changed during control')
+        for row in index_seals: cached('index', row['id'], row['bytes'])
+        for row in tree_seals: cached('data', row['id'], row['bytes'])
+        return {'result': 'READ_ONLY_WARM_BASE_METADATA_CONTROL', 'admission': False, 'repository_id': repository_id,
+                'source': copy.deepcopy(w.source), 'generation': w.c['generation'], 'code_sha': w.c['code_sha'], 'repository': repo,
+                'configuration_sha256': digest({'repository': repo, 'repository_id': repository_id, 'generation': w.c['generation'],
+                                               'source': w.source, 'endpoint': w.c['endpoint'], 'bucket': w.c['bucket'], 'code_sha': w.c['code_sha']}),
+                'cache_version': 1, 'index_count': len(index_seals), 'index_ciphertext_bytes': sum(row['bytes'] for row in index_seals),
+                'active_tree_pack_count': len(tree_seals), 'active_tree_ciphertext_bytes': sum(row['bytes'] for row in tree_seals),
+                'typed_blob_entries': blobs, 'index_seals': index_seals, 'tree_pack_seals': tree_seals,
+                'before_listing': before, 'after_listing': after, 'started_at': started.isoformat(),
+                'completed_at': dt.datetime.now(dt.timezone.utc).isoformat(), 'cache_repair': False, 'restore_calls': 0, 'SQL_calls': 0}
+    except guards.GuardError:
+        raise
+    except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+        raise guards.GuardError('Metadata cache preflight unavailable or malformed; manual calibration required') from error
 
 
 def digest(value):
@@ -305,7 +438,16 @@ class RetentionRecovery(Recovery):
     def run(self):
         from retention_native import exclusive_json, publish_evidence
         with runtime.lane_lock(self.lock), backup_catalog.ArchiveCatalog(self.w).open_reader() as reader:
-            self.w.gate(); self.prepare(reader)
+            self.w.gate()
+            budget_paths = [self.w.root / 'receipts' / name for name in ('commissioning-budget.json', 'commissioning-budget.origin.json')]
+            commissioned = self.w.c.get('retention_readiness_policy') == 'native-v2' and any(path.exists() or path.is_symlink() for path in budget_paths)
+            if commissioned:
+                import budget
+                # prepare() may refresh paid native metadata/integrity too.
+                budget.load_commissioning_budget(self.w)
+            self.prepare(reader)
+            if commissioned:
+                metadata_cache_preflight(self.w, self.inventory['repositories']['base'])
             guards.require(not self.intent.exists() and not self.intent.is_symlink() and not self.root.exists() and not self.root.is_symlink(), 'Prior operational attempt; preserve/investigate')
             objects_absent(self.w.native, targets(self.plan)); started = now()
             exclusive_json(self.intent, {'plan_sha256': digest(self.plan), 'generation': self.w.c['generation'], 'token': self.plan['token'], 'started_at': started, 'targets': targets(self.plan)})

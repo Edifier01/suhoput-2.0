@@ -644,9 +644,19 @@ class NativeApply:
             critical_deadline=[None]
             active_phase=[None]
             prepared_inputs=[None];phase_budget=[None];prepared_native={};prepared_current=[None];journal_prefix=[None];fixed_authorities=[None]
+            ordinal=[0];outside_reads={}
+            def charge_native_read():
+                if w.c.get('retention_readiness_policy')!='native-v2':return
+                used=outside_reads.get(ordinal[0],0)
+                guards.require(used<4,'Four outside native observations exhausted for durable phase')
+                outside_reads[ordinal[0]]=used+1
+            def refresh_tail(current,intent):
+                charge_native_read()
+                return retention.refresh_prepared_inventory(w,current,prepared_native,current_reader[0],intent['candidate_ids'],retention_cohort.clock())
             def read():
                 started=time.monotonic()
                 try:
+                    charge_native_read()
                     current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
                     prepared_native.clear()
                     result=retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0],reader_out=current_reader,native_views=prepared_native)
@@ -676,17 +686,52 @@ class NativeApply:
                                    'Original confirmation or retirement prefix changed')
                 prior={lane:_journal_prefix_seal(state) for lane,state in prior.items()}
                 prepared_current[0]=None
-                try:
-                    # Unknown/malformed ordinal authorities are rejected here;
-                    # only equal raw bytes may transfer this complete audit.
-                    catalog._checkpoint_inputs()
-                    yield
-                finally:
-                    after=_phase_input_bytes(catalog)
-                    if before!=after:
-                        journals=_phase_journals(catalog,after)
-                        if prepared_current[0] is None or not _prepared_append(catalog,before,after,prior,journals,prepared_current[0],current_reader[0]):
-                            raise retention_apply.PhasePreparationChanged('Read-only phase authority advanced')
+                # Failed audits/bodies must propagate unchanged. Only a clean
+                # preparation may transfer authenticated concurrent arrivals.
+                # Unknown/malformed ordinal authorities are rejected here;
+                # only equal raw bytes may transfer this complete audit.
+                catalog._checkpoint_inputs()
+                yield
+                after=_phase_input_bytes(catalog)
+                if before!=after:
+                    journals=_phase_journals(catalog,after)
+                    transferred=prepared_current[0] is not None and _prepared_append(catalog,before,after,prior,journals,prepared_current[0],current_reader[0])
+                    unchanged=set(before)==set(after) and all(before[key]==after[key] for key in before if key not in mutable)
+                    appended=any(len(journals[lane]['confirmed'])>prior[lane]['count'] for lane in ('base','binlog'))
+                    if not transferred and unchanged and appended and prepared_current[0] is not None:
+                        intent=getattr(store,'staged_intent',None) or store.load();current=prepared_current[0]
+                        refreshed,views,fresh_reader=refresh_tail(current,intent)
+                        current.clear();current.update(refreshed);prepared_native.clear();prepared_native.update(views);current_reader[0]=fresh_reader
+                        if hasattr(store,'prepared_authority'):
+                            _,phases,files=store.prepared_authority;key=next(reversed(phases));filename='phase-'+key+'.json'
+                            if not (store.root/filename).exists():
+                                phase=phases[key];baseline={row['id'] for row in intent['before_inventory']['snapshots']}
+                                phase.update(native_inventory_sha256=retention.inventory_digest(current),authorized_at=retention_cohort.clock().isoformat(),
+                                             arrival_rows=[row for row in current['snapshots'] if row['id'] not in baseline],catalog_head=copy.deepcopy(fresh_reader.head))
+                                phase['phase_sha256']=retention_apply.document_digest({key:value for key,value in phase.items() if key!='phase_sha256'})
+                                raw=(json.dumps(phase,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+                                guards.require(len(raw)<=1024**2,'Refreshed phase witness too large');files[filename]=hashlib.sha256(raw).hexdigest()
+                        if publication.prepared is not None:
+                            value=publication.prepared['value'];baseline={row['id'] for row in intent['before_inventory']['snapshots']}
+                            value.update(post_inventory_sha256=retention.inventory_digest(current),completed_at=retention_cohort.clock().isoformat(),
+                                         protected_arrival_ids=sorted(set(value['protected_arrival_ids'])|{row['id'] for row in current['snapshots'] if row['id'] not in baseline}))
+                            publication.stage(value)
+                        after=_phase_input_bytes(catalog);journals=_phase_journals(catalog,after)
+                        transferred=_prepared_append(catalog,before,after,prior,journals,current,fresh_reader)
+                    if transferred and publication.prepared is not None:
+                        intent=getattr(store,'staged_intent',None) or store.load()
+                        current=prepared_current[0];value=publication.prepared['value'];current_sha=retention.inventory_digest(current)
+                        if value['post_inventory_sha256']!=current_sha:
+                            # Confirmation can refresh after observation but
+                            # before stage(); retain that exact final view in
+                            # the receipt and both staged journals as well.
+                            baseline={row['id'] for row in intent['before_inventory']['snapshots']}
+                            value.update(post_inventory_sha256=current_sha,completed_at=retention_cohort.clock().isoformat(),
+                                         protected_arrival_ids=sorted(set(value['protected_arrival_ids'])|{row['id'] for row in current['snapshots'] if row['id'] not in baseline}))
+                            publication.stage(value);after=_phase_input_bytes(catalog);journals=_phase_journals(catalog,after)
+                            transferred=_prepared_append(catalog,before,after,prior,journals,current,current_reader[0])
+                    if not transferred:
+                        raise retention_apply.PhasePreparationChanged('Read-only phase authority advanced')
                 prepared_inputs[0]=after
             def verify_prepared(expected):
                 if _phase_input_bytes(catalog,critical_deadline[0])!=prepared_inputs[0]:
@@ -704,13 +749,13 @@ class NativeApply:
                 # final measurement follows the last lock release.
                 started=time.monotonic()
                 phase={'name':name,'seconds':0,'native_inventory_seconds':0,'effect_seconds':0,'journal_seconds':0}
-                effect_before=timing['effect_seconds'];journal_before=timing['journal_seconds'];active_phase[0]=phase
+                effect_before=timing['effect_seconds'];journal_before=timing['journal_seconds'];active_phase[0]=phase;completed=False
                 if not timing['critical_phases']:timing['scan_seconds']=started-scan_started
                 try:
                     with retention_cohort.upload_section(w) as acquired:
                         if acquired is not None:started=acquired
                         critical_deadline[0]=started+retention_cohort.MAX_CRITICAL_SECONDS-10
-                        retention_cohort.ready(w,deadline=critical_deadline[0]);yield
+                        retention_cohort.ready(w,deadline=critical_deadline[0]);yield;completed=True
                 finally:
                     critical_deadline[0]=None;elapsed=time.monotonic()-started
                     active_phase[0]=None;phase.update(seconds=elapsed,effect_seconds=timing['effect_seconds']-effect_before,journal_seconds=timing['journal_seconds']-journal_before)
@@ -718,6 +763,12 @@ class NativeApply:
                     timing['critical_seconds']+=elapsed;timing['critical_max_seconds']=max(timing['critical_max_seconds'],elapsed)
                     timing['critical_phases'].append(phase)
                     guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual continuous phase lock limit exceeded')
+                    if completed and name!='publication' and hasattr(store,'prepared_authority'):
+                        filename='phase-'+format(ordinal[0],'04d')+'.json';expected=store.prepared_authority[2].get(filename)
+                        path=store.root/filename
+                        if expected is not None and path.exists():
+                            guards.require(sha(private_path(path))==expected,'Completed durable phase quota binding changed')
+                            ordinal[0]+=1
             unfinished=[]
             for path in directory.iterdir():
                 guards.hex_id(path.name,64);old=IntentStore(path)
@@ -766,7 +817,14 @@ class NativeApply:
                     try:return runner(lane,argv)
                     finally:timing['effect_seconds']+=time.monotonic()-effect_started
                 def pre_phase(current,intent,absent):
-                    _confirmed_active(w,current,intent,absent,store)
+                    try:_confirmed_active(w,current,intent,absent,store)
+                    except guards.GuardError as error:
+                        if policy!='native-v2' or str(error)!='Unknown active confirmation/native arrival':raise
+                        refreshed,views,fresh_reader=refresh_tail(current,intent)
+                        current.clear();current.update(refreshed);prepared_native.clear();prepared_native.update(views);current_reader[0]=fresh_reader
+                        # Refresh is not confirmation authority: the actual full
+                        # protected retirement/journal validator must pass again.
+                        _confirmed_active(w,current,intent,absent,store)
                 if policy=='native-v2' and plan['candidates']:
                     phase_budget[0]=lambda:readiness_v2.revalidate_budget(w,evidence,at=retention_cohort.clock())
                 ex=retention_apply.Executor(read,effect,store,publication,w.c['repositories'],clock=retention_cohort.clock,
