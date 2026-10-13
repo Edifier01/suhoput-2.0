@@ -377,6 +377,31 @@ class CatalogLifecycleTests(unittest.TestCase):
             self.assertEqual(subject().digest(raw),pending['next_head']['checkpoint']['sha256'])
         with self.assertRaises(guards.GuardError):self.c.entries()
         self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
+    def test_committed_reconcile_full_authority_over_work_budget_preserves_both_head_states_and_pending(self):
+        for published in (False,True):
+            if published:self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+            insert=self.c._checkpoint_insert
+            def crash(*args,**kwargs):insert(*args,**kwargs);raise OSError('Actual SQLite committed, head not yet published')
+            with mock.patch.object(self.c,'_checkpoint_insert',crash),self.assertRaises(OSError):self.c.checkpoint()
+            pending=runtime.load_json(self.c.checkpoint_pending)
+            if published:runtime.atomic_json(self.c.head,pending['next_head'])
+            head=self.c.head.read_bytes();marker=self.c.checkpoint_pending.read_bytes();elapsed=[0.0];authority=self.c._retirement_evidence
+            def slow(records,**kwargs):
+                result=authority(records,**kwargs)
+                if kwargs.get('deadline') is not None:elapsed[0]+=46
+                return result
+            blocked=False
+            try:
+                with mock.patch.object(self.c,'_retirement_evidence',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):self.c.checkpoint(reconcile=True)
+            except guards.GuardError:blocked=True
+            with self.subTest(next_head_published=published):self.assertTrue(blocked,'Full authority used46s but work budget is45s')
+            if not blocked:continue
+            self.assertEqual(self.c.head.read_bytes(),head);self.assertEqual(self.c.checkpoint_pending.read_bytes(),marker)
+            with self.c._db() as db:
+                raw=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone()[0]
+                self.assertEqual(subject().digest(raw),pending['next_head']['checkpoint']['sha256'])
+            self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
     def test_checkpoint_initial_native_audit_releases_upload_lanes(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
         original=self.c._retirement_evidence;calls=[]

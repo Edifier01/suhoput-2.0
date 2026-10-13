@@ -612,9 +612,9 @@ class ArchiveCatalog:
             guards.require(self._checkpoint_head(witness,survivors,deadline=deadline)==nexthead,'Interrupted catalog checkpoint publication differs')
             proofs,_=self._retirement_evidence(records,deadline=deadline)
             guards.require(all(proofs.get(item['record']['id'])==item['proof'] for item in witness['retired']),'Interrupted checkpoint native retirement proof differs')
+            _check_deadline(deadline)
             if not committed:
                 guards.require(head==prior,'Checkpoint prior index after new head publication')
-                _check_deadline(deadline)
                 try:self._checkpoint_insert(db,witness,survivors,nexthead,deadline=hard_deadline)
                 except CatalogCapacityError:
                     self._tail(db,prior);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);raise
