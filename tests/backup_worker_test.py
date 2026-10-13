@@ -81,7 +81,7 @@ class SnapshotCoherenceTests(unittest.TestCase):
     def fake(self,directory,mutate=False):
         m=module('worker');w=m.Worker.__new__(m.Worker);w.stage=pathlib.Path(directory);w.root=w.stage/'backup';w.c=m.validate_config(config());w.source=w.c['source'];w.wp_volume=w.stage/'wp';w.wp_mounts=[];w.bin=w.root/'bin';w.bin.mkdir(parents=True)
         for name in ['backup/spool','backup/receipts','wp/wp-content/uploads','infra/staging']:(w.stage/name).mkdir(parents=True,exist_ok=True)
-        for name in ('worker.py','restore.py','retention.py','retention_native.py','retention_cohort.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','backup_catalog.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):(w.bin/name).write_bytes(b'synthetic public source')
+        for name in ('worker.py','restore.py','retention.py','retention_native.py','retention_cohort.py','maintenance.py','storage.py','readiness_v2.py','integrity.py','retention_restore.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','backup_catalog.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):(w.bin/name).write_bytes(b'synthetic public source')
         (w.wp_volume/'wp-content/uploads/a.jpg').write_bytes(b'before snapshot')
         for name in ['.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf']:(w.stage/name).write_text('synthetic')
         w.source_check=lambda:None;w.gate=lambda:None;w.schema_catalog=lambda:module('dump_records').records(dump())['catalog']
@@ -120,7 +120,7 @@ class SnapshotCoherenceTests(unittest.TestCase):
     def test_full_contains_owner_budget_apply_and_row_guards(self):
         with tempfile.TemporaryDirectory() as d:
             w=self.fake(d);w.base('full');public=w.root/'spool/base-payload/configuration/backup-public'
-            for name in ('owner-kit.php','owner-full.php','budget.py','retention_apply.py','retention_native.py','retention_cohort.py','meter.py','binlog.py','backup_catalog.py','retention_cohort.py'):
+            for name in ('owner-kit.php','owner-full.php','budget.py','retention_apply.py','retention_native.py','retention_cohort.py','meter.py','binlog.py','backup_catalog.py','readiness_v2.py','maintenance.py','storage.py','integrity.py','retention_restore.py'):
                 self.assertTrue((public/name).is_file(),'Full recovery archive missing '+name)
                 self.assertEqual((public/name).read_bytes(),(w.bin/name).read_bytes())
     def test_snapshot_watermark_precedes_dump_not_its_completion(self):
@@ -235,4 +235,34 @@ class CaptureRecoveryTests(unittest.TestCase):
                 else:(p/'.capture.json').unlink()
                 with self.assertRaises(guards.GuardError):w.prepare_payload('base')
                 self.assertEqual((p/'keep').read_bytes(),b'unacknowledged')
+class MonitorTests(unittest.TestCase):
+    def test_monitor_uses_forecast_and_checks_base_and_full_freshness(self):
+        import datetime as dt, runtime, budget, storage, integrity
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            w=SnapshotCoherenceTests().fake(directory);stamp=dt.datetime.now(dt.timezone.utc).isoformat()
+            for lane in ('base','binlog'):
+                runtime.atomic_json(w.root/'receipts'/lane/'state.json',{'generation':GEN,'confirmed':[],'last_success_at':stamp})
+            runtime.atomic_json(w.root/'receipts/full.json',{'generation':GEN,'captured_at':stamp})
+            report={'result':'PASS','projected_monthly_rub':'300','projected_storage_bytes':1024**3,'valid_until':stamp}
+            with patch.object(budget,'load_commissioning_budget',return_value=report,create=True) as loaded, patch.object(storage,'live_observation',return_value={'test':'observation'}) as observed, patch.object(budget,'commissioning_live_applicable',return_value=True) as checked, patch.object(storage,'publish_live_observation',create=True) as published, patch.object(integrity,'status',return_value={'base':stamp,'binlog':stamp}) as remote_integrity:
+                result=w.monitor();self.assertEqual(result['budget_status'],'PASS');loaded.assert_called_once_with(w)
+                observed.assert_called_once_with(w,report);checked.assert_called_once();published.assert_called_once_with(w,report,{'test':'observation'})
+                remote_integrity.assert_called_once_with(w)
+                self.assertEqual(result['full_remote_integrity_completed_at'],{'base':stamp,'binlog':stamp})
+                remote_integrity.side_effect=guards.GuardError('Weekly integrity expired')
+                with self.assertRaisesRegex(guards.GuardError,'Weekly integrity expired'):w.monitor()
+                self.assertEqual(published.call_count,1)
+                remote_integrity.side_effect=None
+                runtime.atomic_json(w.root/'receipts/full.json',{'generation':GEN,'captured_at':(dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=2)).isoformat()})
+                with self.assertRaises(guards.GuardError):w.monitor()
+    def test_missing_forecast_prevents_monitor_pass(self):
+        import runtime,budget,datetime as dt
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            w=SnapshotCoherenceTests().fake(directory)
+            runtime.atomic_json(w.root/'receipts/binlog/state.json',{'generation':GEN,'confirmed':[],'last_success_at':dt.datetime.now(dt.timezone.utc).isoformat()})
+            with patch.object(budget,'load_commissioning_budget',side_effect=guards.GuardError('Budget absent'),create=True):
+                with self.assertRaises(guards.GuardError):w.monitor()
+
 if __name__=='__main__':unittest.main()

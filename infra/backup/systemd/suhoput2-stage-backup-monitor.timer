@@ -2,7 +2,7 @@
 Description=Suhoput STAGE-B monitor schedule (budget gated)
 
 [Timer]
-OnCalendar=*-*-* *:*:00 UTC
+OnCalendar=*-*-* *:*:30 UTC
 AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=false

@@ -102,22 +102,29 @@ def publish_history(worker):
               'journal_sha256':retention_native.retention_apply.document_digest(journals),'completed_at':retention_cohort.clock().isoformat()}
     return retention_native.publish_evidence(w,'history',document,inventory,started.isoformat())
 
+class LaneBusyError(guards.GuardError):
+    """Only an OS nonblocking lock acquisition reported contention."""
+
 @contextmanager
 def lane_lock(path):
     fd=os.open(path,os.O_CREAT|os.O_RDWR|getattr(os,'O_NOFOLLOW',0),0o600)
     acquired=False
     try:
+        if os.name=='nt':
+            import msvcrt
+            if os.fstat(fd).st_size==0: os.write(fd,b'0')
+            os.lseek(fd,0,os.SEEK_SET)
+        else: import fcntl
         try:
             if os.name=='nt':
-                import msvcrt
-                if os.fstat(fd).st_size==0: os.write(fd,b'0')
-                os.lseek(fd,0,os.SEEK_SET);msvcrt.locking(fd,msvcrt.LK_NBLCK,1)
+                msvcrt.locking(fd,msvcrt.LK_NBLCK,1)
             else:
-                import fcntl
                 fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
             acquired=True
         except OSError as error:
-            raise guards.GuardError('Backup lane busy') from error
+            import errno
+            if error.errno not in (errno.EAGAIN,errno.EACCES):raise
+            raise LaneBusyError('Backup lane busy') from error
         yield
     finally:
         if acquired:

@@ -41,6 +41,33 @@ def verify_tree_listing(listing,sid,payload_root,native_metadata,raw_manifest):
     guards.require(actual==expected,'Partial or changed snapshot tree');return native
 
 
+def verify_restored_tree(target,payload_root,metadata,raw_manifest,inventory):
+    """Compare every native-restored byte, including outside the payload root.
+
+    Restic 0.19.1 ls always lists repository snapshots, even with a full SID.
+    Exact-SID restore authenticates that snapshot without that enumeration.
+    The caller also binds its native cat snapshot identity before restoring.
+    inventory rejects symlinks, hardlinks and special files and hashes all files.
+    """
+    scope=pathlib.Path(payload_root);prefix=scope.relative_to(scope.anchor).as_posix()
+    guards.require(scope.is_absolute() and '..' not in scope.parts,'Canonical restored payload scope required')
+    expected={prefix+'/manifest.json':{'bytes':len(raw_manifest),'sha256':hashlib.sha256(raw_manifest).hexdigest()}}
+    for item in metadata['files']:
+        name=guards.media_path(item['path']);guards.hex_id(item['sha256'],64)
+        guards.require(type(item['bytes']) is int and item['bytes']>=0,'Invalid restored file size')
+        key=prefix+'/'+name;guards.require(key not in expected,'Duplicate restored manifest file')
+        expected[key]={'bytes':item['bytes'],'sha256':item['sha256']}
+    actual=inventory(target)
+    guards.require(actual==[{'path':key,**expected[key]} for key in sorted(expected)],'Partial, changed or foreign restored tree')
+    # Native absolute-path restore legitimately creates the scope's ancestors;
+    # unrelated empty directories outside the payload are still unexpected.
+    for path in target.rglob('*'):
+        if path.is_dir():
+            name=path.relative_to(target).as_posix()
+            guards.require(name==prefix or name.startswith(prefix+'/') or prefix.startswith(name+'/'),'Foreign restored directory')
+    return target/scope.relative_to(scope.anchor)
+
+
 def repository_scope(value):
     guards.require(isinstance(value, str) and value.startswith('s3:'), 'S3 repository required')
     parsed = urlsplit(value[3:])
@@ -98,8 +125,7 @@ class ResticAdapter:
                                'Manifest bytes required')
                 guards.require(hashlib.sha256(body).hexdigest() == digest, 'Archived manifest mismatch')
                 metadata=backup_catalog.decode(body);guards.require(metadata.get('generation')==self.generation and isinstance(metadata.get('files'),list),'Unknown archived manifest format')
-                listing=self.run(['ls','--json','--recursive',sid,self.payload_root])
-                verify_tree_listing(listing,sid,self.payload_root,row,body)
+                backup_catalog.native_identity(row,sid,self.payload_root,self.generation)
                 guards.require(callable(self.verify_archive) and self.verify_archive(sid,metadata,native_metadata=row,raw_manifest=body) is True,'Actual archived bytes verifier required')
                 matches.append({'id': sid, 'token': token, 'generation': self.generation,
                                 'manifest_sha256': digest})

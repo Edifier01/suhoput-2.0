@@ -14,13 +14,54 @@ import datetime as dt
 import hashlib
 import json
 import uuid
+from decimal import Decimal, InvalidOperation
 
 import guards
 import retention
 
 EVIDENCE_TYPES = frozenset(('audit', 'anchor', 'tip', 'owner', 'budget', 'history'))
+NATIVE_V2_POLICY = 'native-v2'
+NATIVE_V2_EVIDENCE_TYPES = EVIDENCE_TYPES - {'history'}
 MAX_PLAN_AGE_SECONDS = 900
 MAX_CANDIDATES = 256
+MAX_FORGET_IDS = 256
+MAX_INTENT_CANDIDATES = retention.MAX_RETENTION_INTENT
+DAILY_BATCH_PROTOCOL = 'daily-batches-v2'
+BATCH_PHASE_PROTOCOL = 'bounded-batches-v2'
+
+
+def evidence_types(plan):
+    """The absent policy retains the complete legacy six-receipt contract."""
+    if 'readiness_policy' not in plan:
+        return EVIDENCE_TYPES
+    guards.require(plan['readiness_policy'] == NATIVE_V2_POLICY, 'Unknown native readiness policy')
+    return NATIVE_V2_EVIDENCE_TYPES
+
+
+def _forecast_clock(document, at):
+    completed=guards.utc(document['completed_at']);until=guards.utc(document['valid_until'])
+    guards.require(completed <= at <= until and (until-completed).total_seconds() <= 31*86400,
+                   'Commissioning forecast expired or clock differs')
+
+
+def _commissioning_budget(document, inventory, source, at):
+    """Pure checks after readiness_v2 authenticates the protected real loader.
+
+    This report deliberately has no current cohort, fake history or invoice.
+    Configuration and current workload applicability belong to that loader.
+    """
+    guards.require(document['format']=='commissioning_budget_pass' and document['result']=='PASS' and
+                   document['generation']==inventory['generation'] and document['source']==source and
+                   document['actual_month_observed'] is False and document['invoice_verified'] is False,
+                   'Authentic commissioning forecast binding required')
+    for key in ('configuration_sha256','scope_sha256'):guards.hex_id(document[key],64)
+    _forecast_clock(document,at)
+    cost=document['projected_monthly_rub'];size=document['projected_storage_bytes']
+    guards.require(type(cost) in (str,int,float), 'Unknown commissioning cost')
+    try:cost=Decimal(str(cost))
+    except InvalidOperation as error:raise guards.GuardError('Invalid commissioning cost') from error
+    guards.require(cost.is_finite() and 0<=cost<=500 and type(size) is int and 0<=size<=10*1024**3,
+                   'Commissioning budget exceeds agreed limits or unknown')
 
 
 def document_digest(document):
@@ -146,6 +187,7 @@ def protected_dependencies(inventory, candidate_ids, at):
 
 def _plan(inventory, plan, at):
     _time(at)
+    evidence_types(plan)
     indexed, source = _index(inventory, at)
     planned = guards.utc(plan['planned_at'])
     if 'cohort' in inventory:
@@ -154,12 +196,15 @@ def _plan(inventory, plan, at):
                        'Plan frozen cohort differs')
     guards.require(0 <= (at - planned).total_seconds() <= MAX_PLAN_AGE_SECONDS,
                    'Plan stale or clock rollback')
-    calculated = retention.bounded_plan(inventory, retention.inventory_plan(inventory, planned), MAX_CANDIDATES)
+    protocol=plan.get('batch_protocol')
+    guards.require(protocol in (None,DAILY_BATCH_PROTOCOL),'Unknown retention batch protocol')
+    limit=MAX_INTENT_CANDIDATES if protocol==DAILY_BATCH_PROTOCOL else MAX_CANDIDATES
+    calculated = retention.bounded_plan(inventory, retention.inventory_plan(inventory, planned), limit)
     for key in ('anchor_id', 'keep', 'candidates', 'inventory_sha256',
                 'pre_window_anchor_present', 'chain_last_file', 'chain_last_position', 'logs'):
         guards.require(plan[key] == calculated[key], 'Plan differs from authenticated inventory')
     keep = plan['keep']; candidates = plan['candidates']
-    guards.require(isinstance(candidates, list) and len(candidates) <= MAX_CANDIDATES and
+    guards.require(isinstance(candidates, list) and len(candidates) <= limit and
                    len(candidates) == len(set(candidates)) and not set(candidates) & set(keep),
                    'Unbounded or overlapping candidates')
     cutoff = planned - dt.timedelta(days=30)
@@ -181,15 +226,18 @@ def validate_apply(inventory, plan, evidence, at):
     """Pure gate; missing evidence is always BLOCK for nonempty candidates."""
     try:
         indexed, source, planned = _plan(inventory, plan, at)
-        guards.require(set(evidence) == EVIDENCE_TYPES and
-                       set(plan['proof_sha256']) == EVIDENCE_TYPES,
+        required=evidence_types(plan);v2=required==NATIVE_V2_EVIDENCE_TYPES
+        guards.require(set(evidence) == required and
+                       set(plan['proof_sha256']) == required,
                        'Complete hash-bound evidence required')
         documents = {}
-        for name in sorted(EVIDENCE_TYPES):
+        for name in sorted(required):
             item = evidence[name]; document = item['document']
             expected = guards.hex_id(plan['proof_sha256'][name], 64)
             guards.require(isinstance(document, dict) and item['sha256'] == expected and
                            document_digest(document) == expected, 'Receipt content hash differs')
+            if v2 and name=='budget':
+                _commissioning_budget(document,inventory,source,at);documents[name]=document;continue
             guards.require(document['result'] == 'PASS' and document['evidence_type'] == name,
                            'Native completed evidence type/result differs')
             if name == 'tip':
@@ -209,8 +257,13 @@ def validate_apply(inventory, plan, evidence, at):
                            'Evidence clock window differs')
             documents[name] = document
         audit = documents['audit']
+        audit_mode=audit['check_mode']
+        if v2 and audit_mode=='weekly-read-data-and-verified-admissions':
+            import integrity
+            integrity.validate_report(audit['full_remote_integrity'],inventory,at)
+        else:guards.require(audit_mode=='read-data','Complete native remote byte audit absent')
         guards.require(audit['checked_repositories'] == inventory['repositories'] and
-                       audit['check_mode'] == 'read-data' and audit['binlog_check_mode'] == 'native-checksum' and
+                       audit['binlog_check_mode'] == 'native-checksum' and
                        audit['readback_snapshots'] == {sid: row['manifest_sha256'] for sid, row in indexed.items()} and
                        audit['verified_binlogs'] == plan['logs'], 'Complete native byte/checksum audit absent')
         stop = {'file': plan['chain_last_file'], 'position': plan['chain_last_position']}
@@ -222,14 +275,21 @@ def validate_apply(inventory, plan, evidence, at):
                            'private encrypted S3-B base+binlogs; original source reads=0',
                            'Recovery is not native or does not reach exact archived tip')
             retention.bind_recovery(inventory, {**plan, 'anchor_id': sid}, document)
-        history = documents['history']
-        guards.require(plan['pre_window_anchor_present'] is True and
-                       guards.utc(history['observed_from']) <= planned - dt.timedelta(days=30) and
-                       guards.utc(history['observed_until']) == planned and
-                       history['observation_source'] == 'native-confirmed-upload-journal',
-                       'Real 30-day observation and pre-window anchor absent')
-        guards.hex_id(history['journal_sha256'], 64)
+        if v2:
+            guards.require(plan['pre_window_anchor_present'] is True,'Retained pre-window anchor absent')
+        else:
+            history = documents['history']
+            guards.require(plan['pre_window_anchor_present'] is True and
+                           guards.utc(history['observed_from']) <= planned - dt.timedelta(days=30) and
+                           guards.utc(history['observed_until']) == planned and
+                           history['observation_source'] == 'native-confirmed-upload-journal',
+                           'Real 30-day observation and pre-window anchor absent')
+            guards.hex_id(history['journal_sha256'], 64)
         owner = documents['owner']
+        if owner.get('integrity_check_mode')=='weekly-read-data-and-verified-admissions':
+            guards.require(v2,'Legacy owner requires direct remote verification')
+            import integrity
+            integrity.validate_report(owner['full_remote_integrity'],inventory,at)
         guards.require(all(isinstance(owner[k], str) and owner[k].strip() for k in
                            ('machine_id', 'source_machine_id', 'medium_id')) and
                        owner['machine_id'] != owner['source_machine_id'] and
@@ -240,22 +300,24 @@ def validate_apply(inventory, plan, evidence, at):
                        'Independent full owner restore absent')
         for key in ('recovery_bundle_sha256', 'restore_receipt_sha256'):
             guards.hex_id(owner[key], 64)
-        budget = documents['budget']
-        for key in ('provider_usage_sha256', 'account_billing_sha256', 'tariff_sha256'):
-            guards.hex_id(budget[key], 64)
-        guards.require(guards.utc(budget['measurement_from']) < guards.utc(budget['measurement_until']) <=
-                       guards.utc(budget['completed_at']), 'Measured provider interval absent')
-        requests = budget['measured_requests']
-        guards.require(isinstance(requests, dict) and set(requests) == {'PUT', 'GET', 'DELETE'} and
-                       all(type(value) is int and value >= 0 for value in requests.values()),
-                       'Measured provider request counters absent')
-        guards.require(type(budget['measured_egress_bytes']) is int and budget['measured_egress_bytes'] >= 0,
-                       'Measured provider egress absent')
-        cost = budget['projected_monthly_rub']; size = budget['projected_storage_bytes']
-        guards.require(type(cost) in (int, float) and 0 <= cost <= 500 and
-                       type(size) is int and 0 <= size <= 10 * 1024 ** 3,
-                       'Account budget projection exceeds agreed limits or unknown')
+        if not v2:
+            budget = documents['budget']
+            for key in ('provider_usage_sha256', 'account_billing_sha256', 'tariff_sha256'):
+                guards.hex_id(budget[key], 64)
+            guards.require(guards.utc(budget['measurement_from']) < guards.utc(budget['measurement_until']) <=
+                           guards.utc(budget['completed_at']), 'Measured provider interval absent')
+            requests = budget['measured_requests']
+            guards.require(isinstance(requests, dict) and set(requests) == {'PUT', 'GET', 'DELETE'} and
+                           all(type(value) is int and value >= 0 for value in requests.values()),
+                           'Measured provider request counters absent')
+            guards.require(type(budget['measured_egress_bytes']) is int and budget['measured_egress_bytes'] >= 0,
+                           'Measured provider egress absent')
+            cost = budget['projected_monthly_rub']; size = budget['projected_storage_bytes']
+            guards.require(type(cost) in (int, float) and 0 <= cost <= 500 and
+                           type(size) is int and 0 <= size <= 10 * 1024 ** 3,
+                           'Account budget projection exceeds agreed limits or unknown')
         return {**({'cohort':copy.deepcopy(inventory['cohort'])} if 'cohort' in inventory else {}),
+                **({'readiness_policy':NATIVE_V2_POLICY} if v2 else {}),
                 'generation': inventory['generation'], 'repositories': copy.deepcopy(inventory['repositories']),
                 'inventory_sha256': plan['inventory_sha256'], 'candidate_ids': list(plan['candidates']),
                 'keep_ids': list(plan['keep']), 'anchor_id': plan['anchor_id'],
@@ -269,12 +331,43 @@ def current_freshness(plan,evidence,at):
     planned=guards.utc(plan['planned_at'])
     guards.require(planned<=at and (at-planned).total_seconds()<=MAX_PLAN_AGE_SECONDS,
                    'Plan expired immediately before effect')
-    guards.require(set(evidence)==EVIDENCE_TYPES,'Complete native evidence required before effect')
-    for name in EVIDENCE_TYPES:
-        document=evidence[name]['document'];started=guards.utc(document['started_at']);completed=guards.utc(document['completed_at'])
+    required=evidence_types(plan)
+    guards.require(set(evidence)==required,'Complete native evidence required before effect')
+    for name in required:
+        document=evidence[name]['document']
+        if required==NATIVE_V2_EVIDENCE_TYPES and name=='budget':
+            _forecast_clock(document,at);continue
+        started=guards.utc(document['started_at']);completed=guards.utc(document['completed_at'])
         guards.require(started<=completed<=at and (at-completed).total_seconds()<=MAX_PLAN_AGE_SECONDS,
                        'Proof expired immediately before effect')
 
+
+def command_batches(inventory,candidates):
+    """One frozen schedule: hourly before full, binlogs in original order."""
+    selected=set(candidates);rows=inventory['snapshots'];manifests=inventory['manifests'];result=[]
+    for lane in ('base','binlog'):
+        ordered=sorted((row for row in rows if row['id'] in selected and row['lane']==lane),
+                       key=(lambda row:(row['kind']!='hourly',guards.utc(row['time']),row['id'])) if lane=='base' else
+                           (lambda row:manifests[row['id']]['first_log']))
+        for start in range(0,len(ordered),MAX_FORGET_IDS):
+            result.append({'index':len(result),'lane':lane,'candidate_ids':sorted(row['id'] for row in ordered[start:start+MAX_FORGET_IDS])})
+    return result or [{'index':0,'lane':'no-op','candidate_ids':[]}]
+
+def intent_batches(intent):
+    """Validate the immutable bounded schedule before any phase/effect use."""
+    guards.require(intent.get('phase_protocol')==BATCH_PHASE_PROTOCOL,'Batch intent protocol required')
+    candidates=intent['candidate_ids'];batches=intent['batches'];indexed={row['id']:row for row in intent['before_inventory']['snapshots']}
+    guards.require(candidates==sorted(set(candidates)) and len(candidates)<=MAX_INTENT_CANDIDATES and isinstance(batches,list) and 1<=len(batches)<=8,'Daily intent bound differs')
+    seen=set();binlog_seen=False
+    for index,batch in enumerate(batches):
+        guards.require(set(batch)=={'index','lane','candidate_ids'} and type(batch['index']) is int and batch['index']==index,'Batch index/schema differs')
+        lane=batch['lane'];ids=batch['candidate_ids']
+        guards.require(lane in ('base','binlog','no-op') and ids==sorted(set(ids)) and len(ids)<=MAX_FORGET_IDS and not seen.intersection(ids),'Command bound or duplicate identity differs')
+        guards.require((lane=='no-op' and not candidates and batches==[{'index':0,'lane':'no-op','candidate_ids':[]}]) or
+                       (lane!='no-op' and ids and all(sid in indexed and indexed[sid]['lane']==lane for sid in ids)),'Batch identity/lane differs')
+        guards.require(not (binlog_seen and lane=='base'),'Base batch follows binlog retirement')
+        binlog_seen=binlog_seen or lane=='binlog';seen.update(ids)
+    guards.require(seen==set(candidates),'Batch partition differs from frozen intent');return batches
 
 class Executor:
     """Injected runner(lane, argv) must raise on nonzero or ambiguous exit.
@@ -321,7 +414,7 @@ class Executor:
 
     def _observation(self,intent,after,at):
         allowed=intent['candidate_ids']
-        if intent.get('phase_protocol')=='bounded-lanes-v1':allowed=self.store.attempted_ids()
+        if intent.get('phase_protocol') in ('bounded-lanes-v1',BATCH_PHASE_PROTOCOL):allowed=self.store.attempted_ids()
         comparison=compatible_inventory(intent['before_inventory'],after,at,allowed)
         protected_dependencies(after,intent['candidate_ids'],at)
         absent=sorted(set(intent['candidate_ids'])-{row['id'] for row in after['snapshots']})
@@ -337,7 +430,8 @@ class Executor:
                         'remote_delete_calls': calls, 'prune_run': False,
                         'error_type': error, 'completed_at': at.isoformat(), **observed})
         if 'cohort' in intent:receipt['cohort']=copy.deepcopy(intent['cohort'])
-        if intent.get('phase_protocol')=='bounded-lanes-v1':receipt['phase_witnesses']=self.store.phase_refs()
+        if 'readiness_policy' in intent:receipt['readiness_policy']=intent['readiness_policy']
+        if intent.get('phase_protocol') in ('bounded-lanes-v1',BATCH_PHASE_PROTOCOL):receipt['phase_witnesses']=self.store.phase_refs()
         return receipt
 
     def _receipt(self,intent,status,at,calls,observed,error=None):
@@ -347,6 +441,8 @@ class Executor:
 
     def apply(self, inventory, plan, evidence, at):
         at = self._now(_time(at))
+        if plan.get('batch_protocol')==DAILY_BATCH_PROTOCOL:
+            guards.require(self.phase_section is not None and callable(getattr(self.store,'phase',None)),'Daily intent requires protected bounded phases')
         existing = self._intent()
         if existing is not None:
             # No new command even when a prior process died before calling restic.
@@ -361,6 +457,7 @@ class Executor:
                            'keep_ids': list(plan['keep']), 'anchor_id': plan['anchor_id'],
                            'proof_sha256': {}, 'source': copy.deepcopy(source)}
                 if 'cohort' in inventory:binding['cohort']=copy.deepcopy(inventory['cohort'])
+                if 'readiness_policy' in plan:binding['readiness_policy']=plan['readiness_policy']
         except (KeyError, TypeError, ValueError) as failure:
             raise guards.GuardError('Incomplete retention plan') from failure
         before = self.read_inventory()
@@ -462,13 +559,17 @@ class Executor:
         body={**binding,'operation':'native-retention-forget','token':uuid.uuid4().hex,'prepared_at':at.isoformat(),
               'before_inventory':compact_authenticated_inventory(before,at),'before_inventory_sha256':retention.inventory_digest(before),
               'protected_arrival_ids':comparison['arrival_ids'],'repository_paths':self.repositories}
-        if callable(getattr(self.store,'phase',None)):body['phase_protocol']='bounded-lanes-v1'
+        daily=plan.get('batch_protocol')==DAILY_BATCH_PROTOCOL
+        if callable(getattr(self.store,'phase',None)):
+            body['phase_protocol']=BATCH_PHASE_PROTOCOL if daily else 'bounded-lanes-v1'
+            if daily:body['batches']=command_batches(before,binding['candidate_ids'])
         intent={**body,'intent_sha256':document_digest(body)}
         if callable(getattr(self.store,'stage',None)):self.store.stage(intent)
-        lane_ids={lane:sorted(row['id'] for row in before['snapshots'] if row['lane']==lane and row['id'] in intent['candidate_ids']) for lane in ('base','binlog')}
-        phases=[(lane,ids) for lane,ids in lane_ids.items() if ids] or [('no-op',[])]
+        selected=set(intent['candidate_ids'])
+        lane_ids={} if daily else {lane:sorted(row['id'] for row in before['snapshots'] if row['lane']==lane and row['id'] in selected) for lane in ('base','binlog')}
+        phases=[(batch['lane'],batch['candidate_ids']) for batch in intent_batches(intent)] if daily else ([(lane,ids) for lane,ids in lane_ids.items() if ids] or [('no-op',[])])
         removed=set();calls=0;error=None;promoted=False
-        for lane,ids in phases:
+        for index,(lane,ids) in enumerate(phases):
             try:
                 with self.phase_section(lane):
                     current=self.read_inventory();at=self._now(at)
@@ -479,7 +580,7 @@ class Executor:
                     at=self._now(at)
                     if ids:current_freshness(plan,evidence,at)
                     else:_plan(inventory,plan,at)
-                    phase_document=self.store.phase_document(lane,current,sorted(removed),at) if callable(getattr(self.store,'phase',None)) else None
+                    phase_document=self.store.phase_document(lane,current,sorted(removed),at,index=index) if daily else (self.store.phase_document(lane,current,sorted(removed),at) if callable(getattr(self.store,'phase',None)) else None)
                     if not promoted:
                         self.store.prepare(intent);promoted=True
                         guards.require(self._intent()==intent,'Durable phased intent readback differs')

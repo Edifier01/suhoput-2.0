@@ -4,6 +4,8 @@ import guards,runtime,restic_adapter,backup_catalog
 from worker import Worker,DB_IMAGE,sha,private_path,now
 from restore import Recovery,replay_range
 
+MAX_RETENTION_INTENT=1536
+
 def canonical(value):
     return json.dumps(value,sort_keys=True,separators=(',',':')).encode()
 
@@ -153,14 +155,15 @@ def inventory_plan(inventory,at):
             'logs':logs,'inventory_sha256':inventory_digest(inventory),'chain_last_file':logs[-1]['file'],'chain_last_position':logs[-1]['size']}
 
 def bounded_plan(inventory,plan,limit=256):
-    """One deterministic safe batch, retaining every deferred expired ID.
+    """One deterministic safe intent, retaining every deferred expired ID.
 
     Expired bases go first: deferred hourly snapshots keep their full; binlog
-    deletion begins only after all deletable bases fit in this batch. The
+    deletion begins only after all deletable bases fit in this intent. The
     remaining binlogs are always an original-numbered prefix, never random IDs.
-    A later batch needs a fresh inventory and all current proof gates again.
+    Native commands within it remain bounded independently; a later intent
+    needs a fresh inventory and all current proof gates again.
     """
-    guards.require(type(limit) is int and 0<limit<=256,'Invalid native batch bound')
+    guards.require(type(limit) is int and 0<limit<=MAX_RETENTION_INTENT,'Invalid native intent bound')
     if len(plan['candidates'])<=limit:return dict(plan)
     indexed={row['id']:row for row in inventory['snapshots']};manifests=inventory['manifests']
     eligible=set(plan['candidates']);chosen=[]
@@ -231,20 +234,55 @@ def cached_log_audit(reader,inventory,target):
 class Inspector:
     def __init__(self,config):
         self.config=config;self.w=Worker(config);self.root=self.w.root/'spool'/('retention-audit-'+uuid.uuid4().hex)
+    def recovery_checks(self,inventory,plan):
+        if self.w.c.get('retention_readiness_policy','legacy-v1')=='native-v2':
+            import retention_restore
+            latest=max((row for row in inventory['snapshots'] if row['lane']=='base'),key=lambda row:(guards.utc(row['time']),row['id']))['id']
+            checks=[('anchor',retention_restore.RetentionRecovery(self.w,'anchor'),plan,retention_restore.bind_recovery),
+                    ('tip',retention_restore.RetentionRecovery(self.w,'tip'),{**plan,'anchor_id':latest},retention_restore.bind_recovery)]
+        else:
+            recovery=Recovery(self.config,self.w.root/'config/restore-plan.json')
+            guards.require(recovery.plan['base_id']==plan['anchor_id'],'Current anchor requires a new separately owned restore control; preserve existing DB')
+            checks=[('anchor',recovery,plan,bind_recovery)]
+        result={}
+        for name,recovery,selected,binder in checks:
+            with contextlib.redirect_stdout(io.StringIO()):proof=recovery.verify_existing()
+            if self.w.c.get('retention_readiness_policy','legacy-v1')=='native-v2':
+                guards.require(proof.get('profile')==name,'Operational audit recovery profile differs')
+            binding=binder(inventory,selected,proof)
+            for item in proof['verified_binlogs']:
+                path=recovery.root/'logs'/item['file']
+                guards.require(path.resolve()==path and not path.is_symlink() and path.stat().st_nlink==1 and path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Recovery file differs from audited S3 binlog')
+            result[name]=(proof,binding)
+        return result
     def run(self):
         import retention_cohort,time
         w=self.w;w.gate();started=now();scan_started=time.monotonic()
         with runtime.lane_lock(w.root/'receipts/retention-audit.lock'):
             self.root.mkdir(mode=0o700);(self.root/'logs').mkdir(mode=0o700)
             runtime.atomic_json(self.root/'intent.json',{'generation':w.c['generation'],'code_sha':w.c['code_sha'],'started_at':now(),'remote_delete':False})
-            before,capture_timing=retention_cohort.CohortStore(w).capture();repository_ids=before['repositories']
+            current_inventory=None
+            if w.c.get('retention_readiness_policy','legacy-v1')=='native-v2':
+                current_inventory={}
+                with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
+                    before=retention_cohort.CohortStore(w).load(reader,current_out=current_inventory)
+                age=(guards.utc(now())-guards.utc(before['cohort']['planned_at'])).total_seconds()
+                guards.require(0<=age<=900,'Existing frozen audit cohort expired')
+                capture_timing={'critical_seconds':0}
+            else:before,capture_timing=retention_cohort.CohortStore(w).capture()
+            repository_ids=before['repositories']
             journals={}
             for lane in ('base','binlog'):
                 guards.require(not (w.root/'receipts'/lane/'pending.json').exists(),'Unknown pending upload; retention audit stopped')
                 journals[lane]=runtime.UploadJournal(w.root/'receipts'/lane,w.c['generation']).state()
             from retention_native import verified_tombstones
-            confirmed_inventory(before,journals,verified_tombstones(w));plan=inventory_plan(before,guards.utc(before['cohort']['planned_at']))
-            for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
+            confirmed_inventory(current_inventory if current_inventory is not None else before,journals,verified_tombstones(w));plan=inventory_plan(before,guards.utc(before['cohort']['planned_at']))
+            integrity_report=None
+            if w.c.get('retention_readiness_policy','legacy-v1')=='native-v2':
+                import integrity
+                integrity_report=integrity.ensure(w,before,current_inventory=current_inventory)
+            else:
+                for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
             with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
                 sealed=retention_cohort.CohortStore(w).load(reader);same_inventory(before,sealed)
                 row_guard=cached_log_audit(reader,before,self.root/'logs')
@@ -253,25 +291,23 @@ class Inspector:
             args=['docker','run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--memory','384m','--cpus','0.5','--pids-limit','128','--mount','type=bind,source='+str(self.root/'logs')+',target=/logs,readonly','--entrypoint','sh',DB_IMAGE,'-c',"find /logs -maxdepth 1 -type f -name 'suhoput2-binlog.[0-9][0-9][0-9][0-9][0-9][0-9]' -exec mariadb-binlog --no-defaults --verify-binlog-checksum {} + > /dev/null"]
             w.native.run(args,target=self.root/'checksum-decoded.sql')
             for item in plan['logs']:guards.require(sha(self.root/'logs'/item['file'])==item['sha256'],'Decoded archive changed')
-            recovery=Recovery(self.config,w.root/'config/restore-plan.json')
-            guards.require(recovery.plan['base_id']==plan['anchor_id'],'Current anchor requires a new separately owned restore control; preserve existing DB')
-            with contextlib.redirect_stdout(io.StringIO()):proof=recovery.verify_existing()
-            binding=bind_recovery(before,plan,proof)
-            for item in proof['verified_binlogs']:
-                path=recovery.root/'logs'/item['file']
-                guards.require(path.resolve()==path and not path.is_symlink() and path.stat().st_size==item['size'] and sha(path)==item['sha256'],'Recovery file differs from audited S3 binlog')
+            recoveries=self.recovery_checks(before,plan);proof,binding=recoveries['anchor']
             with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
                 after=retention_cohort.CohortStore(w).load(reader);same_inventory(before,after)
-            blockers=['native_delete_executor_disabled','measured_monthly_budget/account_billing_unverified','independent_owner_full_restore_not_run']
-            if not plan['pre_window_anchor_present']:blockers.append('real_30_day_history_not_present')
+            blockers=[] if integrity_report is not None else ['native_delete_executor_disabled','measured_monthly_budget/account_billing_unverified','independent_owner_full_restore_not_run']
+            if integrity_report is None and not plan['pre_window_anchor_present']:blockers.append('real_30_day_history_not_present')
             if proof['stop']!={'file':plan['chain_last_file'],'position':plan['chain_last_position']}:blockers.append('verified_restore_stop_precedes_archived_chain_tip')
             receipt={'result':'PASS','operation':'read-only native retention inventory/anchor audit','generation':w.c['generation'],'code_sha':w.c['code_sha'],'repositories':repository_ids,'inventory_sha256':plan['inventory_sha256'],'snapshots':before['snapshots'],'verified_snapshots':len(before['snapshots']),'verified_binlogs':len(plan['logs']),'chain_last_file':plan['chain_last_file'],'anchor_recovery':binding,'keep':plan['keep'],'candidates':plan['candidates'],'pre_window_anchor_present':plan['pre_window_anchor_present'],'history_coverage_verified':False,'apply_allowed':False,'remote_delete_calls':0,'timers_enabled':False,'account_api_requests':'not_measured;native restic calls are not provider counters','blockers':blockers,'completed_at':now()}
             receipt.update(evidence_type='audit',source=w.source,started_at=started,
-                           checked_repositories=repository_ids,check_mode='read-data',binlog_check_mode='native-checksum',
+                           checked_repositories=repository_ids,check_mode=integrity.MODE if integrity_report is not None else 'read-data',binlog_check_mode='native-checksum',
                            readback_snapshots={r['id']:r['manifest_sha256'] for r in before['snapshots']},
                            verified_binlog_count=len(plan['logs']),verified_binlogs=plan['logs'],row_event_guard=row_guard,
                            cohort=before['cohort'],phase_seconds={'scan_seconds':time.monotonic()-scan_started,
                                                                 'critical_seconds':capture_timing['critical_seconds']})
+            if integrity_report is not None:receipt['full_remote_integrity']=integrity_report
+            receipt['readiness_evaluated']=False
+            receipt['inventory_mode']='existing-frozen-cohort' if current_inventory is not None else 'new-cohort-capture'
+            if 'tip' in recoveries:receipt['tip_recovery']=recoveries['tip'][1]
             runtime.atomic_json(self.root/'receipt.json',receipt)
             from retention_native import publish_evidence
             publish_evidence(w,'audit',receipt,before,started)

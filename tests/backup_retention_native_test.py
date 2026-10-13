@@ -11,6 +11,98 @@ def subject():
     return retention_native
 
 class NativeBoundaryTests(unittest.TestCase):
+    def test_operational_restore_origin_uses_its_exact_producer_and_profile(self):
+        inv,_,_=fixture();doc={'operation':'native-retention-restore-v1','profile':'tip'}
+        raw=json.dumps(doc).encode();m=subject()
+        origin={'format':1,'evidence_type':'tip','producer':'retention_restore.py','code_sha':'f'*40,
+                'generation':inv['generation'],'repositories':inv['repositories'],
+                'inventory_sha256':__import__('retention').inventory_digest(inv),
+                'file_sha256':__import__('hashlib').sha256(raw).hexdigest(),'document_sha256':retention_apply.document_digest(doc)}
+        self.assertTrue(m.verify_origin('tip',raw,doc,origin,'f'*40,inv))
+        for key,value in [('producer','restore.py'),('evidence_type','anchor')]:
+            bad=copy.deepcopy(origin);bad[key]=value
+            with self.subTest(key=key),self.assertRaises(guards.GuardError):m.verify_origin('tip',raw,doc,bad,'f'*40,inv)
+        with self.assertRaises(guards.GuardError):m.producer_for('anchor',doc)
+        with self.assertRaises(guards.GuardError):m.producer_for('audit',doc)
+        self.assertEqual(m.producer_for('tip',{}),'restore.py')
+
+    def v2_case(self):
+        import backup_cohort_test,readiness_v2
+        from backup_readiness_v2_test import v2_fixture
+        case=backup_cohort_test.NativeCohortTests();case.setUp();self.addCleanup(case.doCleanups)
+        cohort,executor,store,effects=case.prepared_apply();case.w.c['retention_readiness_policy']='native-v2'
+        evidence=subject().load_evidence(case.w,cohort);evidence.pop('history')
+        report=v2_fixture()[2]['budget']['document'];report.update(source=case.w.source,generation=case.w.c['generation'])
+        evidence['budget']={'document':report,'sha256':retention_apply.document_digest(report)}
+        for name in ('history','budget'):(case.root/'receipts'/subject().RECEIPTS[name]).unlink()
+        return case,cohort,executor,store,effects,evidence
+
+    def test_configured_native_v2_dispatches_exact_proofs_and_rechecks_every_apply_phase(self):
+        import readiness_v2
+        case,cohort,executor,store,effects,evidence=self.v2_case();events=[]
+        confirmed=subject()._confirmed_active
+        def confirmation(*args,**kwargs):events.append('confirmed');return confirmed(*args,**kwargs)
+        def budget(*args,**kwargs):events.append('budget');return True
+        with mock.patch.object(subject(),'load_evidence',side_effect=AssertionError('Legacy evidence must not load')), \
+             mock.patch.object(readiness_v2,'load_evidence',return_value=evidence) as loaded, \
+             mock.patch.object(readiness_v2,'revalidate_budget',side_effect=budget), \
+             mock.patch.object(subject(),'_confirmed_active',side_effect=confirmation):
+            result=executor.run('apply')
+        loaded.assert_called_once();self.assertEqual(result['result'],'APPLIED')
+        self.assertEqual(result['readiness_policy'],'native-v2');self.assertEqual(len(effects),2)
+        self.assertEqual(events,['confirmed','budget']*3);self.assertEqual(store.load()['readiness_policy'],'native-v2')
+
+    def test_v2_budget_expiry_or_cost_drift_after_load_blocks_before_intent_and_effect(self):
+        import readiness_v2,budget,storage
+        for change in ('cost_config','stale_live'):
+            case,cohort,executor,store,effects,evidence=self.v2_case()
+            report=evidence['budget']['document']
+            observation={'format':'commissioning-live-observation-v1','bucket':report['bucket'],'scope_sha256':report['scope_sha256'],
+                         'source':report['source'],'generation':report['generation'],'prefix':'','complete':True,
+                         'observed_at':(NOW-__import__('datetime').timedelta(seconds=121)).isoformat()}
+            def loader(*args,**kwargs):
+                if change=='cost_config':raise budget.BudgetError('Changed installed cost configuration')
+                return report
+            with self.subTest(change=change),mock.patch.object(readiness_v2,'load_evidence',return_value=evidence), \
+                 mock.patch.object(budget,'load_commissioning_budget',side_effect=loader), \
+                 mock.patch.object(storage,'load_live_observation',return_value=observation),self.assertRaises(guards.GuardError):
+                executor.run('apply')
+            self.assertEqual(effects,[]);self.assertFalse(store.path.exists())
+
+    def test_uncertain_native_v2_intent_reconciles_readonly_after_budget_freshness_expires(self):
+        import readiness_v2,retention_cohort,datetime as dt
+        case,cohort,executor,store,effects,evidence=self.v2_case();forget=case.w.retention_forget
+        def lost(lane,ids,**kwargs):
+            result=forget(lane,ids,**kwargs)
+            if lane=='binlog':raise TimeoutError('Native response lost')
+            return result
+        case.w.retention_forget=lost
+        with mock.patch.object(readiness_v2,'load_evidence',return_value=evidence),mock.patch.object(readiness_v2,'revalidate_budget',return_value=True):
+            self.assertEqual(executor.run('apply')['result'],'RECONCILE_REQUIRED')
+        self.assertEqual(len(effects),2)
+        with mock.patch.object(retention_cohort,'clock',return_value=NOW+dt.timedelta(seconds=901)), \
+             mock.patch.object(readiness_v2,'load_evidence',side_effect=AssertionError('No new authorization for reconciliation')), \
+             mock.patch.object(readiness_v2,'revalidate_budget',side_effect=AssertionError('Read-only reconciliation cannot require renewed budget')):
+            result=executor.run('reconcile')
+        self.assertEqual(result['result'],'RECONCILED');self.assertEqual(result['remote_delete_calls'],0);self.assertEqual(len(effects),2)
+
+    def test_pointer_only_checkpoint_routes_supported_reconcile_without_new_native_attempt(self):
+        import backup_catalog,backup_catalog_test
+        case=backup_catalog_test.CatalogLifecycleTests('runTest');case.setUp();self.addCleanup(case.doCleanups)
+        case.prepare();case.put(backup_catalog_test.SID,backup_catalog_test.TOKEN);case.put('4'*64,'5'*32);case.prove_absence(backup_catalog_test.SID)
+        write=runtime.atomic_json
+        def crashed(path,value):
+            write(path,value)
+            if pathlib.Path(path)==case.root/'receipts/catalog-checkpoint-stage.json':raise OSError('Process lost after pointer')
+        with mock.patch.object(runtime,'atomic_json',side_effect=crashed),mock.patch.object(backup_catalog.CheckpointStage,'cleanup',side_effect=OSError('No process cleanup')),self.assertRaises(OSError):case.c.checkpoint()
+        self.assertFalse(case.c.checkpoint_pending.exists());case.w.gate=lambda:None
+        executor=subject().NativeApply.__new__(subject().NativeApply);executor.w=case.w
+        with mock.patch.object(executor,'_attempt',side_effect=AssertionError('Pointer recovery must not start native effects')):
+            with self.assertRaisesRegex(guards.GuardError,'Interrupted checkpoint'):executor.run('apply')
+            result=executor.run('reconcile')
+        self.assertEqual(result['result'],'RECONCILED');self.assertEqual(result['remote_delete_calls'],0)
+        self.assertEqual(result['retired_ids'],[backup_catalog_test.SID]);self.assertTrue(case.c.ready());self.assertEqual(set(case.c.entries()),{'4'*64})
+
     def recorded_fixture(self,receipt_count=1):
         inv,plan,_=fixture();template=inv['snapshots'][0];manifest=inv['manifests'][template['id']]
         for index in range(255):

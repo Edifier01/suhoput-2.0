@@ -14,9 +14,16 @@ PRODUCERS={'audit':'retention.py','anchor':'restore.py','tip':'restore.py',
 RECEIPTS={'audit':'retention-audit.json','anchor':'restored-anchor.json','tip':'restored-tip.json',
           'owner':'owner-attestation.json','budget':'budget-projection.json','history':'history.json'}
 
+def producer_for(name,document):
+    guards.require(name in PRODUCERS,'Unknown evidence producer')
+    if document.get('operation')=='native-retention-restore-v1':
+        guards.require(name in ('anchor','tip') and document.get('profile')==name,'Operational restore profile differs')
+        return 'retention_restore.py'
+    return PRODUCERS[name]
+
 def verify_origin(name,raw,document,origin,code_sha,inventory):
     guards.require(name in PRODUCERS and origin.get('format')==1 and
-                   origin.get('evidence_type')==name and origin.get('producer')==PRODUCERS[name] and
+                   origin.get('evidence_type')==name and origin.get('producer')==producer_for(name,document) and
                    origin.get('code_sha')==guards.hex_id(code_sha,40),'Untrusted receipt producer/version')
     guards.require(origin.get('file_sha256')==hashlib.sha256(raw).hexdigest() and
                    origin.get('document_sha256')==retention_apply.document_digest(document),'Receipt origin bytes differ')
@@ -52,7 +59,10 @@ class IntentStore:
         guards.hex_id(name[8:-5],32);path=private_path(self.root/name)
         guards.require(sha(path)==pointer['sha256'],'Durable receipt hash differs');return runtime.load_json(path)
     def phase_documents(self):
-        intent=self.load();baseline={row['id']:row for row in intent['before_inventory']['snapshots']};known=dict(baseline);result={};attempted=set()
+        intent=self.load()
+        guards.require(intent.get('phase_protocol') in (None,'bounded-lanes-v1',retention_apply.BATCH_PHASE_PROTOCOL),'Unknown phase protocol')
+        if intent.get('phase_protocol')==retention_apply.BATCH_PHASE_PROTOCOL:return self._batch_phase_documents(intent)
+        baseline={row['id']:row for row in intent['before_inventory']['snapshots']};known=dict(baseline);result={};attempted=set()
         expected_lanes=[lane for lane in ('base','binlog') if any(row['lane']==lane and row['id'] in intent['candidate_ids'] for row in baseline.values())] or ['no-op']
         guards.require(all(path.name in ('phase-base.json','phase-binlog.json','phase-no-op.json','phase-timing.json') for path in self.root.glob('phase-*.json')),'Unknown phase authorization file')
         for lane in ('base','binlog','no-op'):
@@ -74,19 +84,47 @@ class IntentStore:
             guards.require(authorized>=guards.utc(intent['prepared_at']) and all(authorized>=guards.utc(row['authorized_at']) for row in result.values()),'Phase authorization clock rollback')
             attempted.update(expected);result[lane]=doc
         return result
+    def _batch_phase_documents(self,intent):
+        batches=retention_apply.intent_batches(intent);baseline={row['id']:row for row in intent['before_inventory']['snapshots']};known=dict(baseline);result={};attempted=set()
+        allowed={'phase-'+format(batch['index'],'04d')+'.json' for batch in batches}|{'phase-timing.json'}
+        guards.require(all(path.name in allowed for path in self.root.glob('phase-*.json')),'Unknown batch authorization file')
+        missing=False
+        for batch in batches:
+            key=format(batch['index'],'04d');path=self.root/('phase-'+key+'.json')
+            if not path.exists():missing=True;continue
+            guards.require(not missing,'Batch authorization gap')
+            doc=runtime.load_json(private_path(path));body={key:value for key,value in doc.items() if key!='phase_sha256'}
+            guards.require(type(doc.get('index')) is int and doc['operation']=='native-retention-batch-authorization' and doc['phase_sha256']==retention_apply.document_digest(body) and
+                           doc['intent_sha256']==intent['intent_sha256'] and all(doc[field]==batch[field] for field in ('index','lane','candidate_ids')) and
+                           doc['previous']=={key:value['phase_sha256'] for key,value in result.items()} and doc['prior_absence_ids']==sorted(attempted),'Batch authorization identity/prefix differs')
+            for row in doc['arrival_rows']:
+                guards.require(row['id'] not in baseline and (row['id'] not in known or known[row['id']]==row),'Batch arrival identity changed');known[row['id']]=row
+            view={'generation':intent['generation'],'repositories':intent['repositories'],'snapshots':[row for sid,row in known.items() if sid not in attempted]}
+            guards.require(__import__('retention').inventory_digest(view)==doc['native_inventory_sha256'],'Batch current inventory cannot be reconstructed')
+            authorized=guards.utc(doc['authorized_at'])
+            guards.require(authorized>=guards.utc(intent['prepared_at']) and all(authorized>=guards.utc(previous['authorized_at']) for previous in result.values()),'Batch authorization clock rollback')
+            attempted.update(batch['candidate_ids']);result[key]=doc
+        return result
     def phase_refs(self):
         return {lane:{'file':'phase-'+lane+'.json','sha256':sha(private_path(self.root/('phase-'+lane+'.json'))),'document_sha256':doc['phase_sha256']}
                 for lane,doc in self.phase_documents().items()}
     def attempted_ids(self):return sorted({sid for doc in self.phase_documents().values() for sid in doc['candidate_ids']})
-    def phase_document(self,lane,current,prior_absences,at):
+    def phase_document(self,lane,current,prior_absences,at,*,index=None):
         intent=getattr(self,'staged_intent',None) or self.load();baseline={row['id']:row for row in intent['before_inventory']['snapshots']}
         previous=self.phase_documents() if self.root.exists() else {}
-        guards.require(lane not in previous and lane in ('base','binlog','no-op'),'Existing phase never resumes')
+        batch=None
+        if intent.get('phase_protocol')==retention_apply.BATCH_PHASE_PROTOCOL:
+            batches=retention_apply.intent_batches(intent)
+            guards.require(type(index) is int and index==len(previous) and index<len(batches),'Existing or out-of-order batch never resumes')
+            batch=batches[index];guards.require(batch['lane']==lane,'Batch lane differs')
+        else:guards.require(index is None and lane not in previous and lane in ('base','binlog','no-op'),'Existing phase never resumes')
+        selected=set(intent['candidate_ids'])
         body={'operation':'native-retention-phase-authorization','intent_sha256':intent['intent_sha256'],'lane':lane,
-              'candidate_ids':sorted(row['id'] for row in baseline.values() if row['lane']==lane and row['id'] in intent['candidate_ids']),
+              'candidate_ids':batch['candidate_ids'] if batch is not None else sorted(row['id'] for row in baseline.values() if row['lane']==lane and row['id'] in selected),
               'authorized_at':at.isoformat(),'native_inventory_sha256':__import__('retention').inventory_digest(current),
               'prior_absence_ids':list(prior_absences),'arrival_rows':[row for row in current['snapshots'] if row['id'] not in baseline],
               'previous':{key:value['phase_sha256'] for key,value in previous.items()}}
+        if batch is not None:body.update(operation='native-retention-batch-authorization',index=index,candidate_ids=batch['candidate_ids'])
         if callable(getattr(self,'catalog_head',None)):body['catalog_head']=copy.deepcopy(self.catalog_head())
         guards.require(len(json.dumps(body,sort_keys=True,separators=(',',':')).encode())<=1024*1024,'Phase witness too large; capture a new outside-lock cohort')
         self.ensure_work()
@@ -95,7 +133,9 @@ class IntentStore:
         if callable(getattr(self,'work_deadline',None)):
             import time
             guards.require(time.monotonic()<self.work_deadline(),'Reserved phase durability/cleanup budget reached')
-    def phase(self,value):self.ensure_work();exclusive_json(self.root/('phase-'+value['lane']+'.json'),value)
+    def phase(self,value):
+        self.ensure_work();key=format(value['index'],'04d') if value['operation']=='native-retention-batch-authorization' else value['lane']
+        exclusive_json(self.root/('phase-'+key+'.json'),value)
 
 class StagedFiles:
     """Owned fsynced payloads prepared without holding upload/job locks."""
@@ -136,16 +176,20 @@ class NewIntentStore(IntentStore):
         else:super().prepare(value)
 
 class ExactRunner:
-    def __init__(self,worker,intent_reader,deadline=None):self.w=worker;self.intent_reader=intent_reader;self.deadline=deadline
+    def __init__(self,worker,intent_reader,deadline=None,*,phase_reader=None):self.w=worker;self.intent_reader=intent_reader;self.deadline=deadline;self.phase_reader=phase_reader
     def __call__(self,lane,argv):
         guards.require(lane in ('base','binlog') and isinstance(argv,list) and len(argv)>3 and
                        argv[:3]==['--repo',self.w.c['repositories'][lane],'forget'],'Exact native forget only')
-        ids=argv[3:];guards.require(ids==sorted(set(ids)),'Unordered or duplicate forget IDs')
+        ids=argv[3:];guards.require(ids==sorted(set(ids)) and len(ids)<=retention_apply.MAX_FORGET_IDS,'Unordered, duplicate or oversized forget IDs')
         for sid in ids:guards.hex_id(sid,64)
         intent=self.intent_reader();guards.require(isinstance(intent,dict),'Durable intent required before effect')
-        expected=sorted(r['id'] for r in intent['before_inventory']['snapshots']
-                        if r['lane']==lane and r['id'] in intent['candidate_ids'])
-        guards.require(ids==expected,'Native forget differs from exact frozen lane intent')
+        if intent.get('phase_protocol')==retention_apply.BATCH_PHASE_PROTOCOL:
+            batches=retention_apply.intent_batches(intent);guards.require(callable(self.phase_reader),'Durable batch authorization required')
+            phases=self.phase_reader();guards.require(phases,'Missing batch authorization');phase=list(phases.values())[-1]
+            expected=batches[phase['index']];guards.require(phase['lane']==lane and ids==phase['candidate_ids']==expected['candidate_ids'],'Native forget differs from exact authorized batch')
+        else:
+            selected=set(intent['candidate_ids']);expected=sorted(r['id'] for r in intent['before_inventory']['snapshots'] if r['lane']==lane and r['id'] in selected)
+            guards.require(ids==expected,'Native forget differs from exact frozen lane intent')
         if self.deadline is None:return self.w.retention_forget(lane,ids)
         import time
         remaining=self.deadline()-time.monotonic();guards.require(remaining>0,'Native effect critical deadline exceeded')
@@ -157,6 +201,7 @@ def load_evidence(worker,inventory):
         path=private_path(worker.root/'receipts'/RECEIPTS[name]);raw=path.read_bytes();document=runtime.load_json(path)
         origin=runtime.load_json(private_path(directory/(name+'.origin.json')))
         verify_origin(name,raw,document,origin,worker.c['code_sha'],inventory)
+        guards.require(producer_for(name,document)==PRODUCERS[name],'Legacy readiness requires legacy restore proof')
         guards.require(origin.get('producer_sha256')==sha(private_path(worker.bin/PRODUCERS[name])),
                        'Installed native producer differs')
         result[name]={'document':document,'sha256':retention_apply.document_digest(document)}
@@ -171,6 +216,9 @@ def publish_evidence(worker,name,document,inventory,started_at):
     import retention
     import retention_cohort,backup_catalog
     guards.require(name in PRODUCERS and document.get('result')=='PASS','Completed native producer required')
+    producer=producer_for(name,document)
+    guards.require(producer==PRODUCERS[name] or worker.c.get('retention_readiness_policy')=='native-v2',
+                   'Operational restore requires explicit native-v2 policy')
     with backup_catalog.ArchiveCatalog(worker).open_reader() as reader:
         frozen=retention_cohort.CohortStore(worker).load(reader)
     guards.require(inventory.get('cohort')==frozen['cohort'] and retention.inventory_digest(inventory)==retention.inventory_digest(frozen),
@@ -187,7 +235,7 @@ def publish_evidence(worker,name,document,inventory,started_at):
     if not directory.exists():directory.mkdir(mode=0o700);runtime.directory_sync(directory.parent)
     protected_directory(directory)
     path=worker.root/'receipts'/RECEIPTS[name];runtime.atomic_json(path,document);raw=private_path(path).read_bytes()
-    origin={'format':1,'evidence_type':name,'producer':PRODUCERS[name],'producer_sha256':sha(private_path(worker.bin/PRODUCERS[name])),
+    origin={'format':1,'evidence_type':name,'producer':producer,'producer_sha256':sha(private_path(worker.bin/producer)),
             'code_sha':worker.c['code_sha'],'generation':inventory['generation'],'repositories':inventory['repositories'],
             'inventory_sha256':document['inventory_sha256'],'cohort':inventory['cohort'],'source':worker.source,
             'document_sha256':retention_apply.document_digest(document),'file_sha256':hashlib.sha256(raw).hexdigest()}
@@ -225,8 +273,9 @@ def publish_owner(worker):
                    'Historical native owner ROW/media proof absent')
     guards.require(guards.utc(native['started_at'])<=guards.utc(native['completed_at'])<=started,'Historical owner clock differs')
     guards.hex_id(native['code_sha'],40)
+    current_inventory={}
     with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
-        inventory=retention_cohort.CohortStore(w).load(reader);indexed={r['id']:r for r in inventory['snapshots']}
+        inventory=retention_cohort.CohortStore(w).load(reader,current_out=current_inventory);indexed={r['id']:r for r in inventory['snapshots']}
         retired={row['id']:row for row in verified_tombstones(w)}
         for name in ('base','full'):
             sid=preparation[name+'_id'];row=indexed.get(sid) or retired.get(sid)
@@ -254,7 +303,12 @@ def publish_owner(worker):
                          'full_manifest_sha256':full_row['manifest_sha256'],'coordinates':base['coordinates'],
                          'verified_binlogs':selected,'stop':stop,'operation':'compatible-current-cohort-after-historical-owner-run',
                          'historical_archives':'unchanged-live-or-proven-retired','SQL_writes':0}
-    for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
+    integrity_report=None
+    if w.c.get('retention_readiness_policy','legacy-v1')=='native-v2':
+        import integrity
+        integrity_report=integrity.ensure(w,inventory,current_inventory=current_inventory)
+    else:
+        for lane in ('base','binlog'):w.restic(lane,['--repo',w.c['repositories'][lane],'check','--read-data'])
     fields=('machine_id','source_machine_id','medium_id','origin','restore_method','executed_by','bundle_storage_separate','password_storage_separate')
     proof={key:historical[key] for key in fields}
     guards.require(historical['recovery_bundle_sha256']==source['bundle_inventory_sha256'],'Historical kit identity differs')
@@ -263,6 +317,7 @@ def publish_owner(worker):
                  external_native_code_sha=native['code_sha'],external_native_started_at=native['started_at'],external_native_completed_at=native['completed_at'],
                  native_cohort_revalidation=current_binding,
                  completed_at=retention_cohort.clock().isoformat())
+    if integrity_report is not None:proof.update(integrity_check_mode=integrity.MODE,full_remote_integrity=integrity_report)
     return publish_evidence(w,'owner',proof,inventory,started.isoformat())
 
 def _receipt_documents(store):
@@ -310,7 +365,7 @@ def verify_journal_commit(worker,store,*,receipt=None):
     # Revalidate the current committed observation even if original rows refer
     # to older immutable observations after later read-only reconciliation.
     retention_apply.retention_tombstones(intent,doc)
-    if intent.get('phase_protocol')=='bounded-lanes-v1':
+    if intent.get('phase_protocol') in ('bounded-lanes-v1',retention_apply.BATCH_PHASE_PROTOCOL):
         guards.require(doc.get('phase_witnesses')==store.phase_refs() and set(doc['forgotten_ids'])<=set(store.attempted_ids()),'Committed phase authorization differs')
     if set(marker)!={'intent_sha256','receipt_sha256'}:
         guards.require(marker['format']==2 and marker['operation']=='native-retention-journals-commit','Unknown journal commitment')
@@ -447,7 +502,7 @@ class NativeApply:
             catalog=backup_catalog.ArchiveCatalog(w)
             # A interrupted own checkpoint is never silently reset. Explicit
             # reconciliation below is performed after this coordination lock.
-            if catalog.checkpoint_pending.exists():
+            if catalog._checkpoint_incomplete():
                 guards.require(mode=='reconcile','Interrupted checkpoint requires explicit read-only native reconciliation')
                 checkpoint_only=True;receipt=None
             else:
@@ -490,7 +545,7 @@ class NativeApply:
             def read():
                 started=time.monotonic()
                 try:
-                    current_reader[0]=current_reader[0].refresh()
+                    current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
                     return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0])
                 finally:
                     if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
@@ -505,9 +560,10 @@ class NativeApply:
                 effect_before=timing['effect_seconds'];journal_before=timing['journal_seconds'];active_phase[0]=phase
                 if not timing['critical_phases']:timing['scan_seconds']=started-scan_started
                 try:
-                    with retention_cohort.upload_section(w):
+                    with retention_cohort.upload_section(w) as acquired:
+                        if acquired is not None:started=acquired
                         critical_deadline[0]=started+retention_cohort.MAX_CRITICAL_SECONDS-10
-                        retention_cohort.ready(w);yield
+                        retention_cohort.ready(w,deadline=critical_deadline[0]);yield
                 finally:
                     critical_deadline[0]=None;elapsed=time.monotonic()-started
                     active_phase[0]=None;phase.update(seconds=elapsed,effect_seconds=timing['effect_seconds']-effect_before,journal_seconds=timing['journal_seconds']-journal_before)
@@ -538,8 +594,15 @@ class NativeApply:
                 guards.require(mode=='apply','No unfinished intent to reconcile')
                 inventory=retention_cohort.CohortStore(w).load(reader)
                 at=retention_cohort.clock();planned=guards.utc(inventory['cohort']['planned_at'])
-                plan=retention.bounded_plan(inventory,retention.inventory_plan(inventory,planned));plan['planned_at']=planned.isoformat()
-                evidence=load_evidence(w,inventory) if plan['candidates'] else {}
+                policy=w.c.get('retention_readiness_policy','legacy-v1')
+                guards.require(policy in ('legacy-v1','native-v2'),'Unknown configured readiness policy')
+                plan=retention.bounded_plan(inventory,retention.inventory_plan(inventory,planned),retention_apply.MAX_INTENT_CANDIDATES if policy=='native-v2' else retention_apply.MAX_CANDIDATES);plan['planned_at']=planned.isoformat()
+                if policy=='native-v2':plan['batch_protocol']=retention_apply.DAILY_BATCH_PROTOCOL
+                if policy=='native-v2':plan['readiness_policy']=retention_apply.NATIVE_V2_POLICY
+                if plan['candidates'] and policy=='native-v2':
+                    import readiness_v2
+                    evidence=readiness_v2.load_evidence(w,inventory,at=at)
+                else:evidence=load_evidence(w,inventory) if plan['candidates'] else {}
                 plan['proof_sha256']={key:value['sha256'] for key,value in evidence.items()}
                 if plan['candidates']:retention_apply.validate_apply(inventory,plan,evidence,at)
                 key=inventory['cohort']['sha256'];path=directory/key
@@ -547,13 +610,17 @@ class NativeApply:
                 store=NewIntentStore(path)
                 store.work_deadline=lambda:critical_deadline[0];store.catalog_head=lambda:current_reader[0].head
                 publication=StagedPublication(w,store,timing)
-                runner=ExactRunner(w,store.load,deadline=lambda:critical_deadline[0])
+                runner=ExactRunner(w,store.load,deadline=lambda:critical_deadline[0],phase_reader=store.phase_documents)
                 def effect(lane,argv):
                     effect_started=time.monotonic()
                     try:return runner(lane,argv)
                     finally:timing['effect_seconds']+=time.monotonic()-effect_started
+                def pre_phase(current,intent,absent):
+                    _confirmed_active(w,current,intent,absent,store)
+                    if policy=='native-v2' and plan['candidates']:
+                        readiness_v2.revalidate_budget(w,evidence,at=retention_cohort.clock())
                 ex=retention_apply.Executor(read,effect,store,publication,w.c['repositories'],clock=retention_cohort.clock,
-                     phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
+                     phase_section=section,pre_phase=pre_phase)
                 try:receipt=ex.apply(inventory,plan,evidence,at);receipt=store.latest()
                 finally:
                     started=time.monotonic()

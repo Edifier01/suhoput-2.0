@@ -16,6 +16,8 @@ def sha(path):
 def validate_config(value):
     guards.require(isinstance(value,dict) and value.get('format')==1,'Invalid worker config')
     c=dict(value);c['source']=guards.source_scope(c['root'],c['schema'],c['generation'])
+    c['retention_readiness_policy']=c.get('retention_readiness_policy','legacy-v1')
+    guards.require(c['retention_readiness_policy'] in ('legacy-v1','native-v2'),'Unknown retention readiness policy')
     for key in ('code_sha','stage_app_sha'):guards.hex_id(c[key],40)
     for key in ('db_id','wordpress_id','db_environment_sha256','wordpress_environment_sha256'):guards.hex_id(c[key],64)
     guards.require(isinstance(c['region'],str) and re.fullmatch(r'[a-z0-9-]{1,24}',c['region']),'Invalid S3 region')
@@ -126,6 +128,23 @@ class Worker:
         opts=['--password-file',str(self.password),'--cache-dir',str(self.root/'cache'/lane),'-o','s3.bucket-lookup=path','-o','s3.connections=1']
         # Restic's native exclusive repository lock serializes the effect.
         return self.native.run([str(self.binary),*opts,'--repo',self.c['repositories'][lane],'forget',*ids],environment={**self.credentials,'AWS_REGION':self.c['region']},timeout=timeout)
+    def maintenance_prune(self,lane,*,timeout):
+        """Dedicated zero-repack cleanup; only the durable maintenance gate calls it."""
+        guards.require(lane in ('base','binlog') and type(timeout) in (int,float) and 0<timeout<=55,'Bounded selected cleanup required')
+        # Restic 0.19.1 prune requires at least two backend connections. Other
+        # operations retain their existing single-connection limit.
+        opts=['--password-file',str(self.password),'--cache-dir',str(self.root/'cache'/lane),'-o','s3.bucket-lookup=path','-o','s3.connections=2']
+        return self.native.run([str(self.binary),*opts,'--repo',self.c['repositories'][lane],'prune','--max-repack-size','0','--max-unused=unlimited'],
+                               environment={**self.credentials,'AWS_REGION':self.c['region']},timeout=timeout)
+    def maintenance_inventory(self,lane,*,repository_id,timeout):
+        from storage import repository_receipt
+        return repository_receipt(self,lane,repository_id=repository_id,timeout=timeout)
+    def maintenance_compact(self,lane,*,timeout):
+        """Fixed index rewrite; no snapshot retirement or optional repair flags."""
+        guards.require(lane in ('base','binlog') and type(timeout) in (int,float) and 0<timeout<=55,'Bounded selected compaction required')
+        opts=['--password-file',str(self.password),'--cache-dir',str(self.root/'cache'/lane),'-o','s3.bucket-lookup=path','-o','s3.connections=2']
+        return self.native.run([str(self.binary),*opts,'--repo',self.c['repositories'][lane],'repair','index'],
+                               environment={**self.credentials,'AWS_REGION':self.c['region']},timeout=timeout)
     def initialize(self,lane):
         repo=self.c['repositories'][lane];intent=self.root/'receipts'/('init-'+lane+'.json')
         if not intent.exists():
@@ -235,13 +254,15 @@ class Worker:
         guards.require(config['version']==2 and config['id']==guards.hex_id(initialization['repository_id'],64) and
                        initialization['generation']==self.c['generation'],'Native archive repository identity differs')
         scope=str(self.root/'spool'/(lane+'-payload'))
-        listing=self.restic(lane,['--repo',self.c['repositories'][lane],'ls','--json','--recursive',sid,scope],timeout=50 if lane=='binlog' else 900)
-        restic_adapter.verify_tree_listing(listing,sid,scope,native_metadata,raw_manifest)
+        expected,_,_=backup_catalog.native_identity(native_metadata,sid,scope,self.c['generation'])
+        actual=backup_catalog.decode(self.restic(lane,['--repo',repo,'cat','snapshot',sid],timeout=50 if lane=='binlog' else 900))
+        actual,_,digest=backup_catalog.native_identity(actual,sid,scope,self.c['generation'])
+        guards.require(actual==expected and digest==hashlib.sha256(raw_manifest).hexdigest(),'Actual native archive tree identity mismatch')
         guards.require(backup_catalog.decode(raw_manifest)==manifest,'Native callback manifest differs')
         token=uuid.uuid4().hex;temporary=self.root/'cache'/('verify-'+token);temporary.mkdir(mode=0o700)
         runtime.atomic_json(temporary/'owner.json',{'generation':self.c['generation'],'token':token,'snapshot_id':sid});target=temporary/'archive'
         self.restic(lane,['--repo',self.c['repositories'][lane],'restore',sid,'--target',str(target),'--verify'],timeout=50 if lane=='binlog' else 900)
-        source_path=pathlib.Path(scope);restored=target/source_path.relative_to(source_path.anchor)
+        restored=restic_adapter.verify_restored_tree(target,scope,manifest,raw_manifest,tree_inventory)
         guards.require(backup_catalog.read_file(restored/'manifest.json',backup_catalog.MAX_RAW_BYTES)==raw_manifest,'Readback raw manifest drift');verify_payload(restored,manifest)
         if lane=='base':
             inventory=self.media(restored/'uploads',dump_records.records((restored/'db.sql').read_bytes()));guards.require(inventory==runtime.load_json(restored/'media.json')['inventory'],'Restored media references/directories differ')
@@ -251,19 +272,26 @@ class Worker:
                 self.native.run(['docker','run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--cpus','0.5','--memory','384m','--pids-limit','128','--mount','type=bind,source='+str(restored/'logs')+',target=/logs,readonly','--entrypoint','mariadb-binlog',DB_IMAGE,'--no-defaults','--verify-binlog-checksum','/logs/'+item['file']],timeout=20)
         # Admission copies only actual restored, all-file verified bytes. The
         # native header is independently bound to the archive before restore.
-        backup_catalog.ArchiveCatalog(self).admit(lane,sid,native_metadata,raw_manifest,restored,reconcile=reconcile)
+        deadline=self.catalog_deadline(lane)
+        backup_catalog.ArchiveCatalog(self,deadline=deadline).admit(lane,sid,native_metadata,raw_manifest,restored,reconcile=reconcile,deadline=deadline)
         guards.require(temporary.resolve()==temporary and temporary.parent==self.root/'cache' and not temporary.is_symlink(),'Readback cleanup scope changed');tree_inventory(temporary)
         shutil.rmtree(temporary);runtime.directory_sync(temporary.parent);return True
     def upload(self,lane,payload):
-        backup_catalog.ArchiveCatalog(self).ready()
+        from maintenance import require_clear
+        require_clear(self)
+        deadline=self.catalog_deadline(lane)
+        backup_catalog.ArchiveCatalog(self,deadline=deadline).ready(deadline=deadline)
         manifest=runtime.load_json(payload/'manifest.json');verify_payload(payload,manifest)
         adapter=restic_adapter.ResticAdapter(self.c['repositories'][lane],self.c['generation'],str(payload),runner=lambda args:self.restic(lane,args,timeout=50 if lane=='binlog' else 900),verify_archive=lambda sid,metadata,**proof:self.verify_archive(lane,sid,metadata,**proof))
         capture=self.capture_intent(lane,payload);runtime.atomic_json(self.root/'receipts'/('capture-'+lane+'.json'),{**capture,'phase':'upload'})
         sid=runtime.UploadJournal(self.root/'receipts'/lane,self.c['generation']).upload(payload,sha(payload/'manifest.json'),adapter)
         return sid
     def base(self,kind):
+        from maintenance import require_clear
+        require_clear(self)
         guards.require(kind in ('full','hourly','pre-update'),'Wrong backup kind');self.source_check();self.gate()
         with runtime.lane_lock(self.root/'receipts/job-base.lock'):
+            require_clear(self)
             pending=self.pending_payload('base')
             if pending:return {**self.finalize('base',pending,self.upload('base',pending)),'reconciled':True}
             recovered=self.finish_confirmed('base')
@@ -287,7 +315,7 @@ class Worker:
                 for name in ('.env','infra/staging/compose.yaml','infra/staging/backup.override.yaml','infra/staging/safety.php','infra/staging/proxy.conf'):
                     source=self.stage/name;guards.require(source.is_file() and not source.is_symlink(),'Missing full configuration');dest=payload/'configuration'/name;dest.parent.mkdir(mode=0o700,parents=True,exist_ok=True);shutil.copyfile(source,dest);os.chmod(dest,0o600)
                 public=payload/'configuration/backup-public';public.mkdir(mode=0o700)
-                for name in ('worker.py','restore.py','retention.py','retention_native.py','retention_cohort.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','backup_catalog.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
+                for name in ('worker.py','restore.py','retention.py','retention_native.py','retention_cohort.py','maintenance.py','storage.py','readiness_v2.py','integrity.py','retention_restore.py','meter.py','dump_records.py','guards.py','runtime.py','restic_adapter.py','backup_catalog.py','media.php','database.php','owner-kit.php','owner-full.php','budget.py','retention_apply.py','binlog.py'):
                     source=self.bin/name;guards.require(source.is_file() and not source.is_symlink(),'Missing recovery public helper');shutil.copyfile(source,public/name);os.chmod(public/name,0o600)
             guards.require(media_before==tree_inventory(uploads)==tree_inventory(payload/'uploads'),'Uploads changed during capture')
             if kind in ('full','pre-update'):guards.require(identity==self.captured_identity(payload),'Captured application/configuration differs from baseline')
@@ -338,9 +366,25 @@ class Worker:
         for name in ('.env','infra/staging/compose.yaml'):
             target=path/pathlib.Path(name).name;shutil.copyfile(self.stage/name,target);os.chmod(target,0o600)
         receipt={'captured_at':now(),'kind':'pre-ROW protected local rollback dump/config','files':tree_inventory(path),'source_generation':self.c['generation'],'path':str(path)};runtime.atomic_json(self.root/'receipts/safety.json',receipt);return {'safety_dump':True,'files':len(receipt['files']),'result':'PASS'}
+    def catalog_deadline(self,lane):
+        # Each catalog acquisition has its own <=5s wait; proof/body work is
+        # charged to the original minute deadline, never to that wait budget.
+        original=getattr(self,'_binlog_job_deadline',None) if lane=='binlog' else None
+        return original if original is not None else float('inf')
     def binlog(self):
+        previous=getattr(self,'_binlog_job_deadline',None)
+        self._binlog_job_deadline=min(previous,time.monotonic()+55) if previous is not None else time.monotonic()+55
+        try:return self._binlog()
+        finally:
+            if previous is None:del self._binlog_job_deadline
+            else:self._binlog_job_deadline=previous
+    def _binlog(self):
+        from maintenance import require_clear
+        from backup_catalog import _catalog_lock
+        require_clear(self)
         self.source_check();self.gate()
-        with runtime.lane_lock(self.root/'receipts/job-binlog.lock'):
+        with _catalog_lock(self.root/'receipts/job-binlog.lock',55,self._binlog_job_deadline,'minute job'):
+            require_clear(self)
             pending=self.pending_payload('binlog')
             if pending:
                 sid=self.upload('binlog',pending);receipt=self.finalize('binlog',pending,sid);binlog_watermark(receipt['captured_at']);return {**receipt,'reconciled':True}
@@ -366,7 +410,33 @@ class Worker:
             runtime.atomic_json(payload/'manifest.json',manifest);sid=self.upload('binlog',payload);self.finalize('binlog',payload,sid);lag=binlog_watermark(stamp)
             return {'snapshot_id':sid,'closed_files':len(fresh),'lag_seconds':lag,'result':'PASS'}
     def monitor(self):
-        self.source_check();self.gate();b=runtime.UploadJournal(self.root/'receipts/binlog',self.c['generation']).state();guards.require('last_success_at' in b,'No verified minute upload');lag=binlog_watermark(b['last_success_at']);return {'result':'PASS','lag_seconds':lag,'scheduling_budget':'unverified;permanent timers disabled','retention_delete':'disabled;native prerequisite restore verifier required'}
+        import budget,maintenance,integrity
+        self.source_check();self.gate();maintenance.require_clear(self)
+        forecast=budget.load_commissioning_budget(self)
+        full_remote_integrity=integrity.status(self)
+        b=runtime.UploadJournal(self.root/'receipts/binlog',self.c['generation']).state()
+        guards.require('last_success_at' in b,'No verified minute upload');lag=binlog_watermark(b['last_success_at'])
+        base=runtime.UploadJournal(self.root/'receipts/base',self.c['generation']).state()
+        full=runtime.load_json(self.root/'receipts/full.json');current=dt.datetime.now(UTC)
+        guards.require(full.get('generation')==self.c['generation'],'Full backup generation differs')
+        ages={'base':(current-guards.utc(base['last_success_at'])).total_seconds(),
+              'full':(current-guards.utc(full['captured_at'])).total_seconds()}
+        # Include the bounded 15-minute base job runtime after its scheduled
+        # start; the independent minute binlog still has a strict 60s lag gate.
+        guards.require(0<=ages['base']<=3600+900 and 0<=ages['full']<=86400+900,'Scheduled base/full backup overdue')
+        import storage
+        observation=storage.live_observation(self,forecast)
+        checked_at=dt.datetime.now(UTC)
+        budget.commissioning_live_applicable(forecast,observation,now=checked_at)
+        # The remote read can overlap a minute upload. Re-read its atomic
+        # journal so a slow monitor cannot report a stale earlier watermark.
+        latest=runtime.UploadJournal(self.root/'receipts/binlog',self.c['generation']).state()
+        lag=guards.upload_lag(latest['last_success_at'],checked_at)
+        storage.publish_live_observation(self,forecast,observation)
+        return {'result':'PASS','lag_seconds':lag,'base_age_seconds':ages['base'],'full_age_seconds':ages['full'],
+                'full_remote_integrity_completed_at':full_remote_integrity,
+                'budget_status':forecast['result'],'projected_monthly_rub':forecast['projected_monthly_rub'],
+                'projected_storage_bytes':forecast['projected_storage_bytes'],'budget_valid_until':forecast['valid_until']}
 
 def main():
     import argparse

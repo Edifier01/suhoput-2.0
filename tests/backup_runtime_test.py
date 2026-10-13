@@ -292,8 +292,7 @@ class ResticReadProofs(unittest.TestCase):
         body=json.dumps({'generation':GEN,'files':[{'path':'db.sql','bytes':100,'sha256':'c'*64}]}).encode();digest=hashlib.sha256(body).hexdigest();token='a'*32
         row=self.native({'id':'d'*64,'tags':['task047','generation:'+GEN,'token:'+token,'manifest-sha:'+digest]})
         listing=self.tree(row,[{'message_type':'node','type':'file','path':'/isolated/payload/manifest.json','size':len(body)}])
-        adapter,calls=self.adapter([json.dumps([row]).encode(),body,listing])
-        with self.assertRaises(guards.GuardError):adapter.find(token)
+        with self.assertRaises(guards.GuardError):restic_adapter.verify_tree_listing(listing,'d'*64,'/isolated/payload',row,body)
     def test_archive_requires_actual_data_verifier_after_metadata(self):
         body=json.dumps({'generation':GEN,'files':[]}).encode();digest=hashlib.sha256(body).hexdigest();token='a'*32
         row=self.native({'id':'d'*64,'tags':['task047','generation:'+GEN,'token:'+token,'manifest-sha:'+digest]})
@@ -317,6 +316,7 @@ class ResticReadProofs(unittest.TestCase):
         self.assertEqual(calls[1][2:],['cat','snapshot','d'*64])
         self.assertIn('--parent',calls[0]);self.assertIn('e'*64,calls[0]);self.assertIn('--json',calls[0])
         self.assertFalse(any('snapshots' in call for call in calls))
+        self.assertFalse(any('ls' in call for call in calls),'Exact SID verification must not list every repository snapshot')
 
     def test_invalid_put_summary_never_becomes_read_hint(self):
         body=json.dumps({'synthetic':True,'generation':GEN,'files':[]}).encode();sha=hashlib.sha256(body).hexdigest()
@@ -341,7 +341,6 @@ class ResticReadProofs(unittest.TestCase):
         row=self.native({'id':'d'*64,'tags':['task047','generation:'+GEN,'token:'+token,'manifest-sha:'+digest]})
         for key,value in [('tree','4'*64),('time','2026-10-12T11:02:00Z'),('paths',['/foreign']),('tags',['task047'])]:
             listing=self.tree({**row,key:value},[{'message_type':'node','type':'file','path':'/isolated/payload/manifest.json','size':len(body)}])
-            adapter,_=self.adapter([json.dumps([row]).encode(),body,listing]);adapter.verify_archive=lambda *a,**k:self.fail('Drift must fail before native verifier')
-            with self.subTest(key=key),self.assertRaises(guards.GuardError):adapter.find(token)
+            with self.subTest(key=key),self.assertRaises(guards.GuardError):restic_adapter.verify_tree_listing(listing,'d'*64,'/isolated/payload',row,body)
 
 if __name__=='__main__': unittest.main()

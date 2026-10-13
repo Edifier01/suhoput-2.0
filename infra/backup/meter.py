@@ -67,3 +67,27 @@ def access_log(data,*,bucket,windows=None):
             'isolated_job_measurement':bool(jobs) and overlap==0 and all(j['interval_covered_by_export_rows'] for j in jobs.values()),
             'monthly_projection_verified':False,'invoice_rounding_reconciled':False,
             'billing_rule_source':'https://docs.selectel.ru/s3/about/payment/'}
+
+
+def provider_window(data,*,bucket,window,now):
+    """Count one admitted DONE export, including quiet edges and every retry.
+
+    The protected caller admits the actual provider export selection/status;
+    hashes authenticate byte identity, not the provider or caller itself.
+    Boundaries come from that selection, never the first/last request. There
+    is no per-job attribution, so concurrent jobs cannot double-charge a row.
+    An absent/empty export remains unknown rather than fabricated zero usage.
+    """
+    try:
+        guards.require(isinstance(window,dict) and window['status']=='DONE','Completed provider export required')
+        guards.require(isinstance(now,dt.datetime) and now.utcoffset()==dt.timedelta(),'Explicit UTC clock required')
+        start=guards.utc(window['from']);end=guards.utc(window['until']);completed=guards.utc(window['completed_at'])
+        guards.require(start<end<=completed<=now,'Provider export window incomplete or future')
+        guards.require(hashlib.sha256(data).hexdigest()==guards.hex_id(window['sha256'],64),'Provider raw export bytes differ')
+        report=access_log(data,bucket=bucket)
+        guards.require(report['account_scope_sha256']==guards.hex_id(window['account_scope_sha256'],64),'Provider account scope differs')
+        guards.require(start<=guards.utc(report['first_utc'])<=guards.utc(report['last_utc'])<end,'Provider rows outside admitted window')
+        return {**report,'complete_provider_window':True,'window_seconds':(end-start).total_seconds(),
+                'selected_from':start.isoformat(),'selected_until':end.isoformat(),'export_completed_at':completed.isoformat()}
+    except (KeyError,TypeError,ValueError) as error:
+        raise guards.GuardError('Invalid completed provider-window evidence') from error

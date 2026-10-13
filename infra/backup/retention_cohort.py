@@ -12,15 +12,34 @@ def clock():return dt.datetime.now(dt.timezone.utc)
 MAX_CRITICAL_SECONDS=55
 
 @contextlib.contextmanager
-def upload_section(worker):
-    # Job locks cover capture and domain finalization that happen outside the
-    # upload journal lock. All locks are nonblocking and held only briefly.
-    with runtime.lane_lock(worker.root/'receipts/job-base.lock'),runtime.lane_lock(worker.root/'receipts/job-binlog.lock'), \
-         runtime.lane_lock(worker.root/'receipts/base/lane.lock'),runtime.lane_lock(worker.root/'receipts/binlog/lane.lock'):
-        yield
+def upload_section(worker,*,deadline=None,extra_locks=()):
+    """Acquire the complete group; never wait with a partial group held.
 
-def ready(worker):
-    backup_catalog.ArchiveCatalog(worker).ready()
+    Only OS acquisition contention is retried. The caller's body and every
+    unlock run once. Return the first acquire time of the successful attempt
+    so its 45/55s work/held budget cannot omit intermediate lock acquisitions.
+    """
+    end=time.monotonic()+MAX_CRITICAL_SECONDS
+    if deadline is not None:end=min(end,deadline)
+    paths=[worker.root/'receipts'/name for name in ('job-base.lock','job-binlog.lock','base/lane.lock','binlog/lane.lock')]+list(extra_locks)
+    while True:
+        guards.require(time.monotonic()<end,'Retention lock acquisition deadline exceeded')
+        stack=contextlib.ExitStack();started=time.monotonic()
+        try:
+            for path in paths:stack.enter_context(runtime.lane_lock(path))
+        except runtime.LaneBusyError:
+            stack.close();remaining=end-time.monotonic()
+            guards.require(remaining>0,'Retention lock acquisition deadline exceeded')
+            time.sleep(min(.025,remaining));continue
+        except BaseException:stack.close();raise
+        break
+    with stack:yield started
+
+def ready(worker,*,deadline=None):
+    for lane in ('base','binlog'):
+        pending=worker.root/'receipts/maintenance'/('pending-'+lane+'.json')
+        guards.require(not pending.exists() and not pending.is_symlink(),'Unfinished physical cleanup blocks retention')
+    backup_catalog.ArchiveCatalog(worker,deadline=deadline).ready(deadline=deadline)
     ready_uploads(worker)
 
 def ready_uploads(worker):
@@ -81,9 +100,10 @@ class CohortStore:
             compact=retention_apply.compact_authenticated_inventory(inventory,planned)
             captured_seals=seals(reader,inventory);captured_head=copy.deepcopy(reader.head)
             critical=time.monotonic()
-            with upload_section(w):
-                deadline=time.monotonic()+MAX_CRITICAL_SECONDS
-                ready(w);reader=reader.refresh();current=retention.native_inventory(w,clock(),inventory['repositories'],clock,reader=reader,deadline=deadline)
+            with upload_section(w) as acquired:
+                if acquired is not None:critical=acquired
+                deadline=critical+MAX_CRITICAL_SECONDS
+                ready(w,deadline=deadline);reader=reader.refresh(deadline=deadline);current=retention.native_inventory(w,clock(),inventory['repositories'],clock,reader=reader,deadline=deadline)
                 confirmed(w,current);retention_apply.compatible_inventory(inventory,current,clock())
                 # Capture the scanned set exactly. Current arrivals remain out
                 # of the cohort, independently authenticated and protected.
@@ -119,8 +139,11 @@ class CohortStore:
         plan=retention.inventory_plan(result,guards.utc(document['planned_at']))
         guards.require(document['watermark']=={'file':plan['chain_last_file'],'position':plan['chain_last_position']},'Cohort watermark differs')
         return result
-    def load(self,reader):
+    def load(self,reader,*,current_out=None):
         reader=reader.refresh();document=self._document();inventory=self._inventory(document,reader)
         current=retention.native_inventory(self.w,clock(),inventory['repositories'],clock,reader=reader)
         confirmed(self.w,current);retention_apply.compatible_inventory(inventory,current,clock())
+        if current_out is not None:
+            guards.require(isinstance(current_out,dict) and not current_out,'Empty current inventory output required')
+            current_out.update(current)
         return inventory

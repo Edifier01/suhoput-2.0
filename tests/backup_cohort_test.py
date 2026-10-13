@@ -326,9 +326,9 @@ class NativeCohortTests(unittest.TestCase):
         import contextlib,retention_cohort
         _,native,store,effects=self.prepared_apply();original=retention_cohort.upload_section;count=[0];arrival=[]
         @contextlib.contextmanager
-        def section(worker):
+        def section(worker,**kwargs):
             count[0]+=1
-            with original(worker):yield
+            with original(worker,**kwargs):yield
             if count[0]==1:arrival.append(self.append_minute())
         with mock.patch.object(retention_cohort,'upload_section',section):result=native.run('apply')
         self.assertEqual(result['result'],'APPLIED');self.assertEqual([lane for lane,_ in effects],['base','binlog'])
@@ -342,10 +342,10 @@ class NativeCohortTests(unittest.TestCase):
             if cause!='pending':self.setUp()
             _,native,store,effects=self.prepared_apply();original=retention_cohort.upload_section;count=[0];at=[NOW]
             @contextlib.contextmanager
-            def section(worker):
+            def section(worker,**kwargs):
                 count[0]+=1
                 if count[0]==2 and cause=='busy':raise guards.GuardError('Actual nonblocking lane busy')
-                with original(worker):yield
+                with original(worker,**kwargs):yield
                 if count[0]==1:
                     if cause=='pending':runtime.atomic_json(self.root/'receipts/binlog/pending.json',{'unknown':True})
                     if cause=='expiry':at[0]=NOW+dt.timedelta(seconds=901)
@@ -364,9 +364,9 @@ class NativeCohortTests(unittest.TestCase):
         import contextlib,retention_cohort
         _,native,store,effects=self.prepared_apply();original=retention_cohort.upload_section;count=[0]
         @contextlib.contextmanager
-        def section(worker):
+        def section(worker,**kwargs):
             count[0]+=1
-            with original(worker):yield
+            with original(worker,**kwargs):yield
             if count[0]==1:self.append_base('suhoput2-binlog.000001')
         with mock.patch.object(retention_cohort,'upload_section',section):result=native.run('apply')
         self.assertEqual(result['result'],'RECONCILE_REQUIRED');self.assertEqual([lane for lane,_ in effects],['base'])
@@ -430,8 +430,8 @@ class NativeCohortTests(unittest.TestCase):
         _,native,store,effects=self.prepared_apply();elapsed=[0.0];active=[False];original_section=retention_cohort.upload_section
         original_read=self.w.restic;original_json=retention_native.exclusive_json;original_promote=retention_native.StagedFiles.promote
         @contextlib.contextmanager
-        def section(worker):
-            with original_section(worker):
+        def section(worker,**kwargs):
+            with original_section(worker,**kwargs):
                 active[0]=True
                 try:yield
                 finally:active[0]=False
@@ -464,8 +464,8 @@ class NativeCohortTests(unittest.TestCase):
         import contextlib,retention_cohort
         _,native,store,effects=self.prepared_apply();elapsed=[0.0];original=retention_cohort.upload_section;read=self.w.restic
         @contextlib.contextmanager
-        def section(worker):
-            with original(worker):
+        def section(worker,**kwargs):
+            with original(worker,**kwargs):
                 try:yield
                 finally:elapsed[0]+=30  # modeled OS cleanup delay, charged before release
         def native_read(lane,args,**kwargs):
@@ -530,7 +530,7 @@ class NativeCohortTests(unittest.TestCase):
         import contextlib,backup_catalog,retention_cohort
         _,native,store,effects=self.prepared_apply();elapsed=[0.0];checkpoint=backup_catalog.ArchiveCatalog.checkpoint;section=retention_cohort.upload_section
         @contextlib.contextmanager
-        def slow(worker):
+        def slow(worker,**kwargs):
             with section(worker):
                 try:yield
                 finally:elapsed[0]+=60
@@ -610,6 +610,11 @@ class NativeCohortTests(unittest.TestCase):
         cohort,_=retention_cohort.CohortStore(self.w).capture()
         for name,item in self.documents(cohort).items():retention_native.publish_evidence(self.w,name,item['document'],cohort,NOW.isoformat())
         arrival=self.append_minute();loaded=retention_native.load_evidence(self.w,cohort)
+        current={}
+        with self.catalog().open_reader() as reader:frozen=retention_cohort.CohortStore(self.w).load(reader,current_out=current)
+        self.assertEqual(frozen['cohort'],cohort['cohort']);self.assertEqual(retention.inventory_digest(frozen),retention.inventory_digest(cohort))
+        self.assertIn(arrival,{row['id'] for row in current['snapshots']})
+        self.assertNotIn(arrival,{row['id'] for row in frozen['snapshots']})
         plan=retention.inventory_plan(cohort,NOW);plan.update(planned_at=NOW.isoformat(),proof_sha256={n:i['sha256'] for n,i in loaded.items()})
         retention_apply.validate_apply(cohort,plan,loaded,NOW)
         self.w.gate=lambda:None
@@ -633,9 +638,9 @@ class NativeCohortTests(unittest.TestCase):
         for name,item in self.documents(cohort).items():retention_native.publish_evidence(self.w,name,item['document'],cohort,NOW.isoformat())
         original=retention_cohort.upload_section;arrival=[]
         @contextlib.contextmanager
-        def section(worker):
+        def section(worker,**kwargs):
             if not arrival:arrival.append(self.append_minute())
-            with original(worker):yield
+            with original(worker,**kwargs):yield
         self.w.gate=lambda:None
         def forget(lane,ids,**kwargs):
             for sid in ids:del self.native[sid]
@@ -656,10 +661,10 @@ class NativeCohortTests(unittest.TestCase):
         self.assertEqual(native.run('apply')['result'],'RECONCILE_REQUIRED')
         original=retention_cohort.upload_section
         @contextlib.contextmanager
-        def section(worker):
+        def section(worker,**kwargs):
             metadata=copy.deepcopy(self.native['3'*64][1]);metadata['id']='e'*64
             self.native['e'*64]=('base',metadata)
-            with original(worker):yield
+            with original(worker,**kwargs):yield
         with mock.patch.object(retention_cohort,'upload_section',section):
             try:native.run('reconcile')
             except guards.GuardError:pass
@@ -691,11 +696,12 @@ class NativeCohortTests(unittest.TestCase):
         self.assertEqual(phases['critical_seconds'],54)
     def test_pending_capture_partial_checkpoint_and_changed_cohort_fail_closed(self):
         import retention_cohort
-        for kind in ('pending','capture','checkpoint','cohort'):
+        for kind in ('pending','capture','checkpoint','maintenance','cohort'):
             cohort,_=retention_cohort.CohortStore(self.w).capture()
             if kind=='pending':path=self.root/'receipts/binlog/pending.json';runtime.atomic_json(path,{'unknown':True})
             elif kind=='capture':path=self.root/'receipts/capture-binlog.json';runtime.atomic_json(path,{'generation':self.w.c['generation'],'lane':'binlog','phase':'capture'})
             elif kind=='checkpoint':path=self.catalog().checkpoint_pending;runtime.atomic_json(path,{'partial':True})
+            elif kind=='maintenance':path=self.root/'receipts/maintenance/pending-binlog.json';runtime.atomic_json(path,{'unknown':True})
             else:
                 path=self.root/'receipts/retention-cohorts'/(cohort['cohort']['sha256']+'.json');value=runtime.load_json(path);value['planned_at']='2026-10-12T12:00:00Z';runtime.atomic_json(path,value)
             with self.subTest(kind=kind),self.assertRaises(guards.GuardError):
