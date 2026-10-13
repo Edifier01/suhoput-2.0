@@ -437,7 +437,7 @@ class NativeApply:
         from worker import Worker
         self.w=Worker(config)
     def run(self,mode):
-        import retention,retention_cohort,backup_catalog,time
+        import backup_catalog,time
         w=self.w;w.gate();directory=w.root/'receipts/retention-applies'
         if not directory.exists():directory.mkdir(mode=0o700);runtime.directory_sync(directory.parent)
         protected_directory(directory);scan_started=time.monotonic()
@@ -452,89 +452,13 @@ class NativeApply:
                 checkpoint_only=True;receipt=None
             else:
                 checkpoint_only=False
-                with catalog.open_reader() as reader:
-                    ids=retention_cohort.repository_ids(w)
-                    current_reader=[reader]
-                    critical_deadline=[None]
-                    active_phase=[None]
-                    def read():
-                        started=time.monotonic()
-                        try:
-                            current_reader[0]=current_reader[0].refresh()
-                            return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0])
-                        finally:
-                            if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
-                    from contextlib import contextmanager
-                    @contextmanager
-                    def section(name):
-                        # Native work ends before the reserved durability and
-                        # termination tail. Timestamp precedes the first lock;
-                        # final measurement follows the last lock release.
-                        started=time.monotonic()
-                        phase={'name':name,'seconds':0,'native_inventory_seconds':0,'effect_seconds':0,'journal_seconds':0}
-                        effect_before=timing['effect_seconds'];journal_before=timing['journal_seconds'];active_phase[0]=phase
-                        if not timing['critical_phases']:timing['scan_seconds']=started-scan_started
-                        try:
-                            with retention_cohort.upload_section(w):
-                                critical_deadline[0]=started+retention_cohort.MAX_CRITICAL_SECONDS-10
-                                retention_cohort.ready(w);yield
-                        finally:
-                            critical_deadline[0]=None;elapsed=time.monotonic()-started
-                            active_phase[0]=None;phase.update(seconds=elapsed,effect_seconds=timing['effect_seconds']-effect_before,journal_seconds=timing['journal_seconds']-journal_before)
-                            phase['readiness_validation_durability_cleanup_seconds']=max(0,elapsed-phase['native_inventory_seconds']-phase['effect_seconds']-phase['journal_seconds'])
-                            timing['critical_seconds']+=elapsed;timing['critical_max_seconds']=max(timing['critical_max_seconds'],elapsed)
-                            timing['critical_phases'].append(phase)
-                            guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual continuous phase lock limit exceeded')
-                    unfinished=[]
-                    for path in directory.iterdir():
-                        guards.hex_id(path.name,64);old=IntentStore(path)
-                        guards.require(old.load() is not None,'Incomplete prior apply directory; investigate')
-                        previous=old.latest() if (path/'latest.json').exists() else None
-                        finished=previous is not None and (previous['result'] in ('APPLIED','NOOP') or
-                                 (previous['result']=='RECONCILED' and previous['present_candidate_ids']==[]))
-                        if not finished or not (path/'journals-committed.json').exists():unfinished.append(old)
-                    if unfinished:
-                        guards.require(mode=='reconcile' and len(unfinished)==1,'Prior ambiguous apply requires read-only reconciliation')
-                        store=unfinished[0]
-                        store.work_deadline=lambda:critical_deadline[0]
-                        publication=StagedPublication(w,store,timing)
-                        ex=retention_apply.Executor(read,ExactRunner(w,store.load),store,publication,w.c['repositories'],clock=retention_cohort.clock,
-                             phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
-                        try:receipt=ex.reconcile(retention_cohort.clock())
-                        finally:
-                            if publication.prepared is not None:
-                                started=time.monotonic();publication.prepared['staging'].cleanup();timing['staging_cleanup_seconds']+=time.monotonic()-started
-                    else:
-                        guards.require(mode=='apply','No unfinished intent to reconcile')
-                        inventory=retention_cohort.CohortStore(w).load(reader)
-                        at=retention_cohort.clock();planned=guards.utc(inventory['cohort']['planned_at'])
-                        plan=retention.bounded_plan(inventory,retention.inventory_plan(inventory,planned));plan['planned_at']=planned.isoformat()
-                        evidence=load_evidence(w,inventory) if plan['candidates'] else {}
-                        plan['proof_sha256']={key:value['sha256'] for key,value in evidence.items()}
-                        if plan['candidates']:retention_apply.validate_apply(inventory,plan,evidence,at)
-                        key=inventory['cohort']['sha256'];path=directory/key
-                        guards.require(not path.exists() and not path.is_symlink(),'Existing cohort attempt; preserve, no retry')
-                        store=NewIntentStore(path)
-                        store.work_deadline=lambda:critical_deadline[0];store.catalog_head=lambda:current_reader[0].head
-                        publication=StagedPublication(w,store,timing)
-                        runner=ExactRunner(w,store.load,deadline=lambda:critical_deadline[0])
-                        def effect(lane,argv):
-                            effect_started=time.monotonic()
-                            try:return runner(lane,argv)
-                            finally:timing['effect_seconds']+=time.monotonic()-effect_started
-                        ex=retention_apply.Executor(read,effect,store,publication,w.c['repositories'],clock=retention_cohort.clock,
-                             phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
-                        try:receipt=ex.apply(inventory,plan,evidence,at);receipt=store.latest()
-                        finally:
-                            started=time.monotonic()
-                            if hasattr(store,'staging'):store.staging.cleanup()
-                            if publication.prepared is not None:publication.prepared['staging'].cleanup()
-                            timing['staging_cleanup_seconds']+=time.monotonic()-started
+                receipt,attempt_path=self._attempt(catalog,directory,mode,timing,scan_started)
         # Native exact effects and both protected journals precede checkpoint.
         # checkpoint() owns its own upload locks, so no caller locks remain.
         if checkpoint_only:
             result=catalog.checkpoint(reconcile=True)
             return {'result':'RECONCILED','operation':'native-catalog-checkpoint','remote_delete_calls':0,**result,'phase_seconds':timing}
+        store=IntentStore(attempt_path)
         def save_timing():
             # This sidecar records actual completed phase durations without
             # rewriting the immutable receipt hash acknowledged by journals.
@@ -547,6 +471,89 @@ class NativeApply:
             try:catalog.checkpoint()
             finally:timing['checkpoint_seconds']=time.monotonic()-checkpoint_started;save_timing()
         return receipt
+    def _attempt(self,catalog,directory,mode,timing,scan_started):
+        """End the lifetime of all heavy attempt views before checkpoint starts."""
+        import retention,retention_cohort,time
+        w=self.w
+        with catalog.open_reader() as reader:
+            ids=retention_cohort.repository_ids(w)
+            current_reader=[reader]
+            critical_deadline=[None]
+            active_phase=[None]
+            def read():
+                started=time.monotonic()
+                try:
+                    current_reader[0]=current_reader[0].refresh()
+                    return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0])
+                finally:
+                    if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
+            from contextlib import contextmanager
+            @contextmanager
+            def section(name):
+                # Native work ends before the reserved durability and
+                # termination tail. Timestamp precedes the first lock;
+                # final measurement follows the last lock release.
+                started=time.monotonic()
+                phase={'name':name,'seconds':0,'native_inventory_seconds':0,'effect_seconds':0,'journal_seconds':0}
+                effect_before=timing['effect_seconds'];journal_before=timing['journal_seconds'];active_phase[0]=phase
+                if not timing['critical_phases']:timing['scan_seconds']=started-scan_started
+                try:
+                    with retention_cohort.upload_section(w):
+                        critical_deadline[0]=started+retention_cohort.MAX_CRITICAL_SECONDS-10
+                        retention_cohort.ready(w);yield
+                finally:
+                    critical_deadline[0]=None;elapsed=time.monotonic()-started
+                    active_phase[0]=None;phase.update(seconds=elapsed,effect_seconds=timing['effect_seconds']-effect_before,journal_seconds=timing['journal_seconds']-journal_before)
+                    phase['readiness_validation_durability_cleanup_seconds']=max(0,elapsed-phase['native_inventory_seconds']-phase['effect_seconds']-phase['journal_seconds'])
+                    timing['critical_seconds']+=elapsed;timing['critical_max_seconds']=max(timing['critical_max_seconds'],elapsed)
+                    timing['critical_phases'].append(phase)
+                    guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual continuous phase lock limit exceeded')
+            unfinished=[]
+            for path in directory.iterdir():
+                guards.hex_id(path.name,64);old=IntentStore(path)
+                guards.require(old.load() is not None,'Incomplete prior apply directory; investigate')
+                previous=old.latest() if (path/'latest.json').exists() else None
+                finished=previous is not None and (previous['result'] in ('APPLIED','NOOP') or
+                         (previous['result']=='RECONCILED' and previous['present_candidate_ids']==[]))
+                if not finished or not (path/'journals-committed.json').exists():unfinished.append(old)
+            if unfinished:
+                guards.require(mode=='reconcile' and len(unfinished)==1,'Prior ambiguous apply requires read-only reconciliation')
+                store=unfinished[0]
+                store.work_deadline=lambda:critical_deadline[0]
+                publication=StagedPublication(w,store,timing)
+                ex=retention_apply.Executor(read,ExactRunner(w,store.load),store,publication,w.c['repositories'],clock=retention_cohort.clock,
+                     phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
+                try:receipt=ex.reconcile(retention_cohort.clock())
+                finally:
+                    if publication.prepared is not None:
+                        started=time.monotonic();publication.prepared['staging'].cleanup();timing['staging_cleanup_seconds']+=time.monotonic()-started
+            else:
+                guards.require(mode=='apply','No unfinished intent to reconcile')
+                inventory=retention_cohort.CohortStore(w).load(reader)
+                at=retention_cohort.clock();planned=guards.utc(inventory['cohort']['planned_at'])
+                plan=retention.bounded_plan(inventory,retention.inventory_plan(inventory,planned));plan['planned_at']=planned.isoformat()
+                evidence=load_evidence(w,inventory) if plan['candidates'] else {}
+                plan['proof_sha256']={key:value['sha256'] for key,value in evidence.items()}
+                if plan['candidates']:retention_apply.validate_apply(inventory,plan,evidence,at)
+                key=inventory['cohort']['sha256'];path=directory/key
+                guards.require(not path.exists() and not path.is_symlink(),'Existing cohort attempt; preserve, no retry')
+                store=NewIntentStore(path)
+                store.work_deadline=lambda:critical_deadline[0];store.catalog_head=lambda:current_reader[0].head
+                publication=StagedPublication(w,store,timing)
+                runner=ExactRunner(w,store.load,deadline=lambda:critical_deadline[0])
+                def effect(lane,argv):
+                    effect_started=time.monotonic()
+                    try:return runner(lane,argv)
+                    finally:timing['effect_seconds']+=time.monotonic()-effect_started
+                ex=retention_apply.Executor(read,effect,store,publication,w.c['repositories'],clock=retention_cohort.clock,
+                     phase_section=section,pre_phase=lambda current,intent,absent:_confirmed_active(w,current,intent,absent,store))
+                try:receipt=ex.apply(inventory,plan,evidence,at);receipt=store.latest()
+                finally:
+                    started=time.monotonic()
+                    if hasattr(store,'staging'):store.staging.cleanup()
+                    if publication.prepared is not None:publication.prepared['staging'].cleanup()
+                    timing['staging_cleanup_seconds']+=time.monotonic()-started
+        return store.latest(),store.root
     def _journals(self,store,receipt):
         w=self.w
         if receipt['result'] in ('APPLIED','RECONCILED'):

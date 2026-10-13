@@ -494,6 +494,34 @@ class NativeCohortTests(unittest.TestCase):
             (store.root/'phase-foreign.json').unlink(missing_ok=True)
         for path,raw in original.items():path.write_bytes(raw)
         self.assertEqual(set(store.phase_documents()),{'base','binlog'})
+    def test_completed_attempt_releases_heavy_views_before_catalog_checkpoint(self):
+        import weakref,backup_catalog,retention_cohort
+        _,native,_,effects=self.prepared_apply();refs={name:[] for name in ('inventories','plans','evidence','staged_intent','sealed_records')}
+        class Tracked(dict):pass
+        def tracked(name,value):
+            result=Tracked(value);refs[name].append(weakref.ref(result));return result
+        def wrap(name,original):
+            def call(*args,**kwargs):return tracked(name,original(*args,**kwargs))
+            return call
+        original_stage=retention_native.NewIntentStore.stage;reader_init=backup_catalog.ArchiveReader.__init__;checkpoint=backup_catalog.ArchiveCatalog.checkpoint
+        def stage(store,value):original_stage(store,tracked('staged_intent',value))
+        def reader(reader,*args,**kwargs):
+            reader_init(reader,*args,**kwargs);reader._records=tracked('sealed_records',reader._records)
+        def check(catalog,**kwargs):
+            for name,values in refs.items():
+                self.assertTrue(values,'Lifetime fixture did not observe '+name)
+            live={name:sum(ref() is not None for ref in values) for name,values in refs.items()}
+            self.assertEqual(live,{name:0 for name in refs},'Completed attempt buffers retained through checkpoint')
+            with retention_cohort.upload_section(self.w):pass
+            return checkpoint(catalog,**kwargs)
+        with mock.patch.object(retention,'native_inventory',wrap('inventories',retention.native_inventory)), \
+             mock.patch.object(retention_cohort.CohortStore,'load',wrap('inventories',retention_cohort.CohortStore.load)), \
+             mock.patch.object(retention,'bounded_plan',wrap('plans',retention.bounded_plan)), \
+             mock.patch.object(retention_native,'load_evidence',wrap('evidence',retention_native.load_evidence)), \
+             mock.patch.object(retention_native.NewIntentStore,'stage',stage), \
+             mock.patch.object(backup_catalog.ArchiveReader,'__init__',reader), \
+             mock.patch.object(backup_catalog.ArchiveCatalog,'checkpoint',check):result=native.run('apply')
+        self.assertEqual(result['result'],'APPLIED');self.assertEqual([lane for lane,_ in effects],['base','binlog'])
     def test_cached_audit_reads_sealed_bytes_and_rejects_splitting_base_coordinate(self):
         import retention_cohort
         cohort,_=retention_cohort.CohortStore(self.w).capture();target=self.root/'audited';target.mkdir(mode=0o700)
