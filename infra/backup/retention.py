@@ -26,7 +26,9 @@ def decode(data):
     except (ValueError,UnicodeError,RecursionError) as error:
         raise guards.GuardError('Invalid authenticated JSON') from error
 
-def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=None):
+def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=None,reader_out=None):
+    guards.require(reader_out is None or (reader is not None and isinstance(reader_out,list) and len(reader_out)==1 and reader_out[0] is reader),
+                   'Native reader output must hold the supplied frozen reader')
     w=worker;entries=[];manifests={};tokens=set();observed=at
     catalog=backup_catalog.ArchiveCatalog(w)
     if reader is not None:records=reader._records
@@ -42,6 +44,12 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
         config=decode(run(['cat','config']))
         guards.require(config['version']==2 and config['id']==guards.hex_id(repository_ids[lane],64),'Repository identity changed')
         listed=decode(run(['snapshots','--json']));guards.require(isinstance(listed,list),'Complete snapshot inventory required')
+        if reader is not None:
+            # A full native listing can finish after a normal upload has been
+            # admitted. Authenticate its exact indexed tail before checking
+            # those IDs; neither native tags nor an unknown ID admit a row.
+            # Keep the caller's frozen reader unchanged until both lanes pass.
+            reader=reader.refresh(deadline=deadline);records=reader._records
         for row in listed:
             if deadline is not None:guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')
             sid=guards.hex_id(row['id'],64);guards.require(sid not in manifests,'Duplicate snapshot across inventory')
@@ -97,8 +105,10 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
             record=records.get(sid)
             guards.require(record is not None and record['native']==native and record['repository_id']==repository_ids[lane] and
                            record['lane']==lane and record['projection']==manifests[sid],'Native backfill was not committed to verified catalog')
-    return {'generation':w.c['generation'],'repositories':dict(repository_ids),'snapshots':entries,'manifests':manifests,
+    result={'generation':w.c['generation'],'repositories':dict(repository_ids),'snapshots':entries,'manifests':manifests,
             'observed_at':observed.isoformat()}
+    if reader_out is not None:reader_out[0]=reader
+    return result
 
 def confirmed_inventory(inventory,journals,tombstones=()):
     retired={}

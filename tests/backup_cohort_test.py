@@ -605,6 +605,83 @@ class NativeCohortTests(unittest.TestCase):
         state=runtime.UploadJournal(self.root/'receipts/base',self.w.c['generation']).state()
         state['confirmed'].append({'id':sid,'token':'a'*32,'manifest_sha256':hashlib.sha256(body).hexdigest()});runtime.atomic_json(self.root/'receipts/base/state.json',state)
         return sid
+    def test_load_accepts_admitted_arrival_returned_by_the_same_unfiltered_listing(self):
+        import retention_cohort
+        store=retention_cohort.CohortStore(self.w);cohort,_=store.capture();original=self.w.restic;calls=[];arrivals=[]
+        def restic(lane,args,**kwargs):
+            calls.append((lane,args[2:]))
+            if lane=='binlog' and args[2:]==['snapshots','--json'] and not arrivals:arrivals.append(self.append_minute())
+            return original(lane,args,**kwargs)
+        with self.catalog().open_reader() as reader:
+            captured=copy.deepcopy(reader.head);current={};self.w.restic=restic
+            loaded=store.load(reader,current_out=current)
+            self.assertEqual(reader.head,captured);self.assertNotIn(arrivals[0],reader._records)
+        self.assertEqual(loaded['cohort'],cohort['cohort']);self.assertNotIn(arrivals[0],loaded['manifests'])
+        self.assertIn(arrivals[0],current['manifests']);self.assertEqual(len(calls),4)
+    def test_native_listing_returns_only_the_fully_validated_reader_view(self):
+        import retention_cohort
+        original=self.w.restic;arrivals=[];calls=[]
+        def restic(lane,args,**kwargs):
+            calls.append((lane,args[2:]))
+            if lane=='binlog' and args[2:]==['snapshots','--json'] and not arrivals:arrivals.append(self.append_minute())
+            return original(lane,args,**kwargs)
+        with self.catalog().open_reader() as reader:
+            holder=[reader];captured=copy.deepcopy(reader.head);self.w.restic=restic
+            current=retention.native_inventory(self.w,NOW,retention_cohort.repository_ids(self.w),reader=reader,reader_out=holder)
+            self.assertIsNot(holder[0],reader);self.assertEqual(holder[0].head,self.catalog()._head())
+            self.assertIn(arrivals[0],holder[0]._records);self.assertIn(arrivals[0],current['manifests'])
+            self.assertEqual(reader.head,captured);self.assertNotIn(arrivals[0],reader._records)
+        self.assertEqual(len(calls),4)
+    def test_authenticated_tail_advance_cannot_accept_an_unadmitted_native_id(self):
+        import retention_cohort
+        original=self.w.restic;calls=[];arrivals=[]
+        def restic(lane,args,**kwargs):
+            calls.append((lane,args[2:]))
+            if lane=='binlog' and args[2:]==['snapshots','--json']:
+                arrivals.append(self.append_minute());rows=json.loads(original(lane,args,**kwargs))
+                foreign=copy.deepcopy(rows[-1]);foreign['id']='e'*64
+                foreign['tags']=[tag if not tag.startswith('token:') else 'token:'+'e'*32 for tag in foreign['tags']]
+                return json.dumps(rows+[foreign]).encode()
+            return original(lane,args,**kwargs)
+        with self.catalog().open_reader() as reader:
+            holder=[reader];self.w.restic=restic
+            with self.assertRaisesRegex(guards.GuardError,'Uncatalogued current arrival'):
+                retention.native_inventory(self.w,NOW,retention_cohort.repository_ids(self.w),reader=reader,reader_out=holder)
+            self.assertIs(holder[0],reader)
+        self.assertEqual(len(calls),4)
+    def test_post_listing_refresh_authenticates_new_tail_blob_bytes(self):
+        import retention_cohort,sqlite3
+        original=self.w.restic;calls=[]
+        def restic(lane,args,**kwargs):
+            calls.append((lane,args[2:]))
+            if lane=='binlog' and args[2:]==['snapshots','--json']:
+                sid=self.append_minute()
+                with sqlite3.connect(self.catalog().database) as database:database.execute('UPDATE logs SET body=? WHERE sid=?',(b'corrupt appended body',sid))
+            return original(lane,args,**kwargs)
+        with self.catalog().open_reader() as reader:
+            holder=[reader];self.w.restic=restic
+            with self.assertRaisesRegex(guards.GuardError,'Catalog appended binlog seal differs'):
+                retention.native_inventory(self.w,NOW,retention_cohort.repository_ids(self.w),reader=reader,reader_out=holder)
+            self.assertIs(holder[0],reader)
+        self.assertEqual(len(calls),4)
+    def test_capture_binds_the_reader_that_validated_post_listing_arrivals(self):
+        import retention_cohort
+        original=self.w.restic;arrivals=[]
+        def restic(lane,args,**kwargs):
+            if lane=='binlog' and args[2:]==['snapshots','--json'] and not arrivals:arrivals.append(self.append_minute())
+            return original(lane,args,**kwargs)
+        self.w.restic=restic;store=retention_cohort.CohortStore(self.w);cohort,_=store.capture();document=store._document()
+        self.assertIn(arrivals[0],cohort['manifests']);self.assertIn(arrivals[0],document['catalog_seals'])
+        self.assertEqual(document['catalog_head'],self.catalog()._head())
+    def test_integrity_uses_the_reader_that_validated_post_listing_arrivals(self):
+        import integrity
+        original=self.w.restic;arrivals=[]
+        def restic(lane,args,**kwargs):
+            if lane=='binlog' and args[2:]==['snapshots','--json'] and not arrivals:arrivals.append(self.append_minute())
+            return original(lane,args,**kwargs)
+        self.w.restic=restic
+        with mock.patch.object(integrity,'clock',return_value=NOW):repositories,current,tombstones=integrity._current(self.w,None)
+        self.assertIn(arrivals[0],current['binlog']);self.assertEqual(tombstones,[])
     def test_safe_minute_arrival_crosses_all_producers_origin_loader_pure_intent_and_exact_effect(self):
         import retention_cohort
         cohort,_=retention_cohort.CohortStore(self.w).capture()

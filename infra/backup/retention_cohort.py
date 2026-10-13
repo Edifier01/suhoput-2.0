@@ -113,7 +113,9 @@ class CohortStore:
         w=self.w;start=time.monotonic();catalog=backup_catalog.ArchiveCatalog(w)
         with catalog.open_reader() as reader:
             reader=reader.refresh()
-            inventory=retention.native_inventory(w,clock(),repository_ids(w),clock,reader=reader)
+            current_reader=[reader]
+            inventory=retention.native_inventory(w,clock(),repository_ids(w),clock,reader=reader,reader_out=current_reader)
+            reader=current_reader[0]
             confirmed(w,inventory);planned=clock();plan=retention.inventory_plan(inventory,planned)
             compact=retention_apply.compact_authenticated_inventory(inventory,planned)
             captured_seals=seals(reader,inventory);captured_head=copy.deepcopy(reader.head)

@@ -123,7 +123,10 @@ def _clear(w):
 def _current(w,inventory):
     import retention,retention_cohort,retention_native
     with backup_catalog.ArchiveCatalog(w).open_reader() as reader:
-        if inventory is None:inventory=retention.native_inventory(w,clock(),retention_cohort.repository_ids(w),clock,reader=reader)
+        if inventory is None:
+            current_reader=[reader]
+            inventory=retention.native_inventory(w,clock(),retention_cohort.repository_ids(w),clock,reader=reader,reader_out=current_reader)
+            reader=current_reader[0]
         guards.require(inventory['generation']==w.c['generation'],'Integrity inventory generation differs')
         guards.require(inventory['repositories']==retention_cohort.repository_ids(w),'Integrity initialized repositories differ')
         tombstones=retention_native.verified_tombstones(w)

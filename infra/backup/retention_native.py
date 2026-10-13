@@ -597,7 +597,7 @@ class NativeApply:
                 started=time.monotonic()
                 try:
                     current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
-                    return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0])
+                    return retention.native_inventory(w,retention_cohort.clock(),ids,retention_cohort.clock,reader=current_reader[0],deadline=critical_deadline[0],reader_out=current_reader)
                 finally:
                     if active_phase[0] is not None:active_phase[0]['native_inventory_seconds']+=time.monotonic()-started
             from contextlib import contextmanager
