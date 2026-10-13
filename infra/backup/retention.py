@@ -280,7 +280,8 @@ def native_inventory(worker,at,repository_ids,clock=None,*,reader=None,deadline=
             # Keep the caller's frozen reader unchanged until both lanes pass.
             reader=reader.refresh(deadline=deadline)
             unknown=[(lane,row) for row in listed if row['id'] not in reader._records]
-            reader=retention_cohort._settle_producer(w,reader,_flight_wait,unknown=unknown,deadline=deadline);records=reader._records
+            if unknown:reader=retention_cohort._settle_producer(w,reader,_flight_wait,unknown=unknown,deadline=deadline)
+            records=reader._records
         for row in listed:
             if deadline is not None:guards.require(time.monotonic()<deadline,'Native critical metadata deadline exceeded')
             sid=guards.hex_id(row['id'],64);guards.require(sid not in manifests,'Duplicate snapshot across inventory')

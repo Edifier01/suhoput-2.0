@@ -7,6 +7,34 @@ import backup_cohort_test
 
 
 class CohortBoundaryTests(unittest.TestCase):
+    def test_used_observation_never_waits_for_a_later_unlisted_pending_upload(self):
+        case=self.case();_,_,_,current=self.loaded(case);before=copy.deepcopy(dict(current));flight=current['snapshots']._observation.flight
+        retention_cohort._FLIGHT_USED.add(flight);sid,lock,waits=self.flight(case,listed=False)
+        pending=case.root/'receipts/binlog/pending.json';pending_raw=pending.read_bytes()
+        with case.catalog().open_reader() as reader,mock.patch.object(runtime,'lane_lock',lock), \
+             mock.patch.object(retention_cohort,'upload_section',side_effect=AssertionError('Second observation wait')), \
+             mock.patch.object(case.w,'restic',side_effect=AssertionError('New native observation')):
+            retention_cohort.confirm_observation(case.w,current,reader)
+        self.assertEqual(dict(current),before);self.assertNotIn(sid,current['manifests']);self.assertFalse(waits)
+        self.assertEqual(pending.read_bytes(),pending_raw);self.assertIn(flight,retention_cohort._FLIGHT_USED)
+        with self.assertRaisesRegex(guards.GuardError,'Unfinished upload'):retention_cohort.ready_uploads(case.w)
+
+    def test_late_ack_followed_by_malformed_pending_never_changes_observation_and_blocks_effect(self):
+        case=self.case();cohort,native,store,effects=case.prepared_apply();current={}
+        with case.catalog().open_reader() as reader:retention_cohort.CohortStore(case.w).load(reader,current_out=current)
+        before=copy.deepcopy(dict(current));sid=case.append_minute();pending=case.root/'receipts/binlog/pending.json'
+        runtime.atomic_json(pending,{'unknown':True});raw=pending.read_bytes()
+        with case.catalog().open_reader() as reader,mock.patch.object(retention_cohort,'upload_section',side_effect=AssertionError('Readonly second wait')):
+            retention_cohort.confirm_observation(case.w,current,reader)
+        self.assertNotIn(sid,current['manifests']);self.assertEqual(dict(current),before)
+        with self.assertRaises(guards.GuardError):native.run('apply')
+        self.assertEqual(effects,[]);self.assertIsNone(store.load());self.assertEqual(pending.read_bytes(),raw)
+
+    def test_missing_original_ack_cannot_be_healed_by_unrelated_later_pending(self):
+        case=self.case();_,_,_,current=self.loaded(case);sid,lock,_=self.flight(case,listed=False)
+        path=case.root/'receipts/base/state.json';state=runtime.load_json(path);state['confirmed'].pop();runtime.atomic_json(path,state)
+        with case.catalog().open_reader() as reader,self.assertRaises(guards.GuardError):retention_cohort.confirm_observation(case.w,current,reader)
+
     def flight(self,case,*,listed=True,busy=True,real_lock=None,failed=False,corrupt_old=False):
         real_lock=real_lock or runtime.lane_lock
         path=case.root/'receipts/binlog/state.json';old=runtime.load_json(path);saved=[];admit=backup_catalog.ArchiveCatalog.admit
@@ -114,7 +142,8 @@ class CohortBoundaryTests(unittest.TestCase):
                 if mutation=='second':retention_cohort._FLIGHT_USED.add(current['snapshots']._observation.flight)
                 with case.catalog().open_reader() as reader,mock.patch.object(runtime,'lane_lock',lock),contextlib.ExitStack() as stack:
                     if mutation=='timeout':stack.enter_context(mock.patch.object(retention_cohort,'upload_section',side_effect=guards.GuardError('original deadline exhausted')))
-                    with self.assertRaises(guards.GuardError):retention_cohort.confirm_observation(case.w,current,reader)
+                    with self.assertRaises(guards.GuardError):
+                        retention_cohort._settle_producer(case.w,reader,current['snapshots']._observation.flight,unknown=[('binlog',case.native[sid][1])])
                 if mutation in ('free-job','capture','second'):self.assertFalse(waits)
 
     def test_native_published_before_admission_waits_only_for_authenticated_live_producer(self):
@@ -135,10 +164,13 @@ class CohortBoundaryTests(unittest.TestCase):
             current={};store.load(reader,current_out=current)
         self.assertIn(flight[0][0],current['manifests']);self.assertTrue(flight[0][2]);self.assertEqual(len(calls),4)
 
-    def test_pending_not_listed_waits_and_authenticates_late_ack_without_adding_native_row(self):
+    def test_pending_not_listed_is_confirmed_only_after_independent_completion(self):
         case=self.case();_,_,_,current=self.loaded(case);before=copy.deepcopy(dict(current));sid,lock,waits=self.flight(case,listed=False)
         with case.catalog().open_reader() as reader,mock.patch.object(runtime,'lane_lock',lock):retention_cohort.confirm_observation(case.w,current,reader)
-        self.assertTrue(waits);self.assertNotIn(sid,current['manifests']);self.assertEqual(dict(current),before)
+        self.assertFalse(waits);self.assertTrue((case.root/'receipts/binlog/pending.json').exists())
+        lock.complete()
+        with case.catalog().open_reader() as reader:retention_cohort.confirm_observation(case.w,current,reader)
+        self.assertNotIn(sid,current['manifests']);self.assertEqual(dict(current),before)
 
     def test_raw_prefix_cannot_reseal_an_uncommitted_checkpoint(self):
         case=self.case()
@@ -290,7 +322,12 @@ class CohortBoundaryTests(unittest.TestCase):
                     if mutation=='journal':state['confirmed'][0]['confirmed_at']='2020-01-01T00:00:00+00:00'
                     else:state['confirmed'][-1]['id']='f'*64
                     runtime.atomic_json(path,state)
-                with self.assertRaises(guards.GuardError):integrity._current(case.w,current)
+                if mutation=='pending':
+                    raw=(case.root/'receipts/binlog/pending.json').read_bytes();integrity._current(case.w,current)
+                    with self.assertRaises(guards.GuardError):retention_cohort.ready_uploads(case.w)
+                    self.assertEqual((case.root/'receipts/binlog/pending.json').read_bytes(),raw)
+                else:
+                    with self.assertRaises(guards.GuardError):integrity._current(case.w,current)
 
     def test_new_excluded_ack_requires_all_production_clock_fields(self):
         import integrity

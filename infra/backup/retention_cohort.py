@@ -223,7 +223,9 @@ def confirm_observation(worker,inventory,reader,*,journals=None,tombstones=None)
     guards.require(retention.reader_raw_prefix_seal(reader,head=head)==proof.raw_prefix,'Original observed catalog raw/body prefix changed')
     guards.require(set(dict(proof.native_views))=={'base','binlog'} and all(guards.hex_id(value,64) for _,value in proof.native_views),
                    'Complete native observation views missing')
-    reader=_settle_producer(worker,reader,proof.flight)
+    # The original native view was admitted before this proof was minted.
+    # Later pending work grants no row or wait to this read-only observation;
+    # effects and publication still require their strict current readiness.
     journals={lane:runtime.UploadJournal(worker.root/'receipts'/lane,worker.c['generation']).state() for lane in ('base','binlog')}
     reader=reader.refresh();indexed={row['id']:row for row in rows};excluded=[];observed={};at=clock()
     for lane,count,prefix,stable in proof.journal_prefix:

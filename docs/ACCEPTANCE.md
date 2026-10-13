@@ -496,6 +496,17 @@
 
 ## Доказательства исполнения
 
+<a id="exec-chk-073"></a>
+### EXEC-CHK-073 — TASK-047: повторное подтверждение native observation
+
+13.10.2026 20:13–20:27UTC, основа5c9bbe99, рабочая копия отличается. NEWV4 200328 завершился FAIL до intent/forget: один observation повторно тратил singleflight на следующее unrelated pending. Семь actual minute admissions, maxlag41.790s, max job41.450s/55, producerexit0; native_forget_calls=[]/S3operations0/VPSoperations0. Том и raw receipt сохранены, effects не повторялись. V4 bootstrap освобождает только доказанно неиспользуемые startup journal graphs; независимо проверенные fixture eebdb167/arrivals1030a0c4 сохраняют настоящий Worker capture/prepare/finalize, catalog/native/all-file/CRC и исходные deadlines. Prerequisite documents и календарь корпуса явно synthetic.
+
+RED201949 воспроизводит повтор confirm; независимый RED202231 воспроизводит два unrelated pending между native lanes при unknown_count=0. Поправка разрешает один authenticated wait только для действительно неизвестного ID исходного native ответа. Повторное read-only подтверждение не ждёт последующее pending, не добавляет строки/время и проверяет прежний raw/native/journal prefix плюс полностью authenticated late ACK. Missing original ACK, copy/forged proof, broken body/CRC/clock/dependencies/900s остаются отказами; malformed later pending сохраняется и блокирует NativeApply до intent/effect. Direct singleflight/capture/payload/free-job/timeout guards сохранены.
+
+Frozen source: retention bbe1a30615935355bcaebec215d7bf6fa2f2d2123850d9b23513bc2fd2fc3292; cohort7b3cfb57588cc5bce4b7815c760af49aa91956cf2dd68bde32221121c3ad4f46; boundary032c05f65ad951241851bfc7160f06901fbb74fc61ca3047a5f459eec437bba5. Полный593Linux/no skips40.259s PASS202534, raw SHA62ffa51f7be7ede58bd3bf7f42f34b2d3763c8c2140998ccdcaecc41ee9d72a8;49 source hashes повторно совпали. Независимые103Linux/no skips20.488s PASS202634; отдельный two-lane RED→GREEN202625 и boundary22/no skips3.550s202417. Python3.12.14/root/networknone/768MiB/1CPU, external S3/VPS0. Frozen review не оставило существенных замечаний. Новый шаблон full21:15UTC сохраняет daily86400/Persistentfalse и separation≥15min; установленный5c9 пока20:45/all4timersdisabled.
+
+Свежие actual read-only controls установленного5c9: complete writer authority/no pending, все24native ACK/snapshot/cache ID согласованы;6indexes/14treepacks и обе snapshot cache линии SHA/size PASS. Все inner commands exit0, source/generation/config bindings проверены. Полная conservative postbilling bound40,814,232B<64MiB; fixed8,611new blobs и два authenticated index outcomes учтены отдельно. Исправленная framing/index геометрия retained2,267,279,836B<2304MiB, margin148,639,268B; это прогнозная граница, не месяц наблюдений. При новом rollout bindings/pins обновляются. Actual NEW native apply/source-off SQL, protected budget publication и четыре calendar triggers ещё не выполнены; TASK-047 не PASS.
+
 <a id="exec-chk-072"></a>
 ### EXEC-CHK-072 — TASK-047: завершение pending и ограничение штатного Cache.Clear
 
