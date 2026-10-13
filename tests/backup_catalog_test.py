@@ -1,5 +1,5 @@
 """Synthetic admission/store fault tests; no native or external provenance claim."""
-import contextlib, copy, datetime as dt, hashlib, importlib.util, json, os, pathlib, shutil, sqlite3, sys, tempfile, unittest
+import contextlib, copy, datetime as dt, hashlib, importlib.util, json, os, pathlib, shutil, sqlite3, sys, tempfile, threading, unittest, weakref
 from types import SimpleNamespace
 from unittest import mock
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'infra'/'backup'))
@@ -304,14 +304,225 @@ class WorkerAdmissionTests(unittest.TestCase):
         self.assertFalse(any(cmd[0]=='restore' for cmd in commands))
 
 class CatalogLifecycleTests(unittest.TestCase):
-    def test_checkpoint_sixty_second_committed_tail_fails_and_preserves_pending_for_read_only_reconcile(self):
+    def test_page_backup_permits_real_concurrent_catalog_writer_and_retains_arrival(self):
+        self.manifest['padding']=os.urandom(400000).hex();self.refresh()
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-        before=self.c.head.read_bytes();elapsed=[0.0];original=self.c._checkpoint_insert
-        def slow(*args,**kwargs):original(*args,**kwargs);elapsed[0]+=60
-        with mock.patch.object(self.c,'_checkpoint_insert',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
-        self.assertEqual(self.c.head.read_bytes(),before);self.assertTrue(self.c.checkpoint_pending.exists())
-        with self.assertRaises(guards.GuardError):self.c.entries()
+        with contextlib.closing(sqlite3.connect(self.c.database)) as db:self.assertGreater(db.execute('PRAGMA page_count').fetchone()[0],128)
+        connect=sqlite3.connect;written=[];failures=[];remaining_at_write=[]
+        class OnlineCopy:
+            def __init__(proxy,db):proxy.db=db
+            def __getattr__(proxy,name):return getattr(proxy.db,name)
+            def backup(proxy,target,**kwargs):
+                callback=kwargs['progress']
+                def progress(*args):
+                    callback(*args)
+                    if written:return
+                    remaining_at_write.append(args[1]);self.assertGreater(args[1],0,'Writer must interleave before online copy completes')
+                    written.append('attempted')
+                    def write():
+                        try:self.put('6'*64,'7'*32)
+                        except Exception as error:failures.append(error)
+                    thread=threading.Thread(target=write);thread.start();thread.join(5)
+                    self.assertFalse(thread.is_alive(),'Backup step retained a source SQLite/catalog lock')
+                return proxy.db.backup(target,**{**kwargs,'progress':progress})
+        def connection(path,*args,**kwargs):
+            db=connect(path,*args,**kwargs)
+            return OnlineCopy(db) if str(path)==self.c.database.as_uri()+'?mode=ro' else db
+        with mock.patch('backup_catalog.sqlite3.connect',side_effect=connection):result=self.c.checkpoint()
+        self.assertEqual(failures,[]);self.assertEqual(result['retired_ids'],[SID]);self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
+        self.assertTrue(remaining_at_write)
+    def test_slow_preparation_catches_multiple_minute_arrivals_without_recopy_or_pending(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        elapsed=[0.0];original=self.c._checkpoint_insert;calls=[];copy=self.c._copy_checkpoint_image
+        def reseal(*args,**kwargs):
+            original(*args,**kwargs);elapsed[0]+=65;calls.append('reseal')
+            self.assertFalse(self.c.checkpoint_pending.exists())
+            if len(calls)<=2:self.put(format(5+len(calls),'064x'),format(6+len(calls),'032x'))
+        with mock.patch.object(self.c,'_checkpoint_insert',side_effect=reseal),mock.patch.object(self.c,'_copy_checkpoint_image',wraps=copy) as copies,mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=self.c.checkpoint()
+        self.assertEqual(copies.call_count,1);self.assertEqual(len(calls),3);self.assertEqual(set(self.c.entries()),{'4'*64,format(6,'064x'),format(7,'064x')})
+        self.assertEqual(result['retired_ids'],[SID]);self.assertLessEqual(result['phase_seconds']['critical_max_seconds'],55)
+    def test_arrival_during_native_preparation_is_authenticated_by_bounded_catchup(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        read=self.w.restic;added=[]
+        def native(lane,args,**kwargs):
+            if not added and args[2:]==['snapshots','--json']:
+                self.put('6'*64,'7'*32);added.append(True)
+            return read(lane,args,**kwargs)
+        self.w.restic=native;result=self.c.checkpoint()
+        self.assertEqual(result['retired_ids'],[SID]);self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
+    def test_binlog_tail_copy_uses_bounded_chunks_and_allows_writer_between_them(self):
+        from backup_binlog_test import build,query,table_map,rows
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        insert=self.c._checkpoint_insert;db_method=self.c._db;lock=runtime.lane_lock;added=[];chunks=[];waiting=[False];interleaved=[]
+        def binlog_arrival(*args,**kwargs):
+            insert(*args,**kwargs)
+            if added:return
+            added.append(True);CatalogTests.binlog_fixture(self)
+            raw,_=build([(2,query()),(19,table_map()),(23,rows()+os.urandom(2200000)),(16,(1).to_bytes(8,'little'))])
+            name=self.manifest['logs'][0]['file'];(self.restored/'logs'/name).write_bytes(raw)
+            descriptor={'file':name,'size':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
+            self.manifest['logs']=[descriptor];self.manifest['files']=[{'path':'logs/'+name,'bytes':len(raw),'sha256':descriptor['sha256']}];self.refresh()
+            self.meta['paths']=[str(self.root/'spool/binlog-payload')]
+            meta={**self.meta,'id':'6'*64,'tags':[x.replace(TOKEN,'7'*32) for x in self.meta['tags']]}
+            record=self.c.admit('binlog','6'*64,meta,self.raw,self.restored);self.records['6'*64]=record;self.live.add('6'*64);self.journals()
+        class Source:
+            def __init__(proxy,db):proxy.db=db
+            def __getattr__(proxy,name):return getattr(proxy.db,name)
+            def execute(proxy,sql,parameters=()):
+                self.assertNotIn('SELECT name,body FROM logs',sql)
+                if 'SELECT substr(body' in sql:
+                    chunks.append(parameters[1]);waiting[0]=True
+                return proxy.db.execute(sql,parameters)
+        @contextlib.contextmanager
+        def source(*args,**kwargs):
+            with db_method(*args,**kwargs) as db:yield Source(db)
+        @contextlib.contextmanager
+        def short_lock(path):
+            with lock(path):yield
+            if pathlib.Path(path)==self.c.lock and waiting[0] and not interleaved:
+                interleaved.append(True)
+                # A real SQLite write succeeds between source chunks. It does
+                # not alter catalog records/proofs or claim native admission.
+                with contextlib.closing(sqlite3.connect(self.c.database,timeout=0)) as db:
+                    db.execute('BEGIN IMMEDIATE');db.rollback()
+        with mock.patch.object(self.c,'_checkpoint_insert',side_effect=binlog_arrival),mock.patch.object(self.c,'_db',side_effect=source),mock.patch('backup_catalog.runtime.lane_lock',side_effect=short_lock):result=self.c.checkpoint()
+        self.assertTrue(interleaved);self.assertGreaterEqual(len(chunks),3);self.assertLessEqual(max(chunks),1024*1024)
+        self.assertEqual(result['retired_ids'],[SID]);self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
+    def test_preparation_releases_full_decoded_maps_before_final_authority(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        class Tracked(dict):pass
+        refs=[];scan=subject().ArchiveCatalog._scan;final=self.c._final_checkpoint_native
+        def tracked(catalog,*args,**kwargs):
+            result=Tracked(scan(catalog,*args,**kwargs));refs.append(weakref.ref(result));return result
+        def authority(*args,**kwargs):
+            self.assertTrue(refs);self.assertTrue(all(ref() is None for ref in refs),'Completed preparation retained a full decoded map')
+            return final(*args,**kwargs)
+        with mock.patch.object(subject().ArchiveCatalog,'_scan',tracked),mock.patch.object(self.c,'_final_checkpoint_native',side_effect=authority):self.c.checkpoint()
+    def test_prepared_raw_images_and_complete_authority_set_tampering_block_before_pending(self):
+        for change in ('source','stage','manifest','intent','receipt','latest','marker','phase','init','added'):
+            if change!='source':self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);directory=self.prove_absence(SID)
+            head=self.c.head.read_bytes();publish=self.c._publish_checkpoint_stage
+            def tamper(stage,prepared,profile):
+                if change in ('source','stage'):
+                    target=self.c.database if change=='source' else stage.catalog.database
+                    with contextlib.closing(sqlite3.connect(target)) as db:
+                        with db:db.execute('PRAGMA user_version=47')
+                else:
+                    target={'manifest':stage.manifest,'intent':directory/'intent.json','receipt':directory/('receipt-'+SID[:32]+'.json'),
+                            'latest':directory/'latest.json','marker':directory/'journals-committed.json','phase':directory/'phase-base.json',
+                            'init':self.root/'receipts/init-base.json','added':directory/('receipt-'+'e'*32+'.json')}[change]
+                    if target.exists():target.write_bytes(target.read_bytes()+b' ')
+                    else:runtime.atomic_json(target,{'changed':True})
+                return publish(stage,prepared,profile)
+            with self.subTest(change=change),mock.patch.object(self.c,'_publish_checkpoint_stage',side_effect=tamper),self.assertRaises(guards.GuardError):self.c.checkpoint()
+            self.assertEqual(self.c.head.read_bytes(),head);self.assertFalse(self.c.checkpoint_pending.exists())
+    def test_prepared_image_loss_blocks_and_does_not_remove_exact_legacy_pending(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID);marker=self.legacy_pending();head=self.c.head.read_bytes();publish=self.c._publish_checkpoint_stage
+        def lost(stage,prepared,profile):stage.catalog.database.unlink();return publish(stage,prepared,profile)
+        with mock.patch.object(self.c,'_publish_checkpoint_stage',side_effect=lost),self.assertRaises(guards.GuardError):self.c.checkpoint(reconcile=True)
+        self.assertEqual(self.c.checkpoint_pending.read_bytes(),marker);self.assertEqual(self.c.head.read_bytes(),head)
         self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
+    def test_referenced_stage_loss_or_corruption_blocks_without_resetting_pending(self):
+        for corrupt in (False,True):
+            if corrupt:self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+            replace=os.replace
+            def stop(path,target):
+                if pathlib.Path(target)==self.c.database:raise OSError('Before image activation')
+                return replace(path,target)
+            with mock.patch('backup_catalog.os.replace',side_effect=stop),self.assertRaises(OSError):self.c.checkpoint()
+            marker=self.c.checkpoint_pending.read_bytes();head=self.c.head.read_bytes();pointer=runtime.load_json(self.root/'receipts/catalog-checkpoint-stage.json')
+            image=self.root/'receipts/catalog-preparations'/pointer['token']/'catalog/index.sqlite3'
+            if corrupt:image.write_bytes(b'corrupted private image')
+            else:image.unlink()
+            with self.subTest(corrupt=corrupt),self.assertRaises(guards.GuardError):self.c.checkpoint(reconcile=True)
+            self.assertEqual(self.c.checkpoint_pending.read_bytes(),marker);self.assertEqual(self.c.head.read_bytes(),head)
+    def test_unknown_preparation_content_blocks_without_live_changes(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID);head=self.c.head.read_bytes()
+        parent=self.root/'receipts/catalog-preparations';parent.mkdir(mode=0o700);(parent/'foreign').mkdir(mode=0o700)
+        with self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertEqual(self.c.head.read_bytes(),head);self.assertFalse(self.c.checkpoint_pending.exists())
+    def test_preparation_reserves_both_images_and_rollback_before_copy(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID);head=self.c.head.read_bytes();copied=[];connect=sqlite3.connect
+        def connection(path,*args,**kwargs):
+            if 'catalog-preparations' in str(path):copied.append(str(path))
+            return connect(path,*args,**kwargs)
+        with mock.patch('backup_catalog.sqlite3.connect',side_effect=connection),mock.patch('backup_catalog.shutil.disk_usage',return_value=SimpleNamespace(free=5*1024**3+self.c.database.stat().st_size)),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertEqual(copied,[],'Capacity must refuse before allocating a private image')
+        self.assertEqual(self.c.head.read_bytes(),head);self.assertFalse(self.c.checkpoint_pending.exists());self.assertEqual(list((self.root/'receipts/catalog-preparations').iterdir()),[])
+    def test_accepted_append_does_not_hide_historic_blob_tampering(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID);head=self.c.head.read_bytes();original=self.c._checkpoint_insert;once=[]
+        def tamper(*args,**kwargs):
+            original(*args,**kwargs)
+            if not once:
+                self.put('6'*64,'7'*32);once.append(True)
+                with contextlib.closing(sqlite3.connect(self.c.database)) as db:
+                    with db:db.execute("UPDATE archives SET body=x'00' WHERE sid=?",('4'*64,))
+        with mock.patch.object(self.c,'_checkpoint_insert',side_effect=tamper),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertFalse(self.c.checkpoint_pending.exists());self.assertEqual(runtime.load_json(self.c.head)['sequence'],3)
+    def test_stage_crashes_preserve_prior_next_dispositions_and_readonly_reconcile(self):
+        for point in ('pending','pointer','replace','head','clear'):
+            if point!='pending':self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+            write=runtime.atomic_json;replace=os.replace;sync=runtime.directory_sync;triggered=[]
+            def crash_write(path,value):
+                write(path,value)
+                if (point=='pending' and pathlib.Path(path)==self.c.checkpoint_pending or point=='pointer' and pathlib.Path(path)==self.root/'receipts/catalog-checkpoint-stage.json' or point=='head' and pathlib.Path(path)==self.c.head):
+                    triggered.append(True);raise OSError('Durable boundary crash')
+            def crash_replace(path,target):
+                replace(path,target)
+                if point=='replace' and pathlib.Path(target)==self.c.database:triggered.append(True);raise OSError('Activated image crash')
+            def crash_sync(path):
+                sync(path)
+                if point=='clear' and pathlib.Path(path)==self.c.root and not self.c.checkpoint_pending.exists() and runtime.load_json(self.c.head).get('checkpoint'):
+                    triggered.append(True);raise OSError('Postclear durability crash')
+            with self.subTest(point=point),mock.patch('backup_catalog.runtime.atomic_json',side_effect=crash_write),mock.patch('backup_catalog.os.replace',side_effect=crash_replace),mock.patch('backup_catalog.runtime.directory_sync',side_effect=crash_sync),self.assertRaises(OSError):self.c.checkpoint()
+            self.assertTrue(triggered)
+            if self.c.checkpoint_pending.exists():
+                raw=self.c.checkpoint_pending.read_bytes()
+                with self.assertRaises(guards.GuardError):self.c.entries()
+                self.c.checkpoint(reconcile=True);self.assertFalse(self.c.checkpoint_pending.exists())
+            self.assertEqual(set(self.c.entries()),{'4'*64})
+            self.assertEqual(list((self.root/'receipts/catalog-preparations').iterdir()),[])
+    def test_inode_close_is_outside_locks_only_on_posix_and_replace_cost_is_charged(self):
+        import retention_cohort
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        opened=[];closed=[];openfd=os.open;closefd=os.close;replace=os.replace;elapsed=[0.0]
+        def open_file(path,*args,**kwargs):
+            fd=openfd(path,*args,**kwargs)
+            if pathlib.Path(path)==self.c.database:opened.append(fd)
+            return fd
+        def close_file(fd):
+            if fd in opened:
+                with retention_cohort.upload_section(self.w):closed.append('all-four-free')
+            return closefd(fd)
+        def slow(path,target):
+            replace(path,target)
+            if pathlib.Path(target)==self.c.database:elapsed[0]+=60
+        with mock.patch('backup_catalog.os.open',side_effect=open_file),mock.patch('backup_catalog.os.close',side_effect=close_file),mock.patch('backup_catalog.os.replace',side_effect=slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertEqual(len(opened),1 if os.name=='posix' else 0);self.assertEqual(closed,['all-four-free'] if os.name=='posix' else [])
+        self.assertEqual(self.c.last_checkpoint_timing['critical_max_seconds'],60);self.assertEqual(self.c.last_checkpoint_timing['promotion_seconds'],60)
+        self.assertTrue(self.c.checkpoint_pending.exists());self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
+    def test_checkpoint_heavy_reseal_and_full_scan_run_without_job_upload_locks(self):
+        import retention_cohort
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        original=self.c._checkpoint_insert;elapsed=[0.0];calls=[]
+        def reseal(*args,**kwargs):
+            with retention_cohort.upload_section(self.w):calls.append('all-four-free')
+            result=original(*args,**kwargs);elapsed[0]+=65;return result
+        with mock.patch.object(self.c,'_checkpoint_insert',reseal),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=self.c.checkpoint()
+        self.assertEqual(calls,['all-four-free']);self.assertEqual(result['retired_ids'],[SID])
+        self.assertLessEqual(result['phase_seconds']['critical_max_seconds'],55)
+    def test_long_private_reseal_keeps_live_source_until_final_activation(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        head=self.c.head.read_bytes();elapsed=[0.0];original=self.c._checkpoint_insert
+        def slow(*args,**kwargs):
+            original(*args,**kwargs);elapsed[0]+=60
+            self.assertEqual(self.c.head.read_bytes(),head);self.assertEqual(len(self.c.entries()),2)
+            self.assertFalse(self.c.checkpoint_pending.exists(),'Slow prep must not quarantine minute writers')
+        with mock.patch.object(self.c,'_checkpoint_insert',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=self.c.checkpoint()
+        self.assertEqual(result['retired_ids'],[SID]);self.assertLessEqual(result['phase_seconds']['critical_max_seconds'],55)
     def test_checkpoint_charges_first_acquisition_and_stops_native_work_at_forty_five_seconds(self):
         import retention_cohort
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
@@ -340,17 +551,12 @@ class CatalogLifecycleTests(unittest.TestCase):
         with mock.patch.object(retention_cohort,'upload_section',section),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
         self.assertFalse(self.c.checkpoint_pending.exists());self.assertEqual(set(self.c.entries()),{'4'*64})
         self.assertEqual(self.c.last_checkpoint_timing['critical_seconds'],60)
-    def test_checkpoint_reseal_timeout_rolls_back_uncommitted_bytes_and_retains_exact_pending(self):
+    def test_private_reseal_capacity_abort_preserves_live_bytes_and_legacy_pending(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.put('6'*64,'7'*32);self.prove_absence(SID)
-        elapsed=[0.0];original=subject().canonical;before=self.c.head.read_bytes()
-        def slow(value):
-            result=original(value)
-            if self.c.checkpoint_pending.exists() and isinstance(value,dict) and value.get('id') in ('4'*64,'6'*64):elapsed[0]+=30
-            return result
-        with mock.patch('backup_catalog.canonical',side_effect=slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
-        self.assertEqual(self.c.head.read_bytes(),before);self.assertTrue(self.c.checkpoint_pending.exists())
-        with self.c._db() as db:
-            self.c._tail(db,self.c._head());self.assertEqual(db.execute('SELECT COUNT(*) FROM archives').fetchone()[0],3)
+        marker=self.legacy_pending();before=self.c.head.read_bytes();database=self.c.database.read_bytes()
+        with mock.patch.object(subject().ArchiveCatalog,'_allocation_check',side_effect=subject().CatalogCapacityError('Measured private transaction refusal')),self.assertRaises(guards.GuardError):self.c.checkpoint(reconcile=True)
+        self.assertEqual(self.c.head.read_bytes(),before);self.assertEqual(self.c.database.read_bytes(),database)
+        self.assertEqual(self.c.checkpoint_pending.read_bytes(),marker)
         self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
     def test_checkpoint_head_publication_timeout_retains_new_head_and_pending_until_explicit_reconcile(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
@@ -363,56 +569,36 @@ class CatalogLifecycleTests(unittest.TestCase):
         self.assertEqual(runtime.load_json(self.c.head),pending['next_head'])
         with self.assertRaises(guards.GuardError):self.c.entries()
         self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
-    def test_checkpoint_committed_readback_scan_timeout_retains_prior_head_and_actual_new_database(self):
+    def test_private_full_scan_runs_outside_upload_locks_even_when_slow(self):
+        import retention_cohort
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-        elapsed=[0.0];original=self.c._row;before=self.c.head.read_bytes()
-        def slow(row):
-            value=original(row)
-            if self.c.checkpoint_pending.exists():elapsed[0]+=60
-            return value
-        with mock.patch.object(self.c,'_row',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
-        self.assertEqual(self.c.head.read_bytes(),before);pending=runtime.load_json(self.c.checkpoint_pending)
-        with self.c._db() as db:
-            raw=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone()[0]
-            self.assertEqual(subject().digest(raw),pending['next_head']['checkpoint']['sha256'])
-        with self.assertRaises(guards.GuardError):self.c.entries()
-        self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
+        elapsed=[0.0];original=subject().ArchiveCatalog._scan;observed=[]
+        def scan(catalog,*args,**kwargs):
+            if 'catalog-preparations' in catalog.database.parts:
+                with retention_cohort.upload_section(self.w):observed.append('free')
+                result=original(catalog,*args,**kwargs);elapsed[0]+=60;return result
+            return original(catalog,*args,**kwargs)
+        with mock.patch.object(subject().ArchiveCatalog,'_scan',scan),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=self.c.checkpoint()
+        self.assertGreaterEqual(len(observed),2);self.assertEqual(result['retired_ids'],[SID]);self.assertLessEqual(result['phase_seconds']['critical_max_seconds'],55)
     def test_committed_reconcile_full_authority_over_work_budget_preserves_both_head_states_and_pending(self):
         for published in (False,True):
             if published:self.setUp()
             self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-            insert=self.c._checkpoint_insert
-            def crash(*args,**kwargs):insert(*args,**kwargs);raise OSError('Actual SQLite committed, head not yet published')
-            with mock.patch.object(self.c,'_checkpoint_insert',crash),self.assertRaises(OSError):self.c.checkpoint()
-            pending=runtime.load_json(self.c.checkpoint_pending)
-            if published:runtime.atomic_json(self.c.head,pending['next_head'])
-            head=self.c.head.read_bytes();marker=self.c.checkpoint_pending.read_bytes();elapsed=[0.0];authority=self.c._retirement_evidence
-            def slow(records,**kwargs):
-                result=authority(records,**kwargs)
-                if kwargs.get('deadline') is not None:elapsed[0]+=46
-                return result
-            blocked=False
-            try:
-                with mock.patch.object(self.c,'_retirement_evidence',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):self.c.checkpoint(reconcile=True)
-            except guards.GuardError:blocked=True
-            with self.subTest(next_head_published=published):self.assertTrue(blocked,'Full authority used46s but work budget is45s')
-            if not blocked:continue
+            marker=self.legacy_pending(committed=True,published=published);head=self.c.head.read_bytes();elapsed=[0.0];authority=self.c._final_checkpoint_native
+            def slow(*args,**kwargs):
+                authority(*args,**kwargs);elapsed[0]+=46
+            with self.subTest(next_head_published=published),mock.patch.object(self.c,'_final_checkpoint_native',slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint(reconcile=True)
             self.assertEqual(self.c.head.read_bytes(),head);self.assertEqual(self.c.checkpoint_pending.read_bytes(),marker)
-            with self.c._db() as db:
-                raw=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone()[0]
-                self.assertEqual(subject().digest(raw),pending['next_head']['checkpoint']['sha256'])
             self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})
     def test_checkpoint_initial_native_audit_releases_upload_lanes(self):
+        import retention_cohort
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-        original=self.c._retirement_evidence;calls=[]
+        original=self.c._retirement_evidence;final=self.c._final_checkpoint_native;calls=[]
         def audit(records,**kwargs):
-            if not calls:
-                try:
-                    with runtime.lane_lock(self.c.receipts/'base/lane.lock'),runtime.lane_lock(self.c.receipts/'binlog/lane.lock'):calls.append('unlocked-audit')
-                except guards.GuardError:self.fail('Initial long checkpoint audit holds upload lanes')
-            else:calls.append('final-check')
+            with retention_cohort.upload_section(self.w):calls.append('unlocked-audit')
             return original(records,**kwargs)
-        with mock.patch.object(self.c,'_retirement_evidence',audit):self.c.checkpoint()
+        def current(*args,**kwargs):calls.append('final-check');return final(*args,**kwargs)
+        with mock.patch.object(self.c,'_retirement_evidence',audit),mock.patch.object(self.c,'_final_checkpoint_native',current):self.c.checkpoint()
         self.assertEqual(calls,['unlocked-audit','final-check'])
     setUp=CatalogTests.setUp
     refresh=CatalogTests.refresh
@@ -455,6 +641,20 @@ class CatalogLifecycleTests(unittest.TestCase):
         runtime.atomic_json(directory/'latest.json',{'file':name,'sha256':hashlib.sha256((directory/name).read_bytes()).hexdigest()})
         runtime.atomic_json(directory/'journals-committed.json',{'intent_sha256':intent['intent_sha256'],'receipt_sha256':retention_apply.document_digest(receipt)})
         self.retired.extend(retention_apply.retention_tombstones(intent,receipt));self.live.remove(sid);self.journals();return directory
+    def legacy_pending(self,*,committed=False,published=False):
+        """Real old-schema local state, never a native/provider proof claim."""
+        records=self.c.entries();head=self.c._head();proofs,inventory=self.c._retirement_evidence(records)
+        retired=[{'sequence':sequence,'record':record,'proof':proofs[sid]} for sequence,(sid,record) in enumerate(records.items(),1) if sid in proofs]
+        ids={item['record']['id'] for item in retired};survivors=[record for sid,record in records.items() if sid not in ids]
+        witness={'format':1,'operation':'native-verified-catalog-checkpoint','prior_head':head,'epoch':head.get('checkpoint',{}).get('epoch',0)+1,
+                 'retired':retired,'survivor_count':len(survivors),'survivors_sha256':self.c._records_digest(survivors),
+                 'native_inventory_sha256':__import__('retention').inventory_digest(inventory)}
+        witness['lineage_sha256']=subject().digest(bytes.fromhex(head.get('checkpoint',{}).get('lineage_sha256',subject().ZERO))+subject().canonical(witness))
+        nexthead=self.c._checkpoint_head(witness,survivors);runtime.atomic_json(self.c.checkpoint_pending,{'witness':witness,'next_head':nexthead})
+        if committed:
+            with self.c._db(write=True) as db:self.c._checkpoint_insert(db,witness,survivors,nexthead)
+        if published:runtime.atomic_json(self.c.head,nexthead)
+        return self.c.checkpoint_pending.read_bytes()
     def test_repeated_rolling_windows_reclaim_only_proven_absences_and_continue_admitting(self):
         self.prepare();self.assertTrue(hasattr(self.c,'checkpoint'),'Protected rolling catalog lifecycle missing')
         with mock.patch('backup_catalog.MAX_RECORDS',2):
@@ -509,7 +709,7 @@ class CatalogLifecycleTests(unittest.TestCase):
     def test_pending_checkpoint_blocks_worker_before_new_upload_intent(self):
         import worker
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-        with mock.patch.object(self.c,'_checkpoint_insert',side_effect=OSError('synthetic precommit crash')),self.assertRaises(OSError):self.c.checkpoint()
+        self.legacy_pending()
         payload=self.root/'spool'/'base-payload';shutil.copytree(self.restored,payload)
         w=worker.Worker.__new__(worker.Worker);w.root=self.root;w.c=self.w.c;w.source=self.source
         w.capture_intent=lambda *args:self.fail('New upload intent started before catalog readiness')
@@ -529,12 +729,12 @@ class CatalogLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.c.entries()),2)
     def test_checkpoint_transaction_capacity_abort_retains_prior_chain_and_bodies(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID);head=self.c.head.read_bytes()
-        with mock.patch.object(self.c,'_allocation_check',side_effect=subject().CatalogCapacityError('synthetic measured checkpoint refusal')),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        with mock.patch.object(subject().ArchiveCatalog,'_allocation_check',side_effect=subject().CatalogCapacityError('synthetic measured checkpoint refusal')),self.assertRaises(guards.GuardError):self.c.checkpoint()
         self.assertEqual(self.c.head.read_bytes(),head);self.assertEqual(self.c.raw_manifest(SID),self.raw)
         self.assertEqual(len(self.c.entries()),2);self.assertFalse(self.c.checkpoint_pending.exists())
     def test_checkpoint_precommit_interruption_can_only_reconcile_actual_own_proof(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-        with mock.patch.object(self.c,'_checkpoint_insert',side_effect=OSError('synthetic precommit crash')),self.assertRaises(OSError):self.c.checkpoint()
+        self.legacy_pending()
         pending=runtime.load_json(self.c.checkpoint_pending);pending['witness']['retired'][0]['record']['verified']['code_sha']='9'*40
         runtime.atomic_json(self.c.checkpoint_pending,pending)
         with self.assertRaises(guards.GuardError):self.c.checkpoint(reconcile=True)
@@ -553,7 +753,7 @@ class CatalogLifecycleTests(unittest.TestCase):
         with self.assertRaises(guards.GuardError):self.c.checkpoint()
     def test_pretransaction_checkpoint_marker_blocks_every_fresh_read_and_capture(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-        with mock.patch.object(self.c,'_checkpoint_insert',side_effect=OSError('synthetic pretransaction interruption')),self.assertRaises(OSError):self.c.checkpoint()
+        self.legacy_pending()
         for operation in (self.c.entries,self.c.ready,lambda:self.c.raw_manifest('4'*64)):
             with self.assertRaises(guards.GuardError):operation()
         with self.assertRaises(guards.GuardError):

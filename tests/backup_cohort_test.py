@@ -536,12 +536,18 @@ class NativeCohortTests(unittest.TestCase):
         receipt=store.latest();self.assertEqual(receipt['result'],'APPLIED');self.assertEqual([lane for lane,_ in effects],['base','binlog'])
         sidecar=runtime.load_json(store.root/'phase-timing.json')
         self.assertEqual(sidecar['receipt_sha256'],retention_apply.document_digest(receipt))
-        self.assertEqual(sidecar['phase_seconds']['checkpoint_phase_seconds'],{'critical_seconds':60,'critical_max_seconds':60})
+        measured=sidecar['phase_seconds']['checkpoint_phase_seconds']
+        self.assertEqual(measured['critical_seconds'],60);self.assertEqual(measured['critical_max_seconds'],60)
+        self.assertIn('copy_step_interval_upper_max_seconds',measured)
         self.assertFalse(self.catalog().checkpoint_pending.exists());self.assertEqual(len(retention_native.verified_tombstones(self.w)),2)
     def test_checkpoint_only_reconcile_reports_physical_section_and_never_repeats_native_effects(self):
         import backup_catalog
         _,native,store,effects=self.prepared_apply()
-        with mock.patch.object(backup_catalog.ArchiveCatalog,'_checkpoint_insert',side_effect=OSError('Before metadata transaction')),self.assertRaises(OSError):native.run('apply')
+        original_replace=os.replace;database=self.catalog().database
+        def crash(path,target):
+            original_replace(path,target)
+            if pathlib.Path(target)==database:raise OSError('After metadata image activation')
+        with mock.patch('backup_catalog.os.replace',side_effect=crash),self.assertRaises(OSError):native.run('apply')
         original=store.latest();self.assertEqual(original['result'],'APPLIED');self.assertTrue(self.catalog().checkpoint_pending.exists())
         result=native.run('reconcile');self.assertEqual(result['result'],'RECONCILED');self.assertEqual(result['remote_delete_calls'],0)
         self.assertEqual([lane for lane,_ in effects],['base','binlog']);self.assertEqual(store.latest(),original)

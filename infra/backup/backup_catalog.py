@@ -24,6 +24,7 @@ import shutil
 import sqlite3
 import stat
 import time
+import uuid
 import zlib
 
 import guards
@@ -41,6 +42,9 @@ ZERO='0'*64
 class CatalogCapacityError(guards.GuardError):
     """Transaction was rolled back; prior committed data remains authoritative."""
 
+class CheckpointArrival(guards.GuardError):
+    """A native member was not in the private prefix; admit-chain catch-up only."""
+
 def canonical(value):
     return json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
 
@@ -48,6 +52,38 @@ def digest(value):return hashlib.sha256(value).hexdigest()
 
 def _check_deadline(deadline):
     if deadline is not None:guards.require(time.monotonic()<deadline,'Catalog checkpoint critical deadline exceeded')
+
+def file_digest(path,deadline=None):
+    path=safe(path);before=path.stat();value=hashlib.sha256()
+    with path.open('rb') as source:
+        while True:
+            _check_deadline(deadline);block=source.read(1024*1024)
+            if not block:break
+            value.update(block)
+    after=path.stat()
+    guards.require((before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)==
+                   (after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns),'Catalog file changed during sealed read')
+    return value.hexdigest()
+
+class CheckpointStage:
+    """Owned sibling image; never a caller-supplied retirement proof."""
+    def __init__(self,catalog,token=None):
+        parent=catalog.receipts/'catalog-preparations';parent.mkdir(mode=0o700,exist_ok=True);safe(parent,directory=True)
+        self.root=parent/(guards.hex_id(token,32) if token is not None else uuid.uuid4().hex)
+        if token is None:self.root.mkdir(mode=0o700)
+        safe(self.root,directory=True);root=self.root/'catalog'
+        if token is None:root.mkdir(mode=0o700)
+        safe(root,directory=True)
+        self.catalog=object.__new__(ArchiveCatalog)
+        for key in ('worker','receipts','binding','lock'):setattr(self.catalog,key,getattr(catalog,key))
+        self.catalog.root=root;self.catalog.database=root/'index.sqlite3';self.catalog.head=self.root/'head.json'
+        self.catalog.pending=root/'pending.json';self.catalog.checkpoint_pending=root/'checkpoint-pending.json'
+        self.manifest=self.root/'preparation.json';self.files=[]
+    def cleanup(self):
+        # Fixed owned paths only; unknown content keeps the orphan for review.
+        for path in (self.manifest,self.catalog.head,self.catalog.database):
+            if path.exists():safe(path).unlink()
+        self.catalog.root.rmdir();self.root.rmdir();runtime.directory_sync(self.root.parent)
 
 def decode(raw,limit=MAX_RAW_BYTES):
     guards.require(isinstance(raw,bytes) and len(raw)<=limit,'Catalog JSON oversized')
@@ -529,7 +565,8 @@ class ArchiveCatalog:
             for metadata in listed:
                 if deadline is not None:guards.require(time.monotonic()<deadline,'Checkpoint final metadata deadline exceeded')
                 sid=guards.hex_id(metadata['id'],64);record=records.get(sid)
-                guards.require(record is not None and sid not in manifests,'Unknown native checkpoint arrival or duplicate ID')
+                if record is None:raise CheckpointArrival('Unknown native checkpoint arrival')
+                guards.require(sid not in manifests,'Duplicate native checkpoint ID')
                 native,token,rawsha=native_identity(metadata,sid,str(w.root/'spool'/(lane+'-payload')),self.binding['generation'])
                 guards.require(record['native']==native and record['lane']==lane and record['repository_id']==rid and record['manifest_sha256']==rawsha and token not in tokens,
                                'Native checkpoint identity differs');tokens.add(token)
@@ -551,103 +588,371 @@ class ArchiveCatalog:
                 if record and record['lane']=='binlog':guards.require(record['projection']['last_log']<first,'Retired cache is required by current binlog suffix')
         return {row['id']:row for row in tombstones},inventory
 
-    def checkpoint(self,*,reconcile=False):
-        """Reclaim at most256 exact proven native absences; no caller IDs or flags.
+    def _checkpoint_inputs(self,deadline=None):
+        paths=[self.receipts/lane/'state.json' for lane in ('base','binlog')]
+        paths += [self.receipts/('init-'+lane+'.json') for lane in ('base','binlog')]
+        directory=self.receipts/'retention-applies'
+        if directory.exists():
+            safe(directory,directory=True)
+            for root in sorted(directory.iterdir()):
+                guards.hex_id(root.name,64);safe(root,directory=True)
+                for path in sorted(root.iterdir()):
+                    name=path.name
+                    if name=='phase-timing.json':safe(path);continue
+                    allowed=name in ('intent.json','latest.json','journals-committed.json','phase-base.json','phase-binlog.json','phase-no-op.json')
+                    if name.startswith('receipt-') and name.endswith('.json'):guards.hex_id(name[8:-5],32);allowed=True
+                    guards.require(allowed,'Unknown checkpoint authority file');paths.append(path)
+        return {path.relative_to(self.receipts).as_posix():file_digest(path,deadline) for path in paths}
 
-        Invoke after native retirement and BOTH journals are committed, outside
-        caller-held lane/retention locks. This method takes those lane locks,
-        loads fixed protected intent/receipt/journal evidence and authenticates
-        unfiltered live native metadata itself. It never calls native forget.
-        SQLite freed pages are reused: count/bytes bound the rolling active set,
-        not lifetime uploads. The last witness plus cumulative lineage is sealed.
-        """
-        import retention_cohort
+    def _checkpoint_state(self):
         with runtime.lane_lock(self.lock),self._db() as db:
             guards.require(not self.pending.exists(),'Interrupted admission blocks catalog checkpoint')
-            head=self._head();marker=read_file(self.checkpoint_pending,MAX_CHECKPOINT_BYTES) if self.checkpoint_pending.exists() else None
-            if marker is not None:
-                guards.require(reconcile is True,'Interrupted catalog checkpoint; explicit native reconciliation required')
-                value=decode(marker,MAX_CHECKPOINT_BYTES);nexthead=value['next_head'];prior=value['witness']['prior_head']
+            head=self._head();raw=read_file(self.checkpoint_pending,MAX_CHECKPOINT_BYTES) if self.checkpoint_pending.exists() else None
+            dbhead=head;committed=False
+            if raw is not None:
+                pending=decode(raw,MAX_CHECKPOINT_BYTES);guards.require(set(pending)=={'witness','next_head'},'Checkpoint pending envelope differs')
+                prior=pending['witness']['prior_head'];nexthead=pending['next_head']
                 guards.require(head in (prior,nexthead),'Interrupted checkpoint head differs')
                 exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_checkpoint'").fetchone()
-                current=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone() if exists else None
-                committed=current is not None and digest(current[0])==nexthead['checkpoint']['sha256']
-                records=self._scan(db,nexthead if committed else prior)
-            else:records=self._scan(db,head)
-        # Initial complete native/journal audit retains neither upload lane nor
-        # catalog lock. Appends are subsequently sealed from the captured head.
-        self._retirement_evidence(records)
-        reader=ArchiveReader(self,head,records)
-        started=time.monotonic();hard_deadline=started+retention_cohort.MAX_CRITICAL_SECONDS;deadline=hard_deadline-10
-        try:
-            with retention_cohort.upload_section(self.worker):
-                _check_deadline(deadline)
-                retention_cohort.ready_uploads(self.worker)
-                if marker is None:reader=reader.refresh();head=reader.head;records=reader._records
-                _check_deadline(deadline)
-                with runtime.lane_lock(self.lock),self._db(write=True) as db:
-                    guards.require(self._head()==head,'Catalog changed before final checkpoint section')
-                    current_marker=read_file(self.checkpoint_pending,MAX_CHECKPOINT_BYTES) if self.checkpoint_pending.exists() else None
-                    guards.require(current_marker==marker,'Checkpoint publication changed during unlocked audit')
-                    result=self._checkpoint_locked(db,head,records,reconcile,deadline,hard_deadline)
-        finally:
-            reader.active=False;elapsed=time.monotonic()-started
-            self.last_checkpoint_timing={'critical_seconds':elapsed,'critical_max_seconds':elapsed}
-            guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual catalog checkpoint continuous lock limit exceeded')
-        return {**result,'phase_seconds':self.last_checkpoint_timing}
+                row=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone() if exists else None
+                committed=row is not None and digest(row[0])==nexthead['checkpoint']['sha256']
+                dbhead=nexthead if committed else prior
+            self._tail(db,dbhead)
+            guards.require(not pathlib.Path(str(self.database)+'-journal').exists() and not pathlib.Path(str(self.database)+'-wal').exists(),'Live SQLite sidecar blocks image publication')
+            return head,raw,dbhead,committed
 
-    def _checkpoint_locked(self,db,head,records,reconcile,deadline,hard_deadline):
-        guards.require(not self.pending.exists(),'Interrupted admission blocks catalog checkpoint')
-        if self.checkpoint_pending.exists():
-            guards.require(reconcile is True,'Interrupted catalog checkpoint; explicit native reconciliation required')
-            pending=decode(read_file(self.checkpoint_pending,MAX_CHECKPOINT_BYTES),MAX_CHECKPOINT_BYTES)
-            witness=pending['witness'];prior=witness['prior_head'];nexthead=pending['next_head']
-            guards.require(head in (prior,nexthead),'Interrupted catalog checkpoint head differs')
-            exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_checkpoint'").fetchone()
-            current=db.execute('SELECT record FROM catalog_checkpoint WHERE slot=1').fetchone() if exists else None
-            committed=current is not None and digest(current[0])==nexthead['checkpoint']['sha256']
-            records=self._scan(db,nexthead if committed else prior,deadline=deadline)
-            survivors=list(records.values()) if committed else [r for r in records.values() if r['id'] not in {item['record']['id'] for item in witness['retired']}]
-            self._reconstruct(witness,survivors,deadline=deadline)
-            guards.require(self._checkpoint_head(witness,survivors,deadline=deadline)==nexthead,'Interrupted catalog checkpoint publication differs')
-            proofs,_=self._retirement_evidence(records,deadline=deadline)
-            guards.require(all(proofs.get(item['record']['id'])==item['proof'] for item in witness['retired']),'Interrupted checkpoint native retirement proof differs')
-            _check_deadline(deadline)
-            if not committed:
-                guards.require(head==prior,'Checkpoint prior index after new head publication')
-                try:self._checkpoint_insert(db,witness,survivors,nexthead,deadline=hard_deadline)
-                except CatalogCapacityError:
-                    self._tail(db,prior);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);raise
-            _check_deadline(hard_deadline);runtime.atomic_json(self.head,nexthead)
-            _check_deadline(hard_deadline);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);_check_deadline(hard_deadline)
-            return {'retired_ids':[item['record']['id'] for item in witness['retired']],'head':nexthead}
-        proofs,inventory=self._retirement_evidence(records,deadline=deadline)
-        _check_deadline(deadline)
-        eligible=[(sequence,record) for sequence,record in enumerate(records.values(),1) if record['id'] in proofs]
-        if not eligible:return {'retired_ids':[],'head':head}
-        retired=[]
-        for sequence,record in eligible[:256]:
-            _check_deadline(deadline)
-            item={'sequence':sequence,'record':record,'proof':proofs[record['id']]}
-            # Leave enough room for bounded marker/witness publication.
-            if len(canonical(retired+[item]))>MAX_CHECKPOINT_BYTES//2:break
-            retired.append(item)
-        guards.require(retired,'Retirement witness exceeds bounded publication; no data removed')
-        ids={item['record']['id'] for item in retired};survivors=[r for r in records.values() if r['id'] not in ids]
-        witness={'format':1,'operation':'native-verified-catalog-checkpoint','prior_head':head,'epoch':head.get('checkpoint',{}).get('epoch',0)+1,
-                 'retired':retired,'survivor_count':len(survivors),'survivors_sha256':self._records_digest(survivors,deadline=deadline),
-                 'native_inventory_sha256':__import__('retention').inventory_digest(inventory)}
-        witness['lineage_sha256']=digest(bytes.fromhex(head.get('checkpoint',{}).get('lineage_sha256',ZERO))+canonical(witness))
-        nexthead=self._checkpoint_head(witness,survivors,deadline=deadline)
-        guards.require(shutil.disk_usage(self.root).free>=5*1024**3+2*self.database.stat().st_size+len(canonical(witness))+MAX_RECORD_BYTES,'Catalog checkpoint journal reserve exceeded')
-        guards.require(time.monotonic()<deadline,'Checkpoint validation critical deadline exceeded')
-        runtime.atomic_json(self.checkpoint_pending,{'witness':witness,'next_head':nexthead});_check_deadline(hard_deadline)
-        try:self._checkpoint_insert(db,witness,survivors,nexthead,deadline=hard_deadline)
-        except CatalogCapacityError:
-            self._tail(db,head);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);raise
-        _check_deadline(hard_deadline);runtime.atomic_json(self.head,nexthead)
-        _check_deadline(hard_deadline);self.checkpoint_pending.unlink();runtime.directory_sync(self.root);_check_deadline(hard_deadline)
-        return {'retired_ids':sorted(ids),'head':nexthead}
+    def _checkpoint_stage_reference(self,reconcile):
+        pointer=self.receipts/'catalog-checkpoint-stage.json'
+        parent=self.receipts/'catalog-preparations'
+        roots=list(parent.iterdir()) if parent.exists() else []
+        for root in roots:guards.hex_id(root.name,32);safe(root,directory=True)
+        if not pointer.exists():
+            guards.require(not roots,'Unreferenced preparation requires protected investigation')
+            return
+        guards.require(reconcile and self.checkpoint_pending.exists(),'Existing stage requires explicit pending reconciliation')
+        value=decode(read_file(pointer,MAX_RECORD_BYTES),MAX_RECORD_BYTES)
+        guards.require(set(value)=={'token','manifest_sha256','pending_sha256'},'Malformed stage integrity reference')
+        token=guards.hex_id(value['token'],32);root=safe(self.receipts/'catalog-preparations'/token,directory=True)
+        guards.require({path.name for path in roots}=={token},'Unknown/orphan preparation blocks reconciliation')
+        guards.require({p.name for p in root.iterdir()}=={'catalog','head.json','preparation.json'} and
+                       {p.name for p in safe(root/'catalog',directory=True).iterdir()}<= {'index.sqlite3'},'Unknown preparation layout')
+        path=root/'preparation.json';guards.require(file_digest(path)==value['manifest_sha256'] and
+                     file_digest(self.checkpoint_pending)==value['pending_sha256'],'Stage descriptor or fixed pending changed')
+        prepared=decode(read_file(path,MAX_RAW_BYTES));image=root/'catalog/index.sqlite3'
+        guards.require(prepared['pending_sha256'] in (None,value['pending_sha256']) and prepared['source']==self.worker.source,
+                       'Foreign stage reference')
+        guards.require(decode(read_file(self.checkpoint_pending,MAX_CHECKPOINT_BYTES),MAX_CHECKPOINT_BYTES)==
+                       {'witness':prepared['witness'],'next_head':prepared['next_head']},'Prepared fixed witness differs')
+        head,marker,dbhead,committed=self._checkpoint_state()
+        if image.exists():guards.require(file_digest(image)==prepared['stage_sha256'],'Prepared image corrupted')
+        else:guards.require(committed and file_digest(self.database)==prepared['stage_sha256'],'Prepared image lost before confirmed live activation')
+        guards.require(self._checkpoint_inputs()==prepared['authority'],'Recovery authority set/bytes changed')
+        if image.exists() and head==prepared['source_head'] and file_digest(self.database)==prepared['source_sha256']:
+            prepared['manifest_sha256']=value['manifest_sha256'];prepared['pending_sha256']=value['pending_sha256']
+            guards.require(committed==prepared['already_committed'],'Recovery disposition changed')
+            return CheckpointStage(self,token),prepared
+        return CheckpointStage(self,token),None
+
+    def _revalidate_checkpoint_stage(self,stage,prepared,profile):
+        records=self._checkpoint_records(stage,prepared['next_head'],profile)
+        self._reconstruct(prepared['witness'],list(records.values()))
+        proofs,inventory=self._retirement_evidence(records)
+        guards.require(__import__('retention').inventory_digest(inventory)==prepared['native_sha256'] and
+                       all(proofs.get(item['record']['id'])==item['proof'] for item in prepared['witness']['retired']),
+                       'Recovered stage native/provenance changed')
+        indexed={row['id']:row for row in inventory['snapshots']}
+        compact={sid:{'native_sha256':digest(canonical(record['native'])),'snapshot':indexed[sid]} for sid,record in records.items()}
+        guards.require(compact==prepared['compact'],'Recovered stage compact bindings changed')
+        return prepared
+
+    def _copy_checkpoint_image(self,stage,profile):
+        head,marker,dbhead,committed=self._checkpoint_state();before=file_digest(self.database);started=time.monotonic();last=[started]
+        guards.require(shutil.disk_usage(self.root).free>=5*1024**3+2*self.database.stat().st_size+MAX_CHECKPOINT_BYTES+MAX_RECORD_BYTES,
+                       'Private source/image/journal reserve unavailable')
+        with contextlib.closing(sqlite3.connect(self.database.as_uri()+'?mode=ro',uri=True)) as source, \
+             contextlib.closing(sqlite3.connect(stage.catalog.database)) as target:
+            source.execute('PRAGMA busy_timeout=0');target.execute('PRAGMA journal_mode=DELETE');target.execute('PRAGMA synchronous=FULL')
+            def progress(status,remaining,total):
+                now=time.monotonic();profile['copy_step_interval_upper_max_seconds']=max(profile['copy_step_interval_upper_max_seconds'],now-last[0]);last[0]=now
+                guards.require(total*source.execute('PRAGMA page_size').fetchone()[0]<=MAX_STORE_BYTES,'Checkpoint image exceeds SQLite ceiling')
+            source.backup(target,pages=64,progress=progress,sleep=.001)
+        os.chmod(stage.catalog.database,0o600);profile['copy_seconds']+=time.monotonic()-started
+        current,current_marker,current_dbhead,current_committed=self._checkpoint_state();after=file_digest(self.database)
+        guards.require(marker==current_marker and current.get('checkpoint')==head.get('checkpoint'),'Checkpoint changed during private copy')
+        if current==head:guards.require(before==after,'Source bytes changed with unchanged head')
+        with contextlib.closing(sqlite3.connect(stage.catalog.database)) as db:
+            row=db.execute('SELECT sequence,chain FROM archives ORDER BY sequence DESC LIMIT 1').fetchone()
+            sequence,chain=row or (0,self._seed(current_dbhead))
+        if marker is not None:
+            guards.require((sequence,chain)==(current_dbhead['sequence'],current_dbhead['chain']),'Pending image differs from actual committed disposition')
+            captured=current_dbhead
+        else:
+            guards.require(sequence<=current['sequence'],'Snapshot is ahead of protected catalog head')
+            with runtime.lane_lock(self.lock),self._db() as db:
+                anchor=db.execute('SELECT chain FROM archives WHERE sequence=?',(sequence,)).fetchone()
+                guards.require((anchor[0] if anchor else self._seed(current))==chain,'Private copy is not a protected current prefix')
+            captured={**current,'sequence':sequence,'chain':chain}
+        runtime.atomic_json(stage.catalog.head,captured);stage.catalog._sync_db()
+        return current,current_marker,captured,current_committed,after
+
+    def _checkpoint_records(self,stage,head,profile):
+        started=time.monotonic()
+        with stage.catalog._db() as db:records=stage.catalog._scan(db,head)
+        profile['full_scan_seconds']+=time.monotonic()-started
+        return records
+
+    def _checkpoint_append(self,stage,captured,current,retired,records,profile):
+        guards.require(current.get('checkpoint')==captured.get('checkpoint') and current['sequence']>=captured['sequence'],'Checkpoint append epoch/prefix changed')
+        previous=captured['chain'];started=time.monotonic()
+        # One admitted record per source transaction. No source cursor or
+        # catalog lock spans the full copy/reseal/scan.
+        for sequence in range(captured['sequence']+1,current['sequence']+1):
+            with runtime.lane_lock(self.lock),self._db() as source:
+                anchor=source.execute('SELECT chain FROM archives WHERE sequence=?',(sequence-1,)).fetchone()
+                guards.require((anchor[0] if anchor else self._seed(current))==previous,'Captured source prefix changed')
+                row=source.execute('SELECT sequence,sid,token,record,body,chain FROM archives WHERE sequence=?',(sequence,)).fetchone()
+                guards.require(row is not None,'Checkpoint append missing');record=self._row(row)
+                guards.require(row[5]==digest(bytes.fromhex(previous)+row[3]),'Checkpoint appended chain differs')
+                logs=dict(source.execute('SELECT name,length(body) FROM logs WHERE sid=?',(row[1],)))
+            guards.require(record['generation']==self.binding['generation'] and record['projection']['source']==self.binding['source'] and
+                           record['repository']==self.binding['repository_paths'][record['lane']],'Foreign checkpoint append')
+            expected={item['file']:item for item in record['cached_logs']}
+            guards.require(set(logs)==set(expected) and all(type(size) is int and 0<=size<=MAX_FILE_BYTES for size in logs.values()),'Checkpoint append cached membership/size differs')
+            with stage.catalog._db(write=True) as target:
+                stage.catalog._allocation_limit(target);target.execute('BEGIN IMMEDIATE')
+                target.execute('INSERT INTO archives VALUES (?,?,?,?,?,?)',(sequence-len(retired),record['id'],record['token'],row[3],row[4],row[5]))
+                for name,size in logs.items():
+                    target.execute('INSERT INTO logs VALUES (?,?,zeroblob(?))',(record['id'],name,size))
+                    blobid=target.execute('SELECT rowid FROM logs WHERE sid=? AND name=?',(record['id'],name)).fetchone()[0];seal=hashlib.sha256()
+                    with target.blobopen('logs','body',blobid) as blob:
+                        for offset in range(0,size,1024*1024):
+                            # A source read transaction/catalog lock covers one
+                            # bounded chunk, never the entire admitted archive.
+                            with runtime.lane_lock(self.lock),self._db() as source:
+                                block=source.execute('SELECT substr(body,?,?) FROM logs WHERE sid=? AND name=?',(offset+1,min(1024*1024,size-offset),record['id'],name)).fetchone()
+                            guards.require(block is not None and isinstance(block[0],bytes) and len(block[0])==min(1024*1024,size-offset),'Checkpoint append blob changed/missing')
+                            seal.update(block[0]);blob.write(block[0])
+                    guards.require(seal.hexdigest()==expected[name]['compressed_sha256'],'Checkpoint append cached seal differs')
+                stage.catalog._allocation_check(target);target.commit()
+            guards.require(record['id'] not in records,'Duplicate appended staged identity');records[record['id']]=record
+            previous=row[5];del logs,row
+        guards.require(previous==current['chain'],'Checkpoint append final head differs')
+        profile['catchup_seconds']+=time.monotonic()-started
+
+    def _checkpoint_source_seal(self,records,retired,head):
+        """Prove the entire admitted source, in short per-row/chunk reads.
+
+        A changed raw DB cannot be excused solely by a legitimate appended
+        head: every historic body/record/blob must still match the private
+        sealed graph. No live read cursor/transaction spans this full pass.
+        """
+        before=file_digest(self.database);expected={**records,**{item['record']['id']:item['record'] for item in retired}}
+        for sid,record in expected.items():
+            with runtime.lane_lock(self.lock),self._db() as source:
+                row=source.execute('SELECT sequence,sid,token,record,body,chain FROM archives WHERE sid=?',(sid,)).fetchone()
+                guards.require(row is not None and self._row(row)==record,'Historic source record/body changed during append')
+                logs=dict(source.execute('SELECT name,length(body) FROM logs WHERE sid=?',(sid,)))
+            seals={item['file']:item['compressed_sha256'] for item in record['cached_logs']}
+            guards.require(set(logs)==set(seals),'Historic source cached set changed')
+            for name,size in logs.items():
+                guards.require(type(size) is int and 0<=size<=MAX_FILE_BYTES,'Historic source cached size differs');seal=hashlib.sha256()
+                for offset in range(0,size,1024*1024):
+                    with runtime.lane_lock(self.lock),self._db() as source:
+                        block=source.execute('SELECT substr(body,?,?) FROM logs WHERE sid=? AND name=?',(offset+1,min(1024*1024,size-offset),sid,name)).fetchone()
+                    guards.require(block is not None and isinstance(block[0],bytes) and len(block[0])==min(1024*1024,size-offset),'Historic source cached body missing')
+                    seal.update(block[0])
+                guards.require(seal.hexdigest()==seals[name],'Historic source cached body changed')
+        current,_,_,_=self._checkpoint_state();after=file_digest(self.database)
+        if current==head:guards.require(before==after,'Source bytes changed during complete accepted prefix verification')
+        return current,after
+
+    def _reseal_checkpoint_stage(self,stage,head,marker,records,frozen,profile):
+        started=time.monotonic();inputs=self._checkpoint_inputs()
+        proofs,inventory=self._retirement_evidence(records)
+        native_sha=__import__('retention').inventory_digest(inventory)
+        if marker is not None:
+            pending=decode(marker,MAX_CHECKPOINT_BYTES);witness=pending['witness'];nexthead=pending['next_head']
+            retired=witness['retired'];ids={item['record']['id'] for item in retired}
+            survivors=[record for record in records.values() if record['id'] not in ids]
+            self._reconstruct(witness,survivors)
+            guards.require(self._checkpoint_head(witness,survivors)==nexthead and native_sha==witness['native_inventory_sha256'] and
+                           all(proofs.get(item['record']['id'])==item['proof'] for item in retired),'Legacy pending exact authority differs')
+        else:
+            if frozen is None:
+                retired=[]
+                for sequence,record in enumerate(records.values(),1):
+                    if record['id'] not in proofs:continue
+                    item={'sequence':sequence,'record':record,'proof':proofs[record['id']]}
+                    if len(canonical(retired+[item]))>MAX_CHECKPOINT_BYTES//2 or len(retired)==256:break
+                    retired.append(item)
+            else:retired=frozen
+            ids={item['record']['id'] for item in retired};survivors=[record for record in records.values() if record['id'] not in ids]
+            guards.require(all(proofs.get(item['record']['id'])==item['proof'] for item in retired),'Frozen checkpoint retirement proof changed')
+            if not retired:return None
+            witness={'format':1,'operation':'native-verified-catalog-checkpoint','prior_head':head,'epoch':head.get('checkpoint',{}).get('epoch',0)+1,
+                     'retired':retired,'survivor_count':len(survivors),'survivors_sha256':self._records_digest(survivors),'native_inventory_sha256':native_sha}
+            witness['lineage_sha256']=digest(bytes.fromhex(head.get('checkpoint',{}).get('lineage_sha256',ZERO))+canonical(witness))
+            nexthead=self._checkpoint_head(witness,survivors)
+        guards.require(len(retired)<=256 and len(records)<=MAX_RECORDS,'Checkpoint image membership exceeds limits')
+        compact={}
+        indexed={row['id']:row for row in inventory['snapshots']}
+        for record in survivors:
+            row=indexed.get(record['id']);guards.require(row is not None,'Staged survivor is not current native identity')
+            compact[record['id']]={'native_sha256':digest(canonical(record['native'])),'snapshot':row}
+        with stage.catalog._db(write=True) as db:self._checkpoint_insert(db,witness,survivors,nexthead,catalog=stage.catalog)
+        runtime.atomic_json(stage.catalog.head,nexthead)
+        after=self._checkpoint_inputs();journals={'base/state.json','binlog/state.json'}
+        guards.require({k:v for k,v in after.items() if k not in journals}=={k:v for k,v in inputs.items() if k not in journals},
+                       'Retirement/init authority changed during private reseal')
+        profile['reseal_seconds']+=time.monotonic()-started
+        return {'witness':witness,'next_head':nexthead,'compact':compact,'authority':inputs,'native_sha256':native_sha}
+
+    def _prepare_checkpoint_stage(self,stage,reconcile,profile):
+        head,marker,captured,committed,source_sha=self._copy_checkpoint_image(stage,profile)
+        guards.require(marker is None or reconcile,'Existing checkpoint requires explicit read-only reconciliation')
+        records=self._checkpoint_records(stage,captured,profile);frozen=None;retired=[]
+        for turn in range(4):
+            current,current_marker,dbhead,current_committed=self._checkpoint_state()
+            guards.require(current_marker==marker,'Pending changed during preparation')
+            if marker is None and current!=captured:
+                self._checkpoint_append(stage,captured,current,retired,records,profile);captured=current
+            # A compact overlay restores original retired rows without copying
+            # payload/manifest graphs; the staged DB itself keeps only survivors.
+            original={}
+            iterator=iter(records.values());removed={item['sequence']:item['record'] for item in retired}
+            for sequence in range(1,captured['sequence']+1):original[sequence]=removed.get(sequence) or next(iterator)
+            ordered={record['id']:record for record in original.values()};del original
+            inputs=self._checkpoint_inputs()
+            try:prepared=self._reseal_checkpoint_stage(stage,captured,marker,ordered,frozen,profile)
+            except CheckpointArrival:
+                new_head,new_marker,_,_=self._checkpoint_state();after=self._checkpoint_inputs();journals={'base/state.json','binlog/state.json'}
+                guards.require(marker is None and new_marker is None and new_head.get('checkpoint')==captured.get('checkpoint') and new_head['sequence']>captured['sequence'] and
+                               {k:v for k,v in after.items() if k not in journals}=={k:v for k,v in inputs.items() if k not in journals},
+                               'Unknown native arrival lacks unchanged authenticated admission prefix')
+                del ordered
+                continue
+            del ordered,records
+            if prepared is None:return None
+            records=self._checkpoint_records(stage,prepared['next_head'],profile)
+            retired=prepared['witness']['retired'];frozen=retired
+            sealing=time.monotonic();new_head,new_sha=self._checkpoint_source_seal(records,[] if committed else retired,current)
+            profile['source_seal_seconds']+=time.monotonic()-sealing
+            observed,new_marker,new_dbhead,new_committed=self._checkpoint_state()
+            guards.require(observed==new_head,'Source advanced during final preparation seal')
+            if new_head==current and new_marker==marker:
+                # The accepted snapshot must not conceal same-head content drift.
+                if current==head:guards.require(new_sha==source_sha,'Source content changed with unchanged independent head')
+                guards.require(self._checkpoint_inputs()==prepared['authority'],'Prepared authority drifted')
+                stage.catalog._sync_db();stage_sha=file_digest(stage.catalog.database)
+                value={**prepared,'source_head':new_head,'source_sha256':new_sha,'pending_sha256':digest(marker) if marker is not None else None,
+                       'stage_sha256':stage_sha,'source':self.worker.source,'code_sha':self.worker.c['code_sha'],'already_committed':new_committed}
+                profile['authority_bytes']=sum(safe(self.receipts/path).stat().st_size for path in prepared['authority'])
+                profile['authority_files']=len(prepared['authority'])
+                runtime.atomic_json(stage.manifest,value);value['manifest_sha256']=file_digest(stage.manifest)
+                del records
+                return value
+            guards.require(marker is None and new_marker is None,'Fixed pending cannot absorb a new arrival')
+            head=current;source_sha=new_sha
+        raise guards.GuardError('Minute arrivals outran bounded stage catch-up; live catalog unchanged')
+
+    def _final_checkpoint_native(self,prepared,deadline):
+        import retention,restic_adapter
+        at=dt.datetime.now(dt.timezone.utc);snapshots=[];tokens=set();seen=set();repositories={}
+        for lane in ('base','binlog'):
+            repo=self.worker.c['repositories'][lane]
+            def read(args):
+                _check_deadline(deadline);result=self.worker.restic(lane,['--repo',repo,*args],timeout=deadline-time.monotonic());_check_deadline(deadline);return result
+            config=decode(read(['cat','config']));init=decode(read_file(self.receipts/('init-'+lane+'.json'),MAX_RECORD_BYTES))
+            guards.require(config['version']==2 and config['id']==init['repository_id'] and init['generation']==self.binding['generation'],'Final staged repository differs')
+            repositories[lane]=config['id'];listed=restic_adapter.strict_json(read(['snapshots','--json']))
+            guards.require(isinstance(listed,list) and len(listed)<=MAX_RECORDS,'Complete native staged authority required')
+            for metadata in listed:
+                _check_deadline(deadline);sid=guards.hex_id(metadata['id'],64);item=prepared['compact'].get(sid)
+                guards.require(item is not None and sid not in seen,'Unknown final arrival or duplicate native ID')
+                native,token,rawsha=native_identity(metadata,sid,str(self.worker.root/'spool'/(lane+'-payload')),self.binding['generation'])
+                row=item['snapshot']
+                guards.require(row['lane']==lane and token==row['token'] and rawsha==row['manifest_sha256'] and digest(canonical(native))==item['native_sha256'] and
+                               guards.utc(row['time'])<=guards.utc(native['time'])<=at and token not in tokens,'Final native staged identity differs')
+                tokens.add(token);seen.add(sid);snapshots.append(row)
+            del listed
+        guards.require(seen==set(prepared['compact']) and retention.inventory_digest({'generation':self.binding['generation'],'repositories':repositories,'snapshots':snapshots})==prepared['native_sha256'],
+                       'Final complete native set differs from checked dependencies')
+
+    def _publish_checkpoint_stage(self,stage,prepared,profile):
+        import retention_cohort
+        started=time.monotonic();work=started+45;hard=started+retention_cohort.MAX_CRITICAL_SECONDS;oldfd=None
+        try:
+            with retention_cohort.upload_section(self.worker),runtime.lane_lock(self.lock):
+                retention_cohort.ready_uploads(self.worker);self._layout()
+                guards.require(not self.pending.exists() and self._head()==prepared['source_head'] and self.worker.source==prepared['source'],'Source/head changed before image activation')
+                guards.require(self.worker.c['code_sha']==prepared['code_sha'] and self.worker.c['generation']==self.binding['generation'] and
+                               self.worker.c['repositories']==self.binding['repository_paths'],'Prepared code/generation/repositories changed')
+                raw=read_file(self.checkpoint_pending,MAX_CHECKPOINT_BYTES) if self.checkpoint_pending.exists() else None
+                guards.require((digest(raw) if raw is not None else None)==prepared['pending_sha256'],'Exact pending changed')
+                for suffix in ('-journal','-wal','-shm'):
+                    guards.require(not pathlib.Path(str(self.database)+suffix).exists() and not pathlib.Path(str(stage.catalog.database)+suffix).exists(),'SQLite handle/sidecar publication unfinished')
+                hashed=time.monotonic()
+                guards.require(file_digest(self.database,work)==prepared['source_sha256'] and file_digest(stage.catalog.database,work)==prepared['stage_sha256'] and
+                               file_digest(stage.manifest,work)==prepared['manifest_sha256'],'Source/stage raw bytes changed')
+                guards.require(self._checkpoint_inputs(work)==prepared['authority'],'Complete retirement authority set/bytes changed')
+                profile['hash_seconds']+=time.monotonic()-hashed
+                native=time.monotonic();self._final_checkpoint_native(prepared,work);profile['final_native_seconds']+=time.monotonic()-native
+                guards.require(shutil.disk_usage(self.root).free>=5*1024**3+2*max(self.database.stat().st_size,stage.catalog.database.stat().st_size)+MAX_CHECKPOINT_BYTES+MAX_RECORD_BYTES,
+                               'Final staged image/journal reserve exceeded')
+                _check_deadline(work);promotion=time.monotonic()
+                if os.name=='posix':oldfd=os.open(safe(self.database),os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))
+                if raw is None:runtime.atomic_json(self.checkpoint_pending,{'witness':prepared['witness'],'next_head':prepared['next_head']})
+                _check_deadline(hard)
+                runtime.atomic_json(self.receipts/'catalog-checkpoint-stage.json',{'token':stage.root.name,'manifest_sha256':prepared['manifest_sha256'],
+                                    'pending_sha256':file_digest(self.checkpoint_pending,hard)})
+                if not prepared['already_committed']:
+                    guards.require(self.database.stat().st_dev==stage.catalog.database.stat().st_dev,'Cross-filesystem image replacement prohibited')
+                    os.replace(safe(stage.catalog.database),self.database);runtime.directory_sync(self.root)
+                _check_deadline(hard);runtime.atomic_json(self.head,prepared['next_head']);_check_deadline(hard)
+                self.checkpoint_pending.unlink();runtime.directory_sync(self.root);_check_deadline(hard)
+        finally:
+            if 'promotion' in locals():profile['promotion_seconds']+=time.monotonic()-promotion
+            elapsed=time.monotonic()-started;profile['critical_seconds']=elapsed;profile['critical_max_seconds']=elapsed
+            # Retaining only a plain POSIX fd defers large inode cleanup; no
+            # SQLite connection is held at activation. Windows holds no fd.
+            cleanup=time.monotonic()
+            if oldfd is not None:os.close(oldfd)
+            profile['outside_cleanup_seconds']+=time.monotonic()-cleanup
+            self.last_checkpoint_timing=dict(profile)
+            guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual catalog checkpoint continuous lock limit exceeded')
+
+    def checkpoint(self,*,reconcile=False):
+        profile={key:0.0 for key in ('copy_seconds','copy_step_interval_upper_max_seconds','catchup_seconds','reseal_seconds','full_scan_seconds','source_seal_seconds','hash_seconds','final_native_seconds','promotion_seconds','outside_cleanup_seconds','critical_seconds','critical_max_seconds','authority_bytes','authority_files')}
+        stage=None;prior_stage=None
+        with runtime.lane_lock(self.receipts/'retention-apply.lock'):
+            try:
+                recovered=self._checkpoint_stage_reference(reconcile)
+                if recovered:
+                    stage,prepared=recovered
+                    if prepared is None:
+                        prior_stage=stage;stage=CheckpointStage(self);prepared=self._prepare_checkpoint_stage(stage,reconcile,profile)
+                    else:prepared=self._revalidate_checkpoint_stage(stage,prepared,profile)
+                else:
+                    stage=CheckpointStage(self);prepared=self._prepare_checkpoint_stage(stage,reconcile,profile)
+                if prepared is None:return {'retired_ids':[],'head':self._head(),'phase_seconds':profile}
+                profile['authority_bytes']=sum(safe(self.receipts/path).stat().st_size for path in prepared['authority'])
+                profile['authority_files']=len(prepared['authority'])
+                self._publish_checkpoint_stage(stage,prepared,profile)
+                result={'retired_ids':sorted(item['record']['id'] for item in prepared['witness']['retired']),'head':prepared['next_head']}
+            finally:
+                # A pending attempt keeps every owned artifact for explicit
+                # read-only recovery. Never reset/clear an uncertain checkpoint.
+                pointer=self.receipts/'catalog-checkpoint-stage.json'
+                referenced=False
+                if pointer.exists():
+                    value=decode(read_file(pointer,MAX_RECORD_BYTES),MAX_RECORD_BYTES);referenced=stage is not None and value.get('token')==stage.root.name
+                if stage is not None and (not self.checkpoint_pending.exists() or not referenced):
+                    started=time.monotonic();stage.cleanup();profile['outside_cleanup_seconds']+=time.monotonic()-started
+                    if referenced:pointer.unlink();runtime.directory_sync(self.receipts)
+                if prior_stage is not None and (not pointer.exists() or runtime.load_json(pointer)['token']!=prior_stage.root.name):
+                    started=time.monotonic();prior_stage.cleanup();profile['outside_cleanup_seconds']+=time.monotonic()-started
+                self.last_checkpoint_timing=dict(profile)
+        return {**result,'phase_seconds':dict(profile)}
 
     def _checkpoint_head(self,witness,survivors,*,deadline=None):
         seed=digest(canonical(witness));chain=seed
@@ -656,10 +961,11 @@ class ArchiveCatalog:
         return {**self.binding,'sequence':len(survivors),'chain':chain,
                 'checkpoint':{'epoch':witness['epoch'],'sha256':seed,'lineage_sha256':witness['lineage_sha256']}}
 
-    def _checkpoint_insert(self,db,witness,survivors,nexthead,*,deadline=None):
+    def _checkpoint_insert(self,db,witness,survivors,nexthead,*,deadline=None,catalog=None):
+        target=catalog or self
         try:
             _check_deadline(deadline)
-            self._allocation_limit(db);db.execute('BEGIN IMMEDIATE')
+            target._allocation_limit(db);db.execute('BEGIN IMMEDIATE')
             for item in witness['retired']:
                 _check_deadline(deadline)
                 sid=item['record']['id'];db.execute('DELETE FROM logs WHERE sid=?',(sid,));db.execute('DELETE FROM archives WHERE sid=?',(sid,))
@@ -671,11 +977,10 @@ class ArchiveCatalog:
             _check_deadline(deadline)
             db.execute('CREATE TABLE IF NOT EXISTS catalog_checkpoint (slot INTEGER PRIMARY KEY CHECK(slot=1), record BLOB NOT NULL)')
             db.execute('INSERT OR REPLACE INTO catalog_checkpoint VALUES(1,?)',(canonical(witness),))
-            self._allocation_check(db);_check_deadline(deadline);db.commit();_check_deadline(deadline)
+            target._allocation_check(db);_check_deadline(deadline);db.commit();_check_deadline(deadline)
         except (sqlite3.Error,guards.GuardError) as error:
             db.rollback()
             if isinstance(error,CatalogCapacityError) or getattr(error,'sqlite_errorcode',None)==sqlite3.SQLITE_FULL:
                 raise CatalogCapacityError('Catalog checkpoint allocation refused; prior sealed data preserved') from error
             raise
-        _check_deadline(deadline);self._sync_db();_check_deadline(deadline)
-        self._scan(db,nexthead,deadline=deadline);_check_deadline(deadline)
+        _check_deadline(deadline);target._sync_db();_check_deadline(deadline)
