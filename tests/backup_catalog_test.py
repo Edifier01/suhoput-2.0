@@ -304,11 +304,23 @@ class WorkerAdmissionTests(unittest.TestCase):
         self.assertFalse(any(cmd[0]=='restore' for cmd in commands))
 
 class CatalogLifecycleTests(unittest.TestCase):
-    def test_page_backup_permits_real_concurrent_catalog_writer_and_retains_arrival(self):
+    def test_source_copy_permits_writer_across_active_steps_or_chunks_without_join_pause(self):
         self.manifest['padding']=os.urandom(400000).hex();self.refresh()
-        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32)
+        for number in range(12,22):self.put(format(number,'064x'),format(number+10,'032x'))
+        self.prove_absence(SID);self.manifest.pop('padding');self.refresh()
         with contextlib.closing(sqlite3.connect(self.c.database)) as db:self.assertGreater(db.execute('PRAGMA page_count').fetchone()[0],128)
-        connect=sqlite3.connect;written=[];failures=[];remaining_at_write=[]
+        connect=sqlite3.connect;openfd=os.open;fdopen=os.fdopen;source_fds=set();written=[];failures=[];active=[];started=[];copying=[False];writes_during_copy=[]
+        def write():
+            for number in range(24,29):
+                try:
+                    self.put(format(number,'064x'),format(number+10,'032x'));written.append(number)
+                    if copying[0]:writes_during_copy.append(number)
+                except Exception as error:failures.append(error)
+        thread=threading.Thread(target=write)
+        def continue_copy():
+            if not started:started.append(True);thread.start()
+            else:active.append(True)
         class OnlineCopy:
             def __init__(proxy,db):proxy.db=db
             def __getattr__(proxy,name):return getattr(proxy.db,name)
@@ -316,21 +328,92 @@ class CatalogLifecycleTests(unittest.TestCase):
                 callback=kwargs['progress']
                 def progress(*args):
                     callback(*args)
-                    if written:return
-                    remaining_at_write.append(args[1]);self.assertGreater(args[1],0,'Writer must interleave before online copy completes')
-                    written.append('attempted')
-                    def write():
-                        try:self.put('6'*64,'7'*32)
-                        except Exception as error:failures.append(error)
-                    thread=threading.Thread(target=write);thread.start();thread.join(5)
-                    self.assertFalse(thread.is_alive(),'Backup step retained a source SQLite/catalog lock')
-                return proxy.db.backup(target,**{**kwargs,'progress':progress})
+                    if args[1]>0:continue_copy()
+                copying[0]=True;result=proxy.db.backup(target,**{**kwargs,'progress':progress});copying[0]=False
+                if started:thread.join(10)
+                return result
+        class RawCopy:
+            def __init__(proxy,file):proxy.file=file
+            def __getattr__(proxy,name):return getattr(proxy.file,name)
+            def __enter__(proxy):proxy.file.__enter__();copying[0]=True;return proxy
+            def __exit__(proxy,*args):
+                result=proxy.file.__exit__(*args);copying[0]=False
+                if started:thread.join(10)
+                return result
+            def read(proxy,size):
+                value=proxy.file.read(size)
+                if value:continue_copy()
+                return value
         def connection(path,*args,**kwargs):
             db=connect(path,*args,**kwargs)
             return OnlineCopy(db) if str(path)==self.c.database.as_uri()+'?mode=ro' else db
-        with mock.patch('backup_catalog.sqlite3.connect',side_effect=connection):result=self.c.checkpoint()
-        self.assertEqual(failures,[]);self.assertEqual(result['retired_ids'],[SID]);self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
-        self.assertTrue(remaining_at_write)
+        def open_file(path,*args,**kwargs):
+            fd=openfd(path,*args,**kwargs)
+            if pathlib.Path(path)==self.c.database:source_fds.add(fd)
+            return fd
+        def stream(fd,mode,*args,**kwargs):
+            file=fdopen(fd,mode,*args,**kwargs)
+            return RawCopy(file) if fd in source_fds and mode=='rb' else file
+        result=None;failure=None
+        with mock.patch('backup_catalog.sqlite3.connect',side_effect=connection),mock.patch('backup_catalog.os.open',side_effect=open_file),mock.patch('backup_catalog.os.fdopen',side_effect=stream):
+            try:result=self.c.checkpoint()
+            except guards.GuardError as error:failure=error
+        self.assertFalse(thread.is_alive());self.assertTrue(active,'Actor must overlap continuing copy; callbacks cannot join/pause it')
+        self.assertEqual(failures,[]);self.assertEqual(written,list(range(24,29)));self.assertFalse(self.c.pending.exists())
+        self.assertTrue(writes_during_copy,'At least one genuine admission must complete while copying remains active')
+        self.assertIsNone(failure);self.assertEqual(result['retired_ids'],[SID]);self.assertTrue({format(n,'064x') for n in written}<=set(self.c.entries()))
+        self.assertGreaterEqual(result['phase_seconds']['copy_attempts'],2,'Changed initial bytes require a fresh exact image')
+    def test_initial_raw_copy_mixed_bytes_identity_pending_or_sidecar_drift_cannot_publish(self):
+        for change in ('stage','stage_with_arrival','source','path','path_with_arrival','journal','legacy_pending'):
+            if change!='stage':self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+            if change=='legacy_pending':self.legacy_pending()
+            head=[self.c.head.read_bytes()];database=[self.c.database.read_bytes()];raw_copy=self.c._raw_checkpoint_copy;calls=[]
+            def mutate(stage,*args,**kwargs):
+                value=raw_copy(stage,*args,**kwargs);calls.append(True)
+                if change in ('stage','stage_with_arrival'):
+                    stage.catalog.database.write_bytes(stage.catalog.database.read_bytes()+b'mixed')
+                    if change=='stage_with_arrival':self.put('6'*64,'7'*32);head[0]=self.c.head.read_bytes();database[0]=self.c.database.read_bytes()
+                elif change=='source':
+                    with contextlib.closing(sqlite3.connect(self.c.database)) as db:
+                        with db:db.execute('PRAGMA user_version=48')
+                elif change in ('path','path_with_arrival'):
+                    replacement=self.c.root/'replacement.sqlite';replacement.write_bytes(self.c.database.read_bytes());os.chmod(replacement,0o600);os.replace(replacement,self.c.database)
+                    if change=='path_with_arrival':self.put('6'*64,'7'*32);head[0]=self.c.head.read_bytes();database[0]=self.c.database.read_bytes()
+                elif change=='journal':
+                    journal=pathlib.Path(str(self.c.database)+'-journal');journal.write_bytes(b'unknown active transaction');os.chmod(journal,0o600)
+                else:self.c.checkpoint_pending.write_bytes(self.c.checkpoint_pending.read_bytes()+b' ')
+                return value
+            with self.subTest(change=change):
+                with mock.patch.object(self.c,'_raw_checkpoint_copy',side_effect=mutate),self.assertRaises(guards.GuardError):self.c.checkpoint(reconcile=change=='legacy_pending')
+                self.assertEqual(len(calls),1);self.assertEqual(self.c.head.read_bytes(),head[0])
+                self.assertEqual(self.c.checkpoint_pending.exists(),change=='legacy_pending')
+                if change!='source':self.assertEqual(self.c.database.read_bytes(),database[0])
+    def test_copy_components_charge_failed_authenticated_attempt_outside_lock_deadline(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        raw_copy=self.c._raw_checkpoint_copy;elapsed=[0.0];changed=[]
+        def drift(*args,**kwargs):
+            value=raw_copy(*args,**kwargs)
+            if not changed:self.put('6'*64,'7'*32);changed.append(True);elapsed[0]+=65
+            return value
+        with mock.patch.object(self.c,'_raw_checkpoint_copy',side_effect=drift),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]):result=self.c.checkpoint()
+        self.assertEqual(result['phase_seconds']['copy_attempts'],2);self.assertGreaterEqual(result['phase_seconds']['copy_seconds'],65)
+        self.assertLessEqual(result['phase_seconds']['critical_max_seconds'],55);self.assertEqual(set(self.c.entries()),{'4'*64,'6'*64})
+    def test_copy_fsync_corruption_before_source_drift_observation_blocks_without_recapture(self):
+        self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+        openfd=os.open;fsync=os.fsync;targets={};corrupted=[];head=[];database=[];raw_copy=self.c._raw_checkpoint_copy;attempts=[]
+        def opened(path,*args,**kwargs):
+            fd=openfd(path,*args,**kwargs)
+            if 'catalog-preparations' in pathlib.Path(path).parts and pathlib.Path(path).name=='index.sqlite3':targets[fd]=pathlib.Path(path)
+            return fd
+        def synced(fd):
+            fsync(fd)
+            if fd in targets and not corrupted:
+                with targets[fd].open('ab') as file:file.write(b'independent target corruption')
+                corrupted.append(True);self.put('6'*64,'7'*32);head.append(self.c.head.read_bytes());database.append(self.c.database.read_bytes())
+        def copy(*args,**kwargs):attempts.append(True);return raw_copy(*args,**kwargs)
+        with mock.patch.object(self.c,'_raw_checkpoint_copy',side_effect=copy),mock.patch('backup_catalog.os.open',side_effect=opened),mock.patch('backup_catalog.os.fsync',side_effect=synced),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        self.assertEqual(len(attempts),1);self.assertTrue(corrupted);self.assertEqual(self.c.head.read_bytes(),head[0]);self.assertEqual(self.c.database.read_bytes(),database[0]);self.assertFalse(self.c.checkpoint_pending.exists())
     def test_slow_preparation_catches_multiple_minute_arrivals_without_recopy_or_pending(self):
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
         elapsed=[0.0];original=self.c._checkpoint_insert;calls=[];copy=self.c._copy_checkpoint_image
@@ -545,10 +628,14 @@ class CatalogLifecycleTests(unittest.TestCase):
     def test_inode_close_is_outside_locks_only_on_posix_and_replace_cost_is_charged(self):
         import retention_cohort
         self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
-        opened=[];closed=[];openfd=os.open;closefd=os.close;replace=os.replace;elapsed=[0.0]
+        opened=[];closed=[];openfd=os.open;closefd=os.close;replace=os.replace;elapsed=[0.0];publishing=[False];publish=self.c._publish_checkpoint_stage
+        def publication(*args,**kwargs):
+            publishing[0]=True
+            try:return publish(*args,**kwargs)
+            finally:publishing[0]=False
         def open_file(path,*args,**kwargs):
             fd=openfd(path,*args,**kwargs)
-            if pathlib.Path(path)==self.c.database:opened.append(fd)
+            if pathlib.Path(path)==self.c.database and publishing[0]:opened.append(fd)
             return fd
         def close_file(fd):
             if fd in opened:
@@ -557,7 +644,7 @@ class CatalogLifecycleTests(unittest.TestCase):
         def slow(path,target):
             replace(path,target)
             if pathlib.Path(target)==self.c.database:elapsed[0]+=60
-        with mock.patch('backup_catalog.os.open',side_effect=open_file),mock.patch('backup_catalog.os.close',side_effect=close_file),mock.patch('backup_catalog.os.replace',side_effect=slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
+        with mock.patch.object(self.c,'_publish_checkpoint_stage',side_effect=publication),mock.patch('backup_catalog.os.open',side_effect=open_file),mock.patch('backup_catalog.os.close',side_effect=close_file),mock.patch('backup_catalog.os.replace',side_effect=slow),mock.patch('time.monotonic',side_effect=lambda:elapsed[0]),self.assertRaises(guards.GuardError):self.c.checkpoint()
         self.assertEqual(len(opened),1 if os.name=='posix' else 0);self.assertEqual(closed,['all-four-free'] if os.name=='posix' else [])
         self.assertEqual(self.c.last_checkpoint_timing['critical_max_seconds'],60);self.assertEqual(self.c.last_checkpoint_timing['promotion_seconds'],60)
         self.assertTrue(self.c.checkpoint_pending.exists());self.c.checkpoint(reconcile=True);self.assertEqual(set(self.c.entries()),{'4'*64})

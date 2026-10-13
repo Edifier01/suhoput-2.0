@@ -45,6 +45,9 @@ class CatalogCapacityError(guards.GuardError):
 class CheckpointArrival(guards.GuardError):
     """A native member was not in the private prefix; admit-chain catch-up only."""
 
+class CheckpointCopyCorrupt(guards.GuardError):
+    """Owned stream/readback differs; an appended head cannot excuse it."""
+
 def canonical(value):
     return json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
 
@@ -627,7 +630,7 @@ class ArchiveCatalog:
                 committed=row is not None and digest(row[0])==nexthead['checkpoint']['sha256']
                 dbhead=nexthead if committed else prior
             self._tail(db,dbhead)
-            guards.require(not pathlib.Path(str(self.database)+'-journal').exists() and not pathlib.Path(str(self.database)+'-wal').exists(),'Live SQLite sidecar blocks image publication')
+            guards.require(all(not pathlib.Path(str(self.database)+suffix).exists() for suffix in ('-journal','-wal','-shm')),'Live SQLite sidecar blocks image publication')
             return head,raw,dbhead,committed
 
     def _checkpoint_stage_reference(self,reconcile):
@@ -674,35 +677,85 @@ class ArchiveCatalog:
         guards.require(compact==prepared['compact'],'Recovered stage compact bindings changed')
         return prepared
 
+    @staticmethod
+    def _copy_stat(value):
+        return (value.st_dev,value.st_ino,value.st_nlink,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+
+    def _raw_checkpoint_copy(self,stage,identity,profile):
+        """One ordinary protected FD, no source SQLite read-lock interval."""
+        seal=hashlib.sha256();remaining=identity[3]
+        sourcefd=os.open(safe(self.database),os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))
+        with os.fdopen(sourcefd,'rb') as source:
+            fd_identity=self._copy_stat(os.fstat(source.fileno()))
+            # Windows path/fd ctime representations differ. Bind path ctime
+            # and fd ctime independently; all other identity fields join.
+            guards.require(fd_identity[:-1]==identity[:-1],'Copy source FD identity changed')
+            targetfd=os.open(stage.catalog.database,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o600)
+            with os.fdopen(targetfd,'wb') as target:
+                while remaining:
+                    chunk=time.monotonic();block=source.read(min(1024*1024,remaining))
+                    guards.require(block and len(block)<=min(1024*1024,remaining),'Copy source size changed')
+                    target.write(block);seal.update(block);remaining-=len(block)
+                    interval=time.monotonic()-chunk
+                    profile['copy_step_interval_upper_max_seconds']=max(profile['copy_step_interval_upper_max_seconds'],interval)
+                    profile['copy_chunk_max_seconds']=max(profile['copy_chunk_max_seconds'],interval)
+                extra=len(source.read(1))
+                target.flush();os.fsync(target.fileno())
+            fd_after=self._copy_stat(os.fstat(source.fileno()));path_after=self._copy_stat(safe(self.database).stat())
+        os.chmod(stage.catalog.database,0o600);runtime.directory_sync(stage.catalog.root)
+        # Return measured identity observations together with stream SHA. A
+        # source drift cannot hide independent target corruption before retry.
+        return {'sha256':seal.hexdigest(),'fd_before':fd_identity,'fd_after':fd_after,'path_after':path_after,'extra_bytes':extra}
+
     def _copy_checkpoint_image(self,stage,profile):
-        head,marker,dbhead,committed=self._checkpoint_state();before=file_digest(self.database);started=time.monotonic();last=[started]
-        guards.require(shutil.disk_usage(self.root).free>=5*1024**3+2*self.database.stat().st_size+MAX_CHECKPOINT_BYTES+MAX_RECORD_BYTES,
-                       'Private source/image/journal reserve unavailable')
-        with contextlib.closing(sqlite3.connect(self.database.as_uri()+'?mode=ro',uri=True)) as source, \
-             contextlib.closing(sqlite3.connect(stage.catalog.database)) as target:
-            source.execute('PRAGMA busy_timeout=0');target.execute('PRAGMA journal_mode=DELETE');target.execute('PRAGMA synchronous=FULL')
-            def progress(status,remaining,total):
-                now=time.monotonic();profile['copy_step_interval_upper_max_seconds']=max(profile['copy_step_interval_upper_max_seconds'],now-last[0]);last[0]=now
-                guards.require(total*source.execute('PRAGMA page_size').fetchone()[0]<=MAX_STORE_BYTES,'Checkpoint image exceeds SQLite ceiling')
-            source.backup(target,pages=64,progress=progress,sleep=.001)
-        os.chmod(stage.catalog.database,0o600);profile['copy_seconds']+=time.monotonic()-started
-        current,current_marker,current_dbhead,current_committed=self._checkpoint_state();after=file_digest(self.database)
-        guards.require(marker==current_marker and current.get('checkpoint')==head.get('checkpoint'),'Checkpoint changed during private copy')
-        if current==head:guards.require(before==after,'Source bytes changed with unchanged head')
-        with contextlib.closing(sqlite3.connect(stage.catalog.database)) as db:
-            row=db.execute('SELECT sequence,chain FROM archives ORDER BY sequence DESC LIMIT 1').fetchone()
-            sequence,chain=row or (0,self._seed(current_dbhead))
-        if marker is not None:
-            guards.require((sequence,chain)==(current_dbhead['sequence'],current_dbhead['chain']),'Pending image differs from actual committed disposition')
-            captured=current_dbhead
-        else:
-            guards.require(sequence<=current['sequence'],'Snapshot is ahead of protected catalog head')
-            with runtime.lane_lock(self.lock),self._db() as db:
-                anchor=db.execute('SELECT chain FROM archives WHERE sequence=?',(sequence,)).fetchone()
-                guards.require((anchor[0] if anchor else self._seed(current))==chain,'Private copy is not a protected current prefix')
-            captured={**current,'sequence':sequence,'chain':chain}
-        runtime.atomic_json(stage.catalog.head,captured);stage.catalog._sync_db()
-        return current,current_marker,captured,current_committed,after
+        journals={'base/state.json','binlog/state.json'}
+        for attempt in range(4):
+            head,marker,dbhead,committed=self._checkpoint_state();inputs=self._checkpoint_inputs();identity=self._copy_stat(safe(self.database).stat())
+            guards.require(identity[3]<=MAX_STORE_BYTES and shutil.disk_usage(self.root).free>=5*1024**3+2*identity[3]+MAX_CHECKPOINT_BYTES+MAX_RECORD_BYTES,
+                           'Private source/image/journal reserve unavailable')
+            profile['copy_attempts']=attempt+1
+            copied=None
+            try:
+                hashed=time.monotonic()
+                try:before=file_digest(self.database)
+                finally:profile['copy_hash_seconds']+=time.monotonic()-hashed
+                copying=time.monotonic()
+                try:copied=self._raw_checkpoint_copy(stage,identity,profile)
+                finally:profile['copy_seconds']+=time.monotonic()-copying
+                hashed=time.monotonic()
+                try:
+                    try:staged=file_digest(stage.catalog.database)
+                    except guards.GuardError as error:raise CheckpointCopyCorrupt('Owned copied image readback failed') from error
+                    if staged!=copied['sha256']:raise CheckpointCopyCorrupt('Owned copied bytes differ from fsynced readback')
+                    after=file_digest(self.database)
+                finally:profile['copy_hash_seconds']+=time.monotonic()-hashed
+                current,current_marker,current_dbhead,current_committed=self._checkpoint_state()
+                guards.require(before==copied['sha256']==staged==after and copied['fd_before']==copied['fd_after'] and copied['path_after']==identity and copied['extra_bytes']==0 and
+                               self._copy_stat(safe(self.database).stat())==identity and
+                               (current,current_marker,current_dbhead,current_committed)==(head,marker,dbhead,committed) and self._checkpoint_inputs()==inputs,
+                               'Initial source/image byte seals or fixed state changed')
+            except CheckpointCopyCorrupt:raise
+            except guards.GuardError:
+                if stage.catalog.database.exists():
+                    if copied is None:raise CheckpointCopyCorrupt('Unsealed target cannot authorize source-drift retry')
+                    try:staged=file_digest(stage.catalog.database)
+                    except guards.GuardError as error:raise CheckpointCopyCorrupt('Retry target readback failed') from error
+                    if staged!=copied['sha256']:raise CheckpointCopyCorrupt('Retry target differs from measured stream')
+                guards.require(self._copy_stat(safe(self.database).stat())[:3]==identity[:3],
+                               'Source device/inode/link replacement is not admitted append drift')
+                current,current_marker,_,_=self._checkpoint_state();now=self._checkpoint_inputs()
+                guards.require(marker is None and current_marker is None and current.get('checkpoint')==head.get('checkpoint') and current['sequence']>head['sequence'] and
+                               {k:v for k,v in now.items() if k not in journals}=={k:v for k,v in inputs.items() if k not in journals},
+                               'Copy drift lacks unchanged authenticated admitted prefix')
+                with runtime.lane_lock(self.lock),self._db() as source:
+                    anchor=source.execute('SELECT chain FROM archives WHERE sequence=?',(head['sequence'],)).fetchone()
+                    guards.require((anchor[0] if anchor else self._seed(head))==head['chain'],'Copy drift changed original protected prefix')
+                guards.require(attempt<3,'Minute arrivals outran bounded initial byte copy')
+                stage.check_layout()
+                if stage.catalog.database.exists():safe(stage.catalog.database).unlink()
+                continue
+            runtime.atomic_json(stage.catalog.head,dbhead);stage.catalog._sync_db()
+            return head,marker,dbhead,committed,after
 
     def _checkpoint_records(self,stage,head,profile):
         started=time.monotonic()
@@ -946,7 +999,7 @@ class ArchiveCatalog:
             guards.require(elapsed<=retention_cohort.MAX_CRITICAL_SECONDS,'Actual catalog checkpoint continuous lock limit exceeded')
 
     def checkpoint(self,*,reconcile=False):
-        profile={key:0.0 for key in ('copy_seconds','copy_step_interval_upper_max_seconds','catchup_seconds','reseal_seconds','full_scan_seconds','source_seal_seconds','hash_seconds','final_native_seconds','promotion_seconds','outside_cleanup_seconds','critical_seconds','critical_max_seconds','authority_bytes','authority_files')}
+        profile={key:0.0 for key in ('copy_seconds','copy_hash_seconds','copy_step_interval_upper_max_seconds','copy_chunk_max_seconds','copy_attempts','catchup_seconds','reseal_seconds','full_scan_seconds','source_seal_seconds','hash_seconds','final_native_seconds','promotion_seconds','outside_cleanup_seconds','critical_seconds','critical_max_seconds','authority_bytes','authority_files')}
         stage=None;prior_stage=None
         with runtime.lane_lock(self.receipts/'retention-apply.lock'):
             try:
