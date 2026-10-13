@@ -821,7 +821,7 @@ class ArchiveCatalog:
             original={}
             iterator=iter(records.values());removed={item['sequence']:item['record'] for item in retired}
             for sequence in range(1,captured['sequence']+1):original[sequence]=removed.get(sequence) or next(iterator)
-            ordered={record['id']:record for record in original.values()};del original
+            ordered={record['id']:record for record in original.values()};del original,iterator
             inputs=self._checkpoint_inputs()
             try:prepared=self._reseal_checkpoint_stage(stage,captured,marker,ordered,frozen,profile)
             except CheckpointArrival:

@@ -398,6 +398,22 @@ class CatalogLifecycleTests(unittest.TestCase):
             self.assertTrue(refs);self.assertTrue(all(ref() is None for ref in refs),'Completed preparation retained a full decoded map')
             return final(*args,**kwargs)
         with mock.patch.object(subject().ArchiveCatalog,'_scan',tracked),mock.patch.object(self.c,'_final_checkpoint_native',side_effect=authority):self.c.checkpoint()
+    def test_each_private_scan_starts_after_prior_full_map_is_released_without_gc(self):
+        for arrival in (False,True):
+            if arrival:self.setUp()
+            self.prepare();self.put(SID,TOKEN);self.put('4'*64,'5'*32);self.prove_absence(SID)
+            class Tracked(dict):pass
+            refs=[];scan=subject().ArchiveCatalog._scan;read=self.w.restic;added=[]
+            def native(lane,args,**kwargs):
+                if arrival and not added and args[2:]==['snapshots','--json']:
+                    self.put('6'*64,'7'*32);added.append(True)
+                return read(lane,args,**kwargs)
+            self.w.restic=native
+            def tracked(catalog,*args,**kwargs):
+                self.assertTrue(all(ref() is None for ref in refs),'A previous complete map survived into the next full scan')
+                result=Tracked(scan(catalog,*args,**kwargs));refs.append(weakref.ref(result));return result
+            with self.subTest(arrival_during_native_observation=arrival),mock.patch.object(subject().ArchiveCatalog,'_scan',tracked):
+                self.c.checkpoint();self.assertGreaterEqual(len(refs),2);self.assertTrue(all(ref() is None for ref in refs))
     def test_prepared_raw_images_and_complete_authority_set_tampering_block_before_pending(self):
         for change in ('source','stage','manifest','intent','receipt','latest','marker','phase','init','added'):
             if change!='source':self.setUp()
