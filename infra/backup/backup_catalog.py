@@ -454,7 +454,15 @@ class ArchiveCatalog:
         if lane=='binlog':
             import binlog
             descriptors=manifest['logs'];guards.checked_logs(descriptors);guards.require(descriptors,'Catalog empty binlog batch')
-            guards.require(names=={'logs/'+item['file'] for item in descriptors},'Catalog binlog descriptor/file set differs')
+            expected_names={'logs/'+item['file'] for item in descriptors}
+            if '.capture.json' in names:
+                # Worker owns capture and upload with separate UUIDs. The marker
+                # is part of the authenticated all-file tree checked above.
+                marker=decode(read_file(root/'.capture.json',MAX_RECORD_BYTES),MAX_RECORD_BYTES)
+                guards.require(set(marker)=={'generation','lane','token'} and marker['generation']==self.binding['generation'] and
+                               marker['lane']==lane,'Catalog capture ownership differs')
+                guards.hex_id(marker['token'],32);expected_names.add('.capture.json')
+            guards.require(names==expected_names,'Catalog binlog descriptor/file set differs')
             for item in descriptors:
                 value=read_file(root/'logs'/item['file'],MAX_FILE_BYTES)
                 guards.require(len(value)==item['size'] and digest(value)==item['sha256'],'Catalog actual binlog hash differs')

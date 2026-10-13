@@ -343,6 +343,67 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(guards.GuardError):
             with c.open_reader():self.fail('Opened incomplete catalog')
 
+class WorkerCaptureMarkerTests(unittest.TestCase):
+    setUp=CatalogTests.setUp
+    refresh=CatalogTests.refresh
+    binlog_fixture=CatalogTests.binlog_fixture
+
+    def capture(self):
+        import worker
+        w,name,raw,_=WorkerAdmissionTests.worker_readback(self)
+        payload=w.prepare_payload('binlog')
+        (payload/'logs').mkdir(mode=0o700)
+        shutil.copyfile(self.restored/'logs'/name,payload/'logs'/name)
+        os.chmod(payload/'logs'/name,0o600)
+        self.restored=payload
+        self.manifest['files']=worker.tree_inventory(payload)
+        self.refresh();self.meta['paths']=[str(payload)]
+        return w,name,raw
+
+    def refresh_files(self):
+        import worker
+        self.manifest['files']=[x for x in worker.tree_inventory(self.restored) if x['path']!='manifest.json']
+        self.refresh();self.meta['paths']=[str(self.restored)]
+
+    def test_actual_worker_capture_marker_is_admitted_and_hash_sealed(self):
+        w,name,raw=self.capture()
+        marker=runtime.load_json(self.restored/'.capture.json')
+        self.assertEqual(marker,{k:w.capture_intent('binlog',self.restored)[k] for k in ('generation','lane','token')})
+        self.assertNotEqual(marker['token'],TOKEN,'Capture ownership and upload tokens are independent')
+        self.assertTrue(w.verify_archive('binlog',SID,self.manifest,native_metadata=self.meta,raw_manifest=self.raw))
+        c=subject().ArchiveCatalog(w)
+        self.assertEqual(c.binlog_bytes(SID,name),raw)
+        self.assertEqual(c.raw_manifest(SID),self.raw)
+        self.assertEqual(c.entries()[SID]['verified']['file_count'],3)
+
+    def test_authenticated_marker_with_foreign_scope_bad_token_or_extra_key_rejected(self):
+        w,_,_=self.capture();original=runtime.load_json(self.restored/'.capture.json')
+        for change in ({'generation':'0'*32},{'lane':'base'},{'token':'bad'},{'unexpected':True}):
+            with self.subTest(change=change):
+                runtime.atomic_json(self.restored/'.capture.json',{**original,**change});self.refresh_files()
+                with self.assertRaises(guards.GuardError):
+                    w.verify_archive('binlog',SID,self.manifest,native_metadata=self.meta,raw_manifest=self.raw)
+                self.assertEqual(subject().ArchiveCatalog(w)._head()['sequence'],0)
+
+    def test_unlisted_changed_marker_and_authenticated_foreign_file_rejected(self):
+        w,_,_=self.capture();original=(self.restored/'.capture.json').read_bytes()
+        for change in ('changed','missing','unlisted','foreign'):
+            with self.subTest(change=change):
+                (self.restored/'.capture.json').write_bytes(original);os.chmod(self.restored/'.capture.json',0o600)
+                if (self.restored/'foreign').exists():(self.restored/'foreign').unlink()
+                self.refresh_files()
+                if change=='changed':(self.restored/'.capture.json').write_bytes(original+b' ')
+                if change=='missing':(self.restored/'.capture.json').unlink()
+                if change=='unlisted':
+                    self.manifest['files']=[x for x in self.manifest['files'] if x['path']!='.capture.json']
+                    self.refresh();self.meta['paths']=[str(self.restored)]
+                if change=='foreign':
+                    (self.restored/'foreign').write_bytes(b'x');os.chmod(self.restored/'foreign',0o600);self.refresh_files()
+                with self.assertRaises(guards.GuardError):
+                    w.verify_archive('binlog',SID,self.manifest,native_metadata=self.meta,raw_manifest=self.raw)
+                self.assertEqual(subject().ArchiveCatalog(w)._head()['sequence'],0)
+
+
 class WorkerAdmissionTests(unittest.TestCase):
     setUp=CatalogTests.setUp
     refresh=CatalogTests.refresh
