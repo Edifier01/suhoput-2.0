@@ -160,6 +160,11 @@ class NativeCohortTests(unittest.TestCase):
     catalog=catalog_tests.CatalogTests.catalog
     def setUp(self):
         catalog_tests.CatalogTests.setUp(self);self.native={};self.w.bin=self.root/'bin';self.w.bin.mkdir(mode=0o700)
+        def local_schedule(argv,**options):
+            if argv!=['systemctl','show','suhoput2-stage-backup-binlog.timer','--property=Id,ActiveState,UnitFileState']:
+                raise AssertionError('Isolated catalog fixture has no external native command')
+            return b'Id=suhoput2-stage-backup-binlog.timer\nActiveState=inactive\nUnitFileState=disabled\n'
+        self.w.native=SimpleNamespace(run=local_schedule)
         for producer in retention_native.PRODUCERS.values():
             (self.w.bin/producer).write_text('synthetic installed producer');os.chmod(self.w.bin/producer,0o600)
         if os.name=='nt':

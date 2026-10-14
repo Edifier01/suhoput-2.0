@@ -14,6 +14,28 @@ PRODUCERS={'audit':'retention.py','anchor':'restore.py','tip':'restore.py',
 RECEIPTS={'audit':'retention-audit.json','anchor':'restored-anchor.json','tip':'restored-tip.json',
           'owner':'owner-attestation.json','budget':'budget-projection.json','history':'history.json'}
 
+def scheduled_minute_producer(worker,deadline):
+    """Observe only the exact local timer; no archive or effect authority."""
+    import time
+    remaining=deadline-time.monotonic()
+    guards.require(remaining>0,'Original minute scheduling deadline expired')
+    unit='suhoput2-stage-backup-binlog.timer'
+    raw=worker.native.run(['systemctl','show',unit,'--property=Id,ActiveState,UnitFileState'],timeout=min(5,remaining))
+    guards.require(time.monotonic()<deadline,'Original minute scheduling deadline expired')
+    guards.require(isinstance(raw,bytes) and len(raw)<=1024,'Exact local minute timer observation required')
+    try:lines=raw.decode('ascii').splitlines()
+    except UnicodeDecodeError:raise guards.GuardError('Exact local minute timer observation required')
+    values={}
+    for line in lines:
+        key,sep,value=line.partition('=')
+        guards.require(sep=='=' and key not in values,'Duplicate or malformed local minute timer observation')
+        values[key]=value
+    guards.require(set(values)=={'Id','ActiveState','UnitFileState'} and values['Id']==unit,
+                   'Exact local minute timer identity required')
+    state=(values['ActiveState'],values['UnitFileState'])
+    guards.require(state in (('active','enabled'),('inactive','disabled')),'Local minute timer state is unknown or changing')
+    return state==('active','enabled')
+
 def producer_for(name,document):
     guards.require(name in PRODUCERS,'Unknown evidence producer')
     if document.get('operation')=='native-retention-restore-v1':
@@ -647,11 +669,13 @@ class NativeApply:
             ids=retention_cohort.repository_ids(w)
             current_reader=[reader]
             critical_deadline=[None]
+            minute_plan=[None]
             active_phase=[None]
             prepared_inputs=[None];phase_budget=[None];prepared_native={};prepared_current=[None];journal_prefix=[None];fixed_authorities=[None]
             # This closure-owned frame cannot be granted by a copied inventory
             # or a JSON field. The actual outside view remains untouched.
             native_frame=[None]
+            entry_observation=[None]
             ordinal=[0];outside_reads={}
             def charge_native_read():
                 if w.c.get('retention_readiness_policy')!='native-v2':return
@@ -661,6 +685,13 @@ class NativeApply:
             def read():
                 started=time.monotonic()
                 try:
+                    if entry_observation[0] is not None:
+                        result=entry_observation[0];entry_observation[0]=None
+                        current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
+                        retention_cohort._consume_entry_observation(w,result,current_reader[0])
+                        # Initial before only: no prepared frame or native view
+                        # is installed. The next phase performs its full audit.
+                        return dict(result)
                     charge_native_read()
                     current_reader[0]=current_reader[0].refresh(deadline=critical_deadline[0])
                     prepared_native.clear()
@@ -786,6 +817,24 @@ class NativeApply:
                 _confirmed_active(w,current,intent,absent,store,**({'_tail':tail} if w.c.get('retention_readiness_policy')=='native-v2' else {}))
             @contextmanager
             def section(name):
+                if w.c.get('retention_readiness_policy')=='native-v2':
+                    origin=minute_plan[0]
+                    if origin is None:
+                        # Read-only reconciliation does not renew an expired
+                        # cohort/budget. Its existing owner-bound ACTUAL view
+                        # has its own original observation-validity clock.
+                        frame=native_frame[0]
+                        guards.require(frame is not None and frame['owner'] is prepared_current[0],
+                                       'Original minute scheduling observation missing')
+                        origin=guards.utc(frame['actual']['observed_at'])
+                    waiting=time.monotonic();remaining=900-(retention_cohort.clock()-origin).total_seconds()
+                    guards.require(0<remaining<=900,'Original minute scheduling proof deadline expired')
+                    turn_deadline=waiting+remaining
+                    if scheduled_minute_producer(w,turn_deadline):
+                        retention_cohort.wait_for_minute_turn(w,turn_deadline)
+                    guards.require(time.monotonic()<turn_deadline and 0<=(retention_cohort.clock()-origin).total_seconds()<900,
+                                   'Original minute scheduling proof deadline expired')
+                    timing['minute_turn_wait_seconds']=timing.get('minute_turn_wait_seconds',0)+time.monotonic()-waiting
                 # Native work ends before the reserved durability and
                 # termination tail. Timestamp precedes the first lock;
                 # final measurement follows the last lock release.
@@ -833,11 +882,16 @@ class NativeApply:
                         started=time.monotonic();publication.prepared['staging'].cleanup();timing['staging_cleanup_seconds']+=time.monotonic()-started
             else:
                 guards.require(mode=='apply','No unfinished intent to reconcile')
-                inventory=retention_cohort.CohortStore(w).load(reader)
+                if w.c.get('retention_readiness_policy')=='native-v2':
+                    current={};charge_native_read()
+                    inventory=retention_cohort.CohortStore(w).load(reader,current_out=current)
+                    entry_observation[0]=current
+                else:inventory=retention_cohort.CohortStore(w).load(reader)
                 at=retention_cohort.clock();planned=guards.utc(inventory['cohort']['planned_at'])
                 policy=w.c.get('retention_readiness_policy','legacy-v1')
                 guards.require(policy in ('legacy-v1','native-v2'),'Unknown configured readiness policy')
                 plan=retention.bounded_plan(inventory,retention.inventory_plan(inventory,planned),retention_apply.MAX_INTENT_CANDIDATES if policy=='native-v2' else retention_apply.MAX_CANDIDATES);plan['planned_at']=planned.isoformat()
+                if policy=='native-v2':minute_plan[0]=planned
                 if policy=='native-v2':plan['batch_protocol']=retention_apply.DAILY_BATCH_PROTOCOL
                 if policy=='native-v2':plan['readiness_policy']=retention_apply.NATIVE_V2_POLICY
                 if plan['candidates'] and policy=='native-v2':

@@ -397,9 +397,9 @@ class PreparedNativePhaseTests(unittest.TestCase):
         case.w.restic=read
         with mock.patch.object(readiness_v2,'load_evidence',return_value=evidence),mock.patch.object(readiness_v2,'revalidate_budget',return_value=True), \
              mock.patch.object(retention_cohort,'upload_section',changed),self.assertRaises(guards.GuardError):executor.run('apply')
-        # One fixed CohortStore.load precedes the four shared observations;
-        # the next attempted preparation must stop before native command one.
-        self.assertEqual(len(views),5);self.assertEqual(effects,[]);self.assertFalse(store.path.exists())
+        # The authentic loader now spends the first shared observation; its
+        # entry baseline is reused, and no fifth native view may start.
+        self.assertEqual(len(views),4);self.assertEqual(effects,[]);self.assertFalse(store.path.exists())
 
     def test_native_only_drift_is_rejected_without_repreparing_or_effect(self):
         case,_,executor,store,effects,evidence=self.case();original=retention_cohort.upload_section;groups=[]

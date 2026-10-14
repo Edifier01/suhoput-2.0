@@ -4,7 +4,7 @@ The pointer only selects an exclusively published hash-bound document. Native
 current listing, admission seals and journals authenticate it on every load;
 neither a receipt nor a caller list can create archive provenance.
 """
-import contextlib, copy, datetime as dt, time
+import contextlib, copy, datetime as dt, time, hashlib, json, math, os, socket, stat, uuid
 import weakref
 from dataclasses import dataclass
 import backup_catalog, guards, runtime, retention, retention_apply
@@ -15,6 +15,129 @@ MAX_CRITICAL_SECONDS=55
 _OBSERVATION_KEY=object()
 _OBSERVATIONS=weakref.WeakKeyDictionary()
 _FLIGHT_USED=weakref.WeakSet()
+_ENTRY_OBSERVATIONS_USED=weakref.WeakSet()
+
+# Ephemeral OS-local scheduling only. These messages carry no archive, ACK,
+# catalog, frame or effect authority and never renew an existing proof clock.
+MAX_MINUTE_TURN_AGE_SECONDS=1
+
+def _minute_turn_directory(worker,*,create=False):
+    root=worker.root/'receipts/minute-turns'
+    if create:
+        protected_directory(worker.root);protected_directory(worker.root/'receipts')
+        if not root.exists() and not root.is_symlink():root.mkdir(mode=0o700)
+    for parent in (root,*root.parents):guards.require(not parent.is_symlink(),'Minute turn directory symlink')
+    return protected_directory(root)
+
+def _minute_turn_identity(path):
+    guards.require(path.name==guards.hex_id(path.stem,32)+'.sock' and not path.is_symlink(),'Minute turn request name/link differs')
+    value=path.lstat()
+    guards.require(stat.S_ISSOCK(value.st_mode) and value.st_uid==0 and value.st_nlink==1 and stat.S_IMODE(value.st_mode)==0o600,
+                   'Minute turn socket owner/type/mode differs')
+    return (value.st_dev,value.st_ino,value.st_uid,value.st_mode,value.st_nlink,value.st_ctime_ns)
+
+def _minute_turn_binding(worker,request):
+    guards.hex_id(worker.c['generation'],32);guards.hex_id(worker.c['code_sha'],40)
+    guards.require(isinstance(worker.source,dict) and worker.source.get('generation')==worker.c['generation'],'Minute turn source generation differs')
+    return {'format':'minute-turn-ready-v1','request':request,'generation':worker.c['generation'],'code_sha':worker.c['code_sha'],
+            'source_sha256':hashlib.sha256(backup_catalog.canonical(worker.source)).hexdigest()}
+
+def wait_for_minute_turn(worker,deadline_monotonic):
+    """Wait for ONE newly completed minute, outside every group lock.
+
+    The caller supplies the conservative monotonic bound of its ORIGINAL
+    cohort/plan deadline. A new random request belongs only to that local
+    invocation/phase. The returned nonce is scheduling data, never a grant.
+    """
+    guards.require(os.name=='posix' and hasattr(socket,'AF_UNIX'),'POSIX minute turn required')
+    guards.require(type(deadline_monotonic) in (int,float) and math.isfinite(deadline_monotonic) and time.monotonic()<deadline_monotonic,
+                   'Original minute turn wait deadline exceeded')
+    root=_minute_turn_directory(worker,create=True)
+    guards.require(not any(root.iterdir()),'Prior minute turn request preserved; investigate')
+    request=uuid.uuid4().hex;path=root/(request+'.sock');temporary=root/('.turn-'+request+'.pending')
+    guards.require(len(os.fsencode(path))<108 and not path.exists() and not path.is_symlink(),'Minute turn socket path invalid')
+    binding=_minute_turn_binding(worker,request);identity=None;temporary_identity=None;started=time.monotonic()
+    guards.require(not temporary.exists() and not temporary.is_symlink(),'Prior temporary minute turn socket preserved')
+    channel=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)
+    try:
+        channel.bind(str(temporary));value=temporary.lstat()
+        temporary_identity=(value.st_dev,value.st_ino,value.st_uid,stat.S_IFMT(value.st_mode),value.st_nlink)
+        guards.require(stat.S_ISSOCK(value.st_mode) and value.st_uid==0 and value.st_nlink==1,'Temporary minute turn socket identity differs')
+        temporary.chmod(0o600)
+        # Publish only the final600 socket. The notifier never observes its
+        # bind/chmod interval as a malformed ordinary producer request.
+        # link is an atomic NO-REPLACE publication, including a collision
+        # introduced after the earlier absence check. A socket briefly has
+        # two links; the notifier ignores it until the owned temporary goes.
+        os.link(temporary,path,follow_symlinks=False)
+        value=temporary.lstat();linked=(value.st_dev,value.st_ino,value.st_uid,stat.S_IFMT(value.st_mode),value.st_nlink)
+        guards.require(linked==(*temporary_identity[:4],2) and stat.S_IMODE(value.st_mode)==0o600,
+                       'Published minute turn temporary changed; preserve')
+        temporary.unlink();identity=_minute_turn_identity(path)
+        while True:
+            remaining=deadline_monotonic-time.monotonic()
+            guards.require(remaining>0,'Original minute turn wait deadline exceeded')
+            guards.require(_minute_turn_identity(path)==identity,'Minute turn socket changed')
+            channel.settimeout(min(.1,remaining))
+            try:raw=channel.recv(4097)
+            except socket.timeout:continue
+            now=time.monotonic();guards.require(now<deadline_monotonic,'Original minute turn wait deadline exceeded')
+            guards.require(len(raw)<=4096,'Minute turn message oversized')
+            def pairs(items):
+                result={}
+                for key,value in items:guards.require(key not in result,'Duplicate minute turn message');result[key]=value
+                return result
+            try:value=json.loads(raw,object_pairs_hook=pairs)
+            except (ValueError,UnicodeError) as error:raise guards.GuardError('Malformed minute turn message') from error
+            guards.require(isinstance(value,dict) and set(value)==set(binding)|{'sent_monotonic'} and
+                           {key:value[key] for key in binding}==binding,'Foreign minute turn message')
+            sent=value['sent_monotonic']
+            guards.require(type(sent) in (int,float) and math.isfinite(sent) and started<=sent<=now and now-sent<=MAX_MINUTE_TURN_AGE_SECONDS,
+                           'Stale or future minute turn message')
+            guards.require(_minute_turn_identity(path)==identity,'Minute turn socket changed')
+            return {'request':request,'sent_monotonic':sent,'received_monotonic':now}
+    finally:
+        channel.close()
+        if identity is not None:
+            try:
+                _minute_turn_directory(worker)
+                if _minute_turn_identity(path)==identity:path.unlink()
+            except (OSError,guards.GuardError):pass # Preserve a replaced/foreign object.
+        elif temporary_identity is not None and temporary.exists() and not temporary.is_symlink():
+            # A failed publish owns only its exclusively bound temporary.
+            try:
+                _minute_turn_directory(worker);value=temporary.lstat()
+                current=(value.st_dev,value.st_ino,value.st_uid,stat.S_IFMT(value.st_mode),value.st_nlink)
+                if current==temporary_identity:temporary.unlink()
+            except (OSError,guards.GuardError):pass
+
+def signal_minute_turns(worker,deadline_original55):
+    """Best-effort nonblocking scheduling notice; no request changes a minute.
+
+    Called only after the original minute body and its first55 check. Broken,
+    malformed, stale or backpressured queue endpoints never fail a successful
+    upload/finalization; the waiting Native side fails closed on its own bound.
+    """
+    if os.name!='posix' or not hasattr(socket,'AF_UNIX') or not (worker.root/'receipts/minute-turns').exists():return 0
+    try:
+        if time.monotonic()>=deadline_original55:return 0
+        root=_minute_turn_directory(worker);paths=[]
+        # At most one active Native phase. Bounded iteration also prevents a
+        # foreign directory from spending an unbounded producer55 budget.
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if len(paths)==1:return 0
+                paths.append(root/entry.name)
+        if not paths:return 0
+        path=paths[0];identity=_minute_turn_identity(path);binding=_minute_turn_binding(worker,path.stem)
+        with socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM) as channel:
+            channel.setblocking(False);channel.connect(str(path))
+            guards.require(_minute_turn_identity(path)==identity,'Minute turn socket changed')
+            if time.monotonic()>=deadline_original55:return 0
+            body=backup_catalog.canonical({**binding,'sent_monotonic':time.monotonic()})
+            guards.require(len(body)<=4096,'Minute turn message oversized');channel.send(body)
+        return 1
+    except (OSError,guards.GuardError,AttributeError,KeyError,TypeError,ValueError):return 0
 
 class _FlightWait:
     """One bounded producer turn for an actual read-only observation."""
@@ -201,6 +324,29 @@ def _journal_proofs(worker):
         result.append((lane,seal['count'],seal['prefix'],seal['stable']))
     return tuple(result)
 
+def _consume_entry_observation(worker,inventory,reader):
+    """Consume a loader-minted observation once as an initial baseline only.
+
+    This grants no prepared effect frame. Every effect still obtains its own
+    full phase observation and reserved native/raw authority closure.
+    """
+    rows=inventory['snapshots'];proof=getattr(rows,'_observation',None)
+    guards.require(type(rows) is _ObservedSnapshots and type(proof) is _Observation and
+                   _OBSERVATIONS.get(rows) is proof and proof.key is _OBSERVATION_KEY and proof.owner==id(rows),
+                   'Entry observation must be the original loader-minted handle')
+    guards.require(rows not in _ENTRY_OBSERVATIONS_USED,'Entry observation already consumed')
+    # A rejected closure cannot be healed by consuming the same handle again.
+    _ENTRY_OBSERVATIONS_USED.add(rows)
+    guards.require(type(reader) is backup_catalog.ArchiveReader and reader.active and
+                   reader.catalog.worker is worker and reader.catalog.receipts==worker.root/'receipts' and
+                   reader.catalog.binding=={'format':1,'generation':worker.c['generation'],'source':worker.source,
+                                            'repository_paths':worker.c['repositories']},
+                   'Entry observation requires an active reader of the same worker/scope')
+    guards.require(retention.reader_raw_prefix_seal(reader,head=backup_catalog.decode(proof.head_raw),verify=True)==proof.raw_prefix,
+                   'Original entry reader projection or catalog raw/body prefix changed')
+    confirm_observation(worker,inventory,reader)
+    return inventory
+
 def confirm_observation(worker,inventory,reader,*,journals=None,tombstones=None):
     """Validate only authenticated ACKs strictly beyond a native observation.
 
@@ -282,6 +428,8 @@ def minute_job(worker,deadline):
     with backup_catalog._catalog_lock(worker.root/'receipts/job-binlog-wait.lock',MAX_CRITICAL_SECONDS,deadline,'minute turn'):
         with backup_catalog._catalog_lock(worker.root/'receipts/job-binlog.lock',MAX_CRITICAL_SECONDS,deadline,'minute job'):
             yield
+            guards.require(time.monotonic()<deadline,'Minute job original deadline exceeded')
+            signal_minute_turns(worker,deadline)
             guards.require(time.monotonic()<deadline,'Minute job original deadline exceeded')
 
 @contextlib.contextmanager
