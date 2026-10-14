@@ -1,0 +1,20 @@
+{
+  "tariff_checked_at_utc": null,
+  "tariff_source": null,
+  "budget_rub": null,
+  "max_gib": null,
+  "rates": {
+    "storage_rub_gib_month": null,
+    "egress_rub_gib": null,
+    "put_rub_1000": null,
+    "get_rub_1000": null,
+    "delete_rub_1000": null
+  },
+  "usage": {
+    "storage_gib": null,
+    "egress_gib": null,
+    "put_requests": null,
+    "get_requests": null,
+    "delete_requests": null
+  }
+}

@@ -1,0 +1,127 @@
+name: Required checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  foundation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - name: Documents and whitespace
+        run: |
+          node tools/validate-docs.cjs
+          git diff --check
+      - name: Offline backup safety scenarios (synthetic; no S3 or DB restore)
+        run: python3 tests/backup_model_test.py
+      - name: Backup journal and manifest fault scenarios (synthetic; no S3 or DB)
+        run: python3 tests/backup_runtime_test.py
+      - name: WordPress media and complete database guards (synthetic; no DB or network)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in backup-media.php backup-database.php backup-owner-full.php; do
+            docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --env TMPDIR=/control --tmpfs /control:rw,nosuid,nodev,size=16777216 --mount "type=bind,source=$PWD/tests,target=/tests,readonly" --mount "type=bind,source=$PWD/infra/backup,target=/input,readonly" --entrypoint php wordpress:7.1.3-php8.3-apache@sha256:8ecd8d8e374167ea22235acf30f80d1165b82f07ffa5bcef90c1cad8f7be251f "/tests/$test"
+          done
+      - name: Local MariaDB PITR rehearsal (synthetic; no S3 or VPS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .cache/packages
+          curl --fail --silent --show-error --location https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2 -o .cache/packages/restic.bz2
+          printf '%s  %s\n' f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c .cache/packages/restic.bz2 | sha256sum --check
+          bzip2 -dc .cache/packages/restic.bz2 > .cache/packages/restic
+          chmod 0755 .cache/packages/restic
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 1 --pids-limit 256 --tmpfs /control:rw,exec,nosuid,nodev,size=805306368,mode=0700 --tmpfs /tmp:rw,nosuid,nodev,size=16777216 --mount "type=bind,source=$PWD/.cache/packages/restic,target=/input/restic,readonly" --mount "type=bind,source=$PWD/tests/backup-mariadb-local.sh,target=/input/test.sh,readonly" --entrypoint bash mariadb:10.11@sha256:7db29378d4fdab73f8123bbc2b48905c90d1a4b00cf848b028f1e81e623257f2 /input/test.sh
+      - name: Protected backup worker capture and crash recovery (synthetic)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 768m --cpus 1 --pids-limit 128 --env TMPDIR=/control --tmpfs /control:rw,nosuid,nodev,size=8589934592,mode=0700 --mount "type=bind,source=$PWD/infra/backup,target=/source/infra/backup,readonly" --mount "type=bind,source=$PWD/tests,target=/source/tests,readonly" --entrypoint sh python:3.12.14-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f -c 'set -eu; for test in backup_worker_test.py backup_restore_test.py backup_retention_test.py backup_retention_apply_test.py backup_retained_suffix_test.py backup_retention_native_test.py backup_budget_test.py backup_meter_test.py backup_binlog_test.py backup_maintenance_test.py backup_storage_test.py backup_readiness_v2_test.py backup_integrity_test.py backup_retention_restore_test.py backup_retention_batch_test.py backup_retention_lock_test.py backup_retention_prepared_test.py backup_capture_budget_test.py backup_metadata_cache_test.py backup_cohort_boundary_test.py backup_native_list_budget_test.py backup_native_tail_closure_test.py; do python -B "/source/tests/$test"; done'
+      - name: Portable owner-kit crypto and exact-ID retention (synthetic; no S3 or host credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in backup-owner-kit-native.php backup-retention-native.php; do
+            docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 768m --cpus 1 --pids-limit 128 --tmpfs /control:rw,exec,nosuid,nodev,size=402653184,mode=0700 --mount "type=bind,source=$PWD/.cache/packages/restic,target=/binary/restic,readonly" --mount "type=bind,source=$PWD/infra/backup,target=/source,readonly" --mount "type=bind,source=$PWD/tests,target=/tests,readonly" --entrypoint php wordpress:7.1.3-php8.3-apache@sha256:8ecd8d8e374167ea22235acf30f80d1165b82f07ffa5bcef90c1cad8f7be251f "/tests/$test"
+          done
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 768m --cpus 1 --pids-limit 128 --env TMPDIR=/control --tmpfs /control:rw,nosuid,nodev,size=8589934592,mode=0700 --mount "type=bind,source=$PWD/infra/backup,target=/source/infra/backup,readonly" --mount "type=bind,source=$PWD/tests,target=/source/tests,readonly" python:3.12.14-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f python -B -m unittest discover -s /source/tests -p 'backup_catalog_test.py'
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 768m --cpus 1 --pids-limit 128 --env TMPDIR=/control --tmpfs /control:rw,nosuid,nodev,size=8589934592,mode=0700 --mount "type=bind,source=$PWD/infra/backup,target=/source/infra/backup,readonly" --mount "type=bind,source=$PWD/tests,target=/source/tests,readonly" python:3.12.14-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f python -B -m unittest discover -s /source/tests -p 'backup_cohort_test.py'
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 768m --cpus 1 --pids-limit 128 --tmpfs /control:rw,exec,nosuid,nodev,size=8589934592,mode=0700 --tmpfs /tmp:rw,nosuid,nodev,size=16777216 --mount "type=bind,source=$PWD/.cache/packages/restic,target=/binary/restic,readonly" --mount "type=bind,source=$PWD/infra/backup,target=/source/infra/backup,readonly" --mount "type=bind,source=$PWD/tests,target=/source/tests,readonly" python:3.12.14-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f python -B /source/tests/backup-retention-protected-local.py
+      - name: Independent MoySklad probe scenarios (no credentials)
+        shell: pwsh
+        run: |
+          ./tests/moysklad-probe.ps1
+          ./tests/moysklad-control.ps1
+          ./tests/moysklad-document-control.ps1
+          ./tests/moysklad-examples.ps1
+      - name: Secrets (redacted)
+        run: >-
+          docker run --rm --network none -v "$PWD:/repo:ro"
+          zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git /repo --redact --no-banner
+      - name: Local-only configuration and verified WooCommerce
+        shell: bash
+        run: |
+          umask 077
+          for key in LOCAL_DB_PASSWORD LOCAL_DB_ROOT_PASSWORD LOCAL_ADMIN_PASSWORD; do
+            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
+          done > infra/.env.local
+          umask 022
+          mkdir -p .cache/packages
+          curl --fail --silent --show-error --location https://downloads.wordpress.org/plugin/woocommerce.11.2.0.zip -o .cache/packages/woocommerce.11.2.0.zip
+          printf '%s  %s\n' 66e91b45b057b64c73d4521111cea5bdc78c4c89de8fa2ca4b18b9422706d722 .cache/packages/woocommerce.11.2.0.zip | sha256sum --check
+      - name: Install browser tools
+        run: |
+          npm install --global pnpm@11.25.0
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium --only-shell
+      - name: Bootstrap and PHP checks
+        run: |
+          docker compose --env-file infra/.env.local -f infra/compose.yaml up -d --wait
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /bootstrap.sh
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp suhoput queue tick
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/queue-startup.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/local-safety.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli php /tests/contracts.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/schema-upgrade.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/journal.php
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/workers.php
+          node tests/worker-crashes.cjs
+          node tests/concurrency.cjs
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli wp eval-file /tests/scheduler.php
+          node tests/queue-concurrency.cjs
+          docker compose --env-file infra/.env.local -f infra/compose.yaml run --rm cli sh /tests/lint.sh
+      - name: System minute queue without HTTP
+        run: node tests/queue-minute.cjs
+      - name: Browser smoke
+        run: pnpm test:browser
+      - name: Local accounts, concurrent attempts, database failures and captured mail
+        run: node tests/accounts-suite.cjs
+      - name: Customer order ownership, one-use proof, direct links, APIs and local mail
+        run: node tests/order-access-suite.cjs
+      - name: Server cart context, guest quotas, concurrent requests and local mail
+        run: node tests/commerce-suite.cjs
+      - name: Separate synthetic staging with mail capture and disabled queues
+        shell: bash
+        run: |
+          umask 077
+          for key in STAGE_DB_PASSWORD STAGE_DB_ROOT_PASSWORD STAGE_ADMIN_PASSWORD; do
+            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
+          done > .cache/staging-ci.env
+          node tests/staging-suite.cjs .cache/staging-ci.env suhoput-stage-ci
+      - name: Stop this CI project
+        if: always()
+        run: |
+          if [ -f infra/.env.local ]; then
+            docker compose --env-file infra/.env.local -f infra/compose.yaml --profile queue down
+          fi
